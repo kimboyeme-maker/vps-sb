@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -uo pipefail
+SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+ENV_FILE="$SB_ROOT/env/node.env"
+CONFIG="$SB_ROOT/out/config.json"
+log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+ok(){ printf 'OK   %s\n' "$*"; }
+warn(){ printf 'WARN %s\n' "$*"; }
+fail(){ printf 'FAIL %s\n' "$*"; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+summary(){ cat <<'S'
+summary:
+  sb-doctor 只诊断，不修改。用于检查 service / ports / firewall / nft / dns / network / upstream / export。
+S
+}
+usage(){ cat <<'U'
+usage:
+  sb-doctor summary
+  sb-doctor help|-h|--help
+  sb-doctor quick
+  sb-doctor all
+  sb-doctor service
+  sb-doctor ports
+  sb-doctor firewall
+  sb-doctor nft
+  sb-doctor dns
+  sb-doctor network
+  sb-doctor upstream
+  sb-doctor export
+U
+}
+section(){ echo; echo "== $1 =="; }
+service_check(){ section service; if has systemctl; then systemctl is-active --quiet sing-box && ok "sing-box active" || warn "sing-box not active"; systemctl status sing-box --no-pager 2>/dev/null | head -20 || true; else warn "no systemctl"; fi; [[ -L /etc/sing-box/config.json ]] && ok "/etc/sing-box/config.json is symlink" || warn "/etc/sing-box/config.json not symlink"; [[ -f "$CONFIG" ]] && ok "$CONFIG exists" || fail "$CONFIG missing"; if has sing-box && [[ -f "$CONFIG" ]]; then sing-box check -c "$CONFIG" >/tmp/sb-doctor-check.log 2>&1 && ok "sing-box check passed" || { fail "sing-box check failed"; tail -40 /tmp/sb-doctor-check.log; }; fi; }
+ports_check(){ section ports; if [[ -f "$CONFIG" ]] && has jq; then jq -r '.inbounds[]? | "\(.tag)\t\(.type)\t\(.listen // "-"):\(.listen_port // "-")"' "$CONFIG"; fi; if has ss; then ss -tunlp | grep -E 'sing-box|:40443|:40500|:40080' || warn "ss 未看到常见端口或 sing-box"; else warn "no ss"; fi; }
+firewall_check(){ section firewall; has ufw && ufw status verbose || warn "no ufw"; }
+nft_check(){ section nft; if has nft; then nft list table inet sb_hy2_range 2>/dev/null || warn "no nft table inet sb_hy2_range"; else warn "no nft"; fi; }
+dns_check(){ section dns; if has sb-dns; then sb-dns status || true; fi; [[ -f "$CONFIG" ]] && has jq && jq '.dns // "<no dns block>", .route.default_domain_resolver? // "<no route.default_domain_resolver>"' "$CONFIG" || true; if has resolvectl; then resolvectl dns 2>/dev/null || true; fi; cat /etc/resolv.conf 2>/dev/null | sed -n '1,8p' || true; }
+network_check(){ section network; has ip && { ip -br addr || true; ip route || true; ip -6 route || true; } || warn "no ip"; if has curl; then echo "public IPv4:"; curl -4 -fsS --max-time 5 https://ip.sb || true; echo; echo "public IPv6:"; curl -6 -fsS --max-time 5 https://ip.sb || true; echo; else warn "no curl"; fi; if has dig; then dig +short google.com A | head || true; dig +short google.com AAAA | head || true; fi; }
+upstream_check(){ section upstream; if [[ -f "$ENV_FILE" ]]; then set -a; . "$ENV_FILE"; set +a; echo "UPSTREAM_ENABLED=${UPSTREAM_ENABLED:-}"; echo "UPSTREAM_NAME=${UPSTREAM_NAME:-}"; echo "UPSTREAM_INBOUNDS=${UPSTREAM_INBOUNDS:-}"; echo "UPSTREAM_HOST=${UPSTREAM_HOST:-}"; echo "UPSTREAM_PORT=${UPSTREAM_PORT:-}"; if [[ "${UPSTREAM_ENABLED:-0}" == 1 && -n "${UPSTREAM_HOST:-}" && -n "${UPSTREAM_PORT:-}" ]]; then timeout 5 bash -c "</dev/tcp/${UPSTREAM_HOST}/${UPSTREAM_PORT}" >/dev/null 2>&1 && ok "upstream tcp reachable" || warn "upstream tcp not reachable"; fi; else warn "node.env missing"; fi; }
+export_check(){ section export; if [[ -d "$SB_ROOT/out/sub" ]]; then find "$SB_ROOT/out/sub" -maxdepth 1 -type f -printf '%f\t%TY-%Tm-%Td %TH:%TM\n' | sort || true; else warn "out/sub missing"; fi; }
+cmd="${1:-quick}"; shift || true
+case "$cmd" in
+  summary) summary ;;
+  help|-h|--help) summary; echo; usage ;;
+  quick) service_check; ports_check; firewall_check ;;
+  all) service_check; ports_check; firewall_check; nft_check; dns_check; network_check; upstream_check; export_check ;;
+  service) service_check ;;
+  ports) ports_check ;;
+  firewall) firewall_check ;;
+  nft) nft_check ;;
+  dns) dns_check ;;
+  network) network_check ;;
+  upstream) upstream_check ;;
+  export) export_check ;;
+  *) fail "未知命令: $cmd"; usage; exit 1 ;;
+esac

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+F="$SB_ROOT/env/routes.json"
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+command -v jq >/dev/null || die "缺依赖 jq"
+
+summary(){ cat <<'S'
+summary:
+  sb-route 管理自定义 route 规则。它只写 env/routes.json，
+  sb-apply 调用 sb-route compile 后才进入最终 config。
+
+  第一版只做常用规则：domain/domain-suffix/domain-keyword/geosite/geoip/ip-cidr/inbound/auth-user。
+  更复杂的 raw sing-box rule 后续再加，避免把 CLI 做成 JSON 编辑器。
+S
+}
+usage(){ cat <<'U'
+usage:
+  sb-route summary
+  sb-route help|-h|--help
+  sb-route status
+  sb-route show
+  sb-route list
+
+  sb-route final <outbound-tag>
+  sb-route private-reject on|off
+
+  sb-route add domain <domain> <outbound>
+  sb-route add domain-suffix <suffix> <outbound>
+  sb-route add domain-keyword <keyword> <outbound>
+  sb-route add geosite <name> <outbound>
+  sb-route add geoip <country-code> <outbound>
+  sb-route add ip-cidr <cidr> <outbound>
+  sb-route add inbound <inbound-tag> <outbound>
+  sb-route add auth-user <user-name> <outbound>
+
+  sb-route del <index>
+  sb-route clear
+
+internal:
+  sb-route compile <config-json-file>
+
+examples:
+  sb-route add domain-suffix openai.com upstream
+  sb-route add geosite netflix direct
+  sb-route final direct
+  sb-apply
+U
+}
+
+mkdir -p "$(dirname "$F")"
+ensure(){
+  if [[ ! -f "$F" ]]; then
+    cat > "$F" <<'JSON'
+{
+  "version": 1,
+  "enabled": true,
+  "private_reject": true,
+  "final": "direct",
+  "rules": []
+}
+JSON
+    chmod 600 "$F"
+  fi
+  local tmp; tmp="$(mktemp)"
+  jq 'if type!="object" then error("routes.json 必须是 object") else . end
+      | .version=(.version//1)
+      | .enabled=(.enabled//true)
+      | .private_reject=(.private_reject//true)
+      | .final=(.final//"direct")
+      | .rules=(.rules//[])
+      | if (.rules|type)!="array" then error("rules 必须是 array") else . end' "$F" > "$tmp" || { rm -f "$tmp"; die "$F 格式错误"; }
+  install -m 600 "$tmp" "$F"; rm -f "$tmp"
+}
+write(){ local tmp="$1"; install -m 600 "$tmp" "$F"; rm -f "$tmp"; }
+
+valid_kind(){ case "$1" in domain|domain-suffix|domain-keyword|geosite|geoip|ip-cidr|inbound|auth-user) return 0;; *) return 1;; esac; }
+
+compile_config(){
+  local cfg="$1"; [[ -f "$cfg" ]] || die "compile 需要 config 文件"
+  ensure
+  local tmp; tmp="$(mktemp)"
+  jq --slurpfile r "$F" '
+    ($r[0]) as $r
+    | def user_rule($x):
+        ({outbound: $x.outbound}
+         + (if $x.kind == "domain" then {domain: [$x.value]}
+            elif $x.kind == "domain-suffix" then {domain_suffix: [$x.value]}
+            elif $x.kind == "domain-keyword" then {domain_keyword: [$x.value]}
+            elif $x.kind == "geosite" then {geosite: [$x.value]}
+            elif $x.kind == "geoip" then {geoip: [$x.value]}
+            elif $x.kind == "ip-cidr" then {ip_cidr: [$x.value]}
+            elif $x.kind == "inbound" then {inbound: [$x.value]}
+            elif $x.kind == "auth-user" then {auth_user: [$x.value]}
+            else empty end));
+    .route = (.route // {})
+    | .route.final = ($r.final // .route.final // "direct")
+    | .route.rules = (.route.rules // [])
+    | if (($r.private_reject // true) == false) then
+        .route.rules |= map(select((.ip_is_private == true and (.action // "") == "reject") | not))
+      else . end
+    | if (($r.enabled // true) == true) then
+        (($r.rules // []) | map(user_rule(.))) as $extra
+        | (.route.rules // []) as $old
+        | if (($old|length) > 0 and (($old[-1] | keys_unsorted) == ["outbound"])) then
+            .route.rules = ($old[0:-1] + $extra + [$old[-1]])
+          else
+            .route.rules = ($old + $extra)
+          end
+      else . end
+  ' "$cfg" > "$tmp" || { rm -f "$tmp"; die "route 编译失败"; }
+  install -m 600 "$tmp" "$cfg"; rm -f "$tmp"
+}
+
+cmd="${1:-}"; shift || true
+ensure
+case "$cmd" in
+  summary) summary ;;
+  help|-h|--help|"") summary; echo; usage ;;
+  status) jq -r '"enabled=\(.enabled) private_reject=\(.private_reject) final=\(.final) rules=\(.rules|length)"' "$F" ;;
+  show) jq . "$F" ;;
+  list) jq -r '.rules | to_entries[] | "\(.key)\t\(.value.kind)\t\(.value.value)\t->\t\(.value.outbound)"' "$F" ;;
+  final)
+    out="${1:-}"; [[ -n "$out" ]] || die "用法: sb-route final <outbound-tag>"
+    tmp="$(mktemp)"; jq --arg o "$out" '.final=$o' "$F" > "$tmp"; write "$tmp"; log "OK: route.final=$out" ;;
+  private-reject)
+    v="${1:-}"; [[ "$v" == "on" || "$v" == "off" ]] || die "用法: sb-route private-reject on|off"
+    tmp="$(mktemp)"; if [[ "$v" == on ]]; then jq '.private_reject=true' "$F" > "$tmp"; else jq '.private_reject=false' "$F" > "$tmp"; fi; write "$tmp"; log "OK: private_reject=$v" ;;
+  add)
+    k="${1:-}"; val="${2:-}"; out="${3:-}"
+    valid_kind "$k" || die "kind 只支持 domain/domain-suffix/domain-keyword/geosite/geoip/ip-cidr/inbound/auth-user"
+    [[ -n "$val" && -n "$out" ]] || die "用法: sb-route add <kind> <value> <outbound>"
+    tmp="$(mktemp)"; jq --arg k "$k" --arg v "$val" --arg o "$out" '.rules += [{kind:$k,value:$v,outbound:$o}] | .enabled=true' "$F" > "$tmp"; write "$tmp"; log "OK: added route $k $val -> $out" ;;
+  del|rm)
+    idx="${1:-}"; [[ "$idx" =~ ^[0-9]+$ ]] || die "用法: sb-route del <index>"
+    tmp="$(mktemp)"; jq --argjson i "$idx" 'if .rules[$i] == null then error("rule index 不存在") else .rules |= del(.[$i]) end' "$F" > "$tmp" || { rm -f "$tmp"; die "rule index 不存在"; }; write "$tmp"; log "OK: deleted route #$idx" ;;
+  clear) tmp="$(mktemp)"; jq '.rules=[]' "$F" > "$tmp"; write "$tmp"; log "OK: route rules cleared" ;;
+  compile) compile_config "${1:-}" ;;
+  *) die "未知命令: $cmd" ;;
+esac

@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SB_ROOT=/opt/sb-deploy
+ENV_FILE="$SB_ROOT/env/node.env"
+USERS_FILE="$SB_ROOT/env/users.json"
+CERT_DIR="$SB_ROOT/certs"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+dbg() { [[ "${DEBUG:-0}" == 1 ]] && printf '[debug] %s\n' "$*" >&2 || true; }
+die() { log "FAIL: $*"; exit 1; }
+
+summary() {
+  cat <<'S'
+summary:
+  sb-genenv 初始化 /opt/sb-deploy 的基础运行环境。
+
+  它负责：
+    - 生成 env/node.env
+    - 生成 env/users.json 初始用户
+    - 生成 Hy2 自签证书
+    - 给旧 node.env 补新增默认字段，但不覆盖已有密钥和端口
+
+  新默认端口策略：
+    VLESS_PORT=40443
+    HY2_PORT=40500
+    SOCKS5_PORT=40080
+
+  端口限制：
+    INBOUND_PORT_MIN=20000
+      - 所有 inbound listen_port 必须 >= 这个值
+
+    INBOUND_PORT_SUGGEST_MIN=40000
+      - 低于这个值允许，但 sb-inbound / sb-apply 会 WARN
+      - 建议所有协议使用 40000+ 高位端口
+
+  HY2 range 默认关闭：
+    HY2_RANGE_ENABLED=0
+    HY2_RANGE_TAG=hy2-in
+    HY2_RANGE_OFFSET=1000
+    HY2_RANGE_MODE=redirect
+    HY2_RANGE_HOP_INTERVAL=30
+S
+}
+
+usage() {
+  cat <<'U'
+usage:
+  sb-genenv
+  sb-genenv upgrade
+  sb-genenv summary
+  sb-genenv help
+  sb-genenv -h
+  sb-genenv --help
+
+examples:
+  sb-genenv
+  sb-genenv upgrade
+
+notes:
+  - node.env 已存在时不会覆盖已有值，只补缺失的新字段
+  - 要彻底重建 node.env，需要手动删除 env/node.env 后再跑
+  - users.json 已存在时不会覆盖
+  - certs/cert.pem 已存在时不会覆盖
+U
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    summary
+    echo
+    usage
+    exit 0
+    ;;
+  summary)
+    summary
+    exit 0
+    ;;
+  ""|upgrade)
+    ;;
+  *)
+    usage >&2
+    die "未知参数: $1"
+    ;;
+esac
+
+for dep in curl openssl sing-box jq; do
+  command -v "$dep" >/dev/null || die "缺依赖 $dep"
+done
+
+mkdir -p "$SB_ROOT"/{env,certs,out,bin,templates}
+
+NODE_NAME_DEFAULT="SJC"
+
+# 新默认高位端口
+VLESS_PORT_DEFAULT=40443
+HY2_PORT_DEFAULT=40500
+SOCKS5_PORT_DEFAULT=40080
+
+# 端口策略
+INBOUND_PORT_MIN_DEFAULT=20000
+INBOUND_PORT_SUGGEST_MIN_DEFAULT=40000
+
+REALITY_SNI_DEFAULT="www.apple.com"
+HY2_SNI_DEFAULT="www.bing.com"
+HY2_UP_DEFAULT=50
+HY2_DOWN_DEFAULT=200
+
+# HY2 range 默认关闭，但预置合理参数
+HY2_RANGE_ENABLED_DEFAULT=0
+HY2_RANGE_TAG_DEFAULT="hy2-in"
+HY2_RANGE_OFFSET_DEFAULT=1000
+HY2_RANGE_MODE_DEFAULT="redirect"
+HY2_RANGE_HOP_INTERVAL_DEFAULT=30
+
+ensure_env_key() {
+  local key="$1"
+  local value="$2"
+
+  grep -q "^${key}=" "$ENV_FILE" || {
+    echo "${key}=${value}" >> "$ENV_FILE"
+    log "ADD: $key=$value"
+  }
+}
+
+upgrade_existing_env() {
+  [[ -f "$ENV_FILE" ]] || return 0
+
+  log "SKIP: $ENV_FILE 已存在，不覆盖已有值，只补缺失字段。"
+
+  ensure_env_key "SOCKS5_PORT" "$SOCKS5_PORT_DEFAULT"
+
+  ensure_env_key "INBOUND_PORT_MIN" "$INBOUND_PORT_MIN_DEFAULT"
+  ensure_env_key "INBOUND_PORT_SUGGEST_MIN" "$INBOUND_PORT_SUGGEST_MIN_DEFAULT"
+
+  ensure_env_key "HY2_RANGE_ENABLED" "$HY2_RANGE_ENABLED_DEFAULT"
+  ensure_env_key "HY2_RANGE_TAG" "$HY2_RANGE_TAG_DEFAULT"
+  ensure_env_key "HY2_RANGE_OFFSET" "$HY2_RANGE_OFFSET_DEFAULT"
+  ensure_env_key "HY2_RANGE_MODE" "$HY2_RANGE_MODE_DEFAULT"
+  ensure_env_key "HY2_RANGE_HOP_INTERVAL" "$HY2_RANGE_HOP_INTERVAL_DEFAULT"
+
+  chmod 600 "$ENV_FILE"
+}
+
+generate_env() {
+  dbg "探测出口 IP"
+
+  SERVER_IP="$(curl -fsS4 --max-time 8 ip.sb 2>/dev/null || true)"
+  [[ -z "$SERVER_IP" ]] && SERVER_IP="104.245.13.252"
+
+  SERVER_IP6="$(curl -fsS6 --max-time 5 ip.sb 2>/dev/null || true)"
+  [[ -z "$SERVER_IP6" ]] && SERVER_IP6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
+
+  dbg "SERVER_IP=$SERVER_IP SERVER_IP6=${SERVER_IP6:-<none>}"
+
+  dbg "生成 REALITY keypair / short_id"
+
+  KP="$(sing-box generate reality-keypair)"
+  PRIV="$(awk '/PrivateKey/{print $2}' <<<"$KP")"
+  PUB="$(awk '/PublicKey/{print $2}'  <<<"$KP")"
+  SID="$(openssl rand -hex 8)"
+
+  [[ -n "$PRIV" && -n "$PUB" ]] || die "sing-box generate reality-keypair 失败"
+
+  umask 077
+
+  cat > "$ENV_FILE" <<INNER
+# === sing-box node env (generated $(date -u +%FT%TZ)) — chmod 600, 勿外传 ===
+
+NODE_NAME=${NODE_NAME_DEFAULT}
+SERVER_IP=${SERVER_IP}
+# 空=不生成 v6 节点
+SERVER_IP6=${SERVER_IP6}
+
+# ---- inbound ports ----
+# 建议所有协议使用 40000+ 高位端口
+VLESS_PORT=${VLESS_PORT_DEFAULT}
+HY2_PORT=${HY2_PORT_DEFAULT}
+SOCKS5_PORT=${SOCKS5_PORT_DEFAULT}
+
+# inbound 端口安全下限：所有协议 listen_port / HY2 range 都不能低于这个值
+INBOUND_PORT_MIN=${INBOUND_PORT_MIN_DEFAULT}
+# inbound 端口建议下限：低于这个值允许，但会 WARN
+INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN_DEFAULT}
+
+# ufw 额外放行（config 端口集之外又要保留的，空格分隔，例: "80/tcp 443/tcp"）
+EXTRA_ALLOW=""
+
+# ---- REALITY ----
+REALITY_PRIVATE_KEY=${PRIV}
+REALITY_PUBLIC_KEY=${PUB}
+REALITY_SHORT_ID=${SID}
+REALITY_SNI=${REALITY_SNI_DEFAULT}
+
+# ---- Hysteria2 ----
+HY2_SNI=${HY2_SNI_DEFAULT}
+# plain 或 salamander
+HY2_OBFS=salamander
+HY2_OBFS_PASS=$(openssl rand -hex 16)
+HY2_UP_MBPS=${HY2_UP_DEFAULT}
+HY2_DOWN_MBPS=${HY2_DOWN_DEFAULT}
+
+# HY2 UDP range / port hopping redirect
+# 默认关闭；开启示例：
+#   sb-inbound set hy2-in listen_port 40500
+#   sb-inbound hy2 range 1000
+HY2_RANGE_ENABLED=${HY2_RANGE_ENABLED_DEFAULT}
+HY2_RANGE_TAG=${HY2_RANGE_TAG_DEFAULT}
+HY2_RANGE_OFFSET=${HY2_RANGE_OFFSET_DEFAULT}
+HY2_RANGE_MODE=${HY2_RANGE_MODE_DEFAULT}
+HY2_RANGE_HOP_INTERVAL=${HY2_RANGE_HOP_INTERVAL_DEFAULT}
+
+# ---- 落地上游（住宅 SOCKS5 / 链其它节点）----
+UPSTREAM_ENABLED=0
+UPSTREAM_NAME=
+UPSTREAM_INBOUNDS=
+UPSTREAM_DOMAIN_STRATEGY=
+
+# UPSTREAM_NAME 为空时的临时上游配置
+# socks | http
+UPSTREAM_TYPE=socks
+UPSTREAM_HOST=
+UPSTREAM_PORT=
+UPSTREAM_USER=
+UPSTREAM_PASS=
+INNER
+
+  chmod 600 "$ENV_FILE"
+  log "OK: 已生成 $ENV_FILE"
+}
+
+generate_user_if_missing() {
+  if [[ -f "$USERS_FILE" ]]; then
+    log "SKIP: $USERS_FILE 已存在，不覆盖。"
+    return 0
+  fi
+
+  NAME="$(openssl rand -hex 4)"
+  UUID="$(sing-box generate uuid)"
+  PW="$(openssl rand -hex 16)"
+
+  printf '[\n  { "name": "%s", "uuid": "%s", "password": "%s", "egress": "direct", "alias": "default" }\n]\n' "$NAME" "$UUID" "$PW" > "$USERS_FILE"
+  chmod 600 "$USERS_FILE"
+
+  log "INFO: 初始用户 → account=$NAME  password=$PW  uuid=$UUID  egress=direct  alias=default"
+  log "OK: 已生成 $USERS_FILE"
+}
+
+generate_cert_if_missing() {
+  if [[ -f "$CERT_DIR/cert.pem" && -f "$CERT_DIR/key.pem" ]]; then
+    log "SKIP: Hy2 证书已存在，不覆盖。"
+    return 0
+  fi
+
+  openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
+  openssl req -new -x509 -days 36500 -key "$CERT_DIR/key.pem" \
+    -out "$CERT_DIR/cert.pem" -subj "/CN=${HY2_SNI_DEFAULT}" 2>/dev/null
+
+  chmod 600 "$CERT_DIR/key.pem" "$CERT_DIR/cert.pem"
+  log "OK: 已生成 Hy2 自签证书"
+}
+
+if [[ -f "$ENV_FILE" ]]; then
+  upgrade_existing_env
+else
+  generate_env
+fi
+
+generate_user_if_missing
+generate_cert_if_missing
+
+log "INFO: sb-genenv 完成。下一步：sb-apply"

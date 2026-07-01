@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+F="$SB_ROOT/env/profile.json"
+ENV_FILE="$SB_ROOT/env/node.env"
+log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die(){ log "FAIL: $*"; exit 1; }
+command -v jq >/dev/null || die "缺依赖 jq"
+summary(){ cat <<'S'
+summary:
+  sb-profile 是地区/用途 profile 入口。它把“这台 VPS 是美国/日本/香港/新加坡”
+  这类高层选择写到 env/profile.json，并联动 sb-dns 的 profile。
+S
+}
+usage(){ cat <<'U'
+usage:
+  sb-profile summary
+  sb-profile help|-h|--help
+  sb-profile list
+  sb-profile current
+  sb-profile show <us|jp|hk|sg|kr|cn-safe|custom>
+  sb-profile apply <us|jp|hk|sg|kr|cn-safe|custom>
+
+examples:
+  sb-profile apply jp
+  sb-apply
+U
+}
+mkdir -p "$(dirname "$F")"
+ensure(){
+  if [[ ! -f "$F" ]]; then echo '{"version":1,"profile":"custom","region":"custom","notes":[]}' > "$F"; chmod 600 "$F"; fi
+}
+profiles_json(){ cat <<'JSON'
+{
+  "us": {"region":"us","dns_profile":"us","dns_enabled":false,"strategy":"ipv4_only","ipv6_export":"manual","note":"美国 VPS：默认可不启用 dns 块，保持系统 resolv.conf。"},
+  "jp": {"region":"jp","dns_profile":"jp","dns_enabled":true,"strategy":"ipv4_only","ipv6_export":"manual","note":"日本 VPS：建议显式 DNS + ipv4_only/prefer_ipv4，避免 IPv6 路由不稳。"},
+  "hk": {"region":"hk","dns_profile":"hk","dns_enabled":true,"strategy":"ipv4_only","ipv6_export":"manual","note":"香港 VPS：建议显式 DNS + ipv4_only，避免解析/路由漂移。"},
+  "sg": {"region":"sg","dns_profile":"sg","dns_enabled":true,"strategy":"ipv4_only","ipv6_export":"manual","note":"新加坡 VPS：建议显式 DNS + ipv4_only。"},
+  "kr": {"region":"kr","dns_profile":"kr","dns_enabled":true,"strategy":"ipv4_only","ipv6_export":"manual","note":"韩国 VPS：建议显式 DNS + ipv4_only。"},
+  "cn-safe": {"region":"cn","dns_profile":"cn-safe","dns_enabled":true,"strategy":"ipv4_only","ipv6_export":"off","note":"国内服务优化：适合访问国内站，不适合海外解锁。"},
+  "custom": {"region":"custom","dns_profile":"custom","dns_enabled":true,"strategy":"ipv4_only","ipv6_export":"manual","note":"自定义 profile。"}
+}
+JSON
+}
+set_env(){
+  local k="$1" v="$2" tmp; [[ -f "$ENV_FILE" ]] || return 0
+  tmp="$(mktemp)"; awk -v k="$k" -v v="$v" 'BEGIN{d=0} $0~"^"k"="{print k"="v; d=1; next} {print} END{if(!d) print k"="v}' "$ENV_FILE" > "$tmp"; install -m 600 "$tmp" "$ENV_FILE"; rm -f "$tmp"
+}
+cmd="${1:-}"; shift || true
+ensure
+case "$cmd" in
+  summary) summary ;;
+  help|-h|--help|"") summary; echo; usage ;;
+  list) profiles_json | jq -r 'to_entries[] | "\(.key)\t\(.value.note)"' ;;
+  current) jq . "$F" ;;
+  show) p="${1:-}"; profiles_json | jq --arg p "$p" -e '.[$p]' || die "未知 profile: $p" ;;
+  apply)
+    p="${1:-}"; [[ -n "$p" ]] || die "用法: sb-profile apply <profile>"
+    prof="$(profiles_json | jq --arg p "$p" -c -e '.[$p]')" || die "未知 profile: $p"
+    tmp="$(mktemp)"; jq -n --arg p "$p" --argjson prof "$prof" '{version:1,profile:$p,region:$prof.region,dns_profile:$prof.dns_profile,dns_enabled:$prof.dns_enabled,strategy:$prof.strategy,ipv6_export:$prof.ipv6_export,note:$prof.note,applied_at:now|todate}' > "$tmp"; install -m 600 "$tmp" "$F"; rm -f "$tmp"
+    if command -v sb-dns >/dev/null 2>&1; then sb-dns profile "$(jq -r .dns_profile "$F")" >/dev/null || true; fi
+    set_env PROFILE_NAME "$p"
+    set_env PROFILE_REGION "$(jq -r .region "$F")"
+    log "OK: profile=$p。已尝试联动 sb-dns。跑 sb-apply 生效。" ;;
+  *) die "未知命令: $cmd" ;;
+esac

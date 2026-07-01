@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SB_ROOT=/opt/sb-deploy
+ENV_FILE="$SB_ROOT/env/node.env"
+USERS_FILE="$SB_ROOT/env/users.json"
+CONFIG="$SB_ROOT/out/config.json"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+
+summary() {
+  cat <<'S'
+summary:
+  sb-show 从最终 /opt/sb-deploy/out/config.json 读取实际生效的 inbound，
+  再结合 env/node.env 和 users.json 输出分享链接或 JSON 节点数据。
+
+  重点：
+    - 不再读取模板推测端口
+    - 不再自己理解 sb-inbound 的 set/rm/clone/delete
+    - 所有 inbound 改动先由 sb-apply 编译进 out/config.json
+    - clone 出来的 vless/hy2/socks5 inbound 会自动出现在 sb-show 输出里
+
+  改完配置后的正确顺序：
+    sb-inbound ...
+    sb-apply
+    sb-show ...
+S
+}
+
+usage() {
+  cat <<'U'
+usage:
+  sb-show [mode] [protocol] [name_or_alias]
+
+mode:
+  txt                         文本分享链接输出，默认
+  node                        JSON 节点数据输出
+
+protocol:
+  all                         输出全部当前可用协议，默认
+  vless                       只输出 VLESS Reality
+  hy2                         只输出 Hysteria2
+  socks5                      只输出 Socks5
+
+name_or_alias:
+  可选。按 users.json 里的 name 或 alias 过滤用户。
+
+examples:
+  sb-show
+  sb-show txt
+  sb-show node
+
+  sb-show txt all
+  sb-show txt vless
+  sb-show txt hy2
+  sb-show txt socks5
+
+  sb-show node all
+  sb-show node vless
+  sb-show node hy2
+  sb-show node socks5
+
+  sb-show txt all default
+  sb-show txt vless default
+  sb-show node socks5 default
+
+help:
+  sb-show help
+  sb-show -h
+  sb-show --help
+
+notes:
+  - protocol 不传时默认 all
+  - name_or_alias 不传时输出所有用户
+  - protocol 传错会提示当前可选值
+  - 当前可选协议来自 out/config.json 里的 inbounds
+  - HY2 range 会在 txt/node 输出里显示 ports
+  - URI 分享链接仍使用 HY2 主监听端口；Clash YAML 的 ports 由 sb-export 输出
+U
+}
+
+fail_usage() {
+  usage >&2
+  die "$1"
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    summary
+    echo
+    usage
+    exit 0
+    ;;
+esac
+
+[[ $# -le 3 ]] || fail_usage "参数过多"
+
+[[ -f "$ENV_FILE"   ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+[[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，先跑 sb-genenv"
+[[ -f "$CONFIG"     ]] || die "缺 $CONFIG，请先跑 sb-apply"
+
+for dep in jq; do
+  command -v "$dep" >/dev/null || die "缺依赖 $dep"
+done
+
+jq -e '.inbounds | type == "array"' "$CONFIG" >/dev/null 2>&1 || die "$CONFIG 不是有效 sing-box config，缺 .inbounds[]"
+
+set -a
+source "$ENV_FILE"
+set +a
+
+mode="${1:-txt}"
+proto="${2:-all}"
+filter_user="${3:-}"
+
+NODE_NAME="${NODE_NAME:-NODE}"
+SERVER_IP="${SERVER_IP:-}"
+SERVER_IP6="${SERVER_IP6:-}"
+REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
+REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"
+REALITY_SNI="${REALITY_SNI:-www.apple.com}"
+HY2_SNI="${HY2_SNI:-www.bing.com}"
+HY2_RANGE_ENABLED="${HY2_RANGE_ENABLED:-0}"
+HY2_RANGE_TAG="${HY2_RANGE_TAG:-}"
+HY2_RANGE_OFFSET="${HY2_RANGE_OFFSET:-}"
+HY2_RANGE_HOP_INTERVAL="${HY2_RANGE_HOP_INTERVAL:-30}"
+
+[[ "$mode" == "txt" || "$mode" == "node" ]] || fail_usage "非法 mode: '$mode'；可选值：txt, node"
+[[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
+[[ -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY_PUBLIC_KEY 为空，请检查 $ENV_FILE"
+[[ -n "$REALITY_SHORT_ID" ]] || die "REALITY_SHORT_ID 为空，请检查 $ENV_FILE"
+
+available_protocols_json() {
+  jq -c '
+    [
+      (if any(.inbounds[]?; .type == "vless") then "vless" else empty end),
+      (if any(.inbounds[]?; .type == "hysteria2") then "hy2" else empty end),
+      (if any(.inbounds[]?; .type == "socks") then "socks5" else empty end)
+    ]
+  ' "$CONFIG"
+}
+
+AVAIL_PROTO_JSON="$(available_protocols_json)"
+AVAIL_PROTO_TEXT="$(jq -r '(["all"] + .) | join(", ")' <<<"$AVAIL_PROTO_JSON")"
+
+if [[ "$proto" != "all" ]]; then
+  if ! jq -e --arg p "$proto" 'index($p) != null' <<<"$AVAIL_PROTO_JSON" >/dev/null; then
+    fail_usage "非法协议: '$proto'；可选值：${AVAIL_PROTO_TEXT}"
+  fi
+fi
+
+USER_COUNT="$(
+  jq --arg f "$filter_user" '
+    [
+      .[]
+      | select($f == "" or .name == $f or (.alias // "") == $f)
+    ]
+    | length
+  ' "$USERS_FILE"
+)"
+
+if [[ "$USER_COUNT" == "0" ]]; then
+  USERS_TEXT="$(
+    jq -r '
+      [
+        .[]
+        | .name + (if (.alias // "") != "" then "(" + .alias + ")" else "" end)
+      ]
+      | join(", ")
+    ' "$USERS_FILE"
+  )"
+  die "没有匹配用户: '$filter_user'；可选值：${USERS_TEXT:-<none>}"
+fi
+
+uri_host() {
+  local host="$1"
+
+  if [[ "$host" == *:* && "$host" != \[* ]]; then
+    printf '[%s]' "$host"
+  else
+    printf '%s' "$host"
+  fi
+}
+
+urlencode() {
+  jq -rn --arg v "$1" '$v | @uri'
+}
+
+hy2_range_ports() {
+  local tag="$1"
+  local port="$2"
+  local offset="${HY2_RANGE_OFFSET:-}"
+  local half
+  local start
+  local end
+
+  [[ "${HY2_RANGE_ENABLED:-0}" == "1" ]] || return 0
+  [[ -n "${HY2_RANGE_TAG:-}" ]] || return 0
+  [[ "$tag" == "$HY2_RANGE_TAG" ]] || return 0
+  [[ "$offset" =~ ^[0-9]+$ ]] || return 0
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+
+  half=$(( offset / 2 ))
+  start=$(( port - half ))
+  end=$(( port + half ))
+
+  (( start >= 1 && end <= 65535 )) || return 0
+
+  printf '%s-%s' "$start" "$end"
+}
+
+inbound_rows() {
+  jq -r --arg proto "$proto" '
+    def protocol:
+      if .type == "vless" then "vless"
+      elif .type == "hysteria2" then "hy2"
+      elif .type == "socks" then "socks5"
+      else empty
+      end;
+
+    .inbounds[]?
+    | protocol as $p
+    | select($p != "")
+    | select($proto == "all" or $proto == $p)
+    | [
+        $p,
+        (.tag // ""),
+        ((.listen_port // "") | tostring),
+        (.tls.server_name // ""),
+        (.obfs.type // ""),
+        (.obfs.password // ""),
+        ((.up_mbps // "") | tostring),
+        ((.down_mbps // "") | tostring)
+      ]
+    | @tsv
+  ' "$CONFIG"
+}
+
+vless_uri() {
+  local host="$1"
+  local port="$2"
+  local uuid="$3"
+  local disp="$4"
+  local tag="$5"
+  local ipver="$6"
+  local sni="$7"
+  local frag
+
+  [[ -n "$port" ]] || die "vless inbound '$tag' 缺 listen_port"
+
+  [[ -z "$sni" ]] && sni="$REALITY_SNI"
+
+  frag="$(urlencode "${NODE_NAME}-${disp}-${tag}-Reality-${ipver}")"
+
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
+    "$uuid" \
+    "$(uri_host "$host")" \
+    "$port" \
+    "$(urlencode "$sni")" \
+    "$(urlencode "$REALITY_PUBLIC_KEY")" \
+    "$(urlencode "$REALITY_SHORT_ID")" \
+    "$frag"
+}
+
+hy2_uri() {
+  local host="$1"
+  local port="$2"
+  local pw="$3"
+  local disp="$4"
+  local tag="$5"
+  local ipver="$6"
+  local obfs_type="$7"
+  local obfs_pass="$8"
+  local ports="$9"
+  local frag
+  local q
+
+  [[ -n "$port" ]] || die "hy2 inbound '$tag' 缺 listen_port"
+
+  frag="$(urlencode "${NODE_NAME}-${disp}-${tag}-Hy2-${ipver}")"
+  q="sni=$(urlencode "$HY2_SNI")&insecure=1&alpn=h3"
+
+  if [[ "$obfs_type" == "salamander" && -n "$obfs_pass" ]]; then
+    q="${q}&obfs=salamander&obfs-password=$(urlencode "$obfs_pass")"
+  fi
+
+  # 注意：URI 保持主端口，ports 只在 txt/node/YAML 中显示，避免非标准 mport 兼容问题。
+  printf 'hysteria2://%s@%s:%s?%s#%s\n' \
+    "$(urlencode "$pw")" \
+    "$(uri_host "$host")" \
+    "$port" \
+    "$q" \
+    "$frag"
+
+  if [[ -n "$ports" ]]; then
+    printf '# hy2-port-hopping: %s ports=%s hop-interval=%s\n' "$tag" "$ports" "$HY2_RANGE_HOP_INTERVAL"
+  fi
+}
+
+socks5_uri() {
+  local host="$1"
+  local port="$2"
+  local user="$3"
+  local pw="$4"
+  local disp="$5"
+  local tag="$6"
+  local ipver="$7"
+  local frag
+
+  [[ -n "$port" ]] || die "socks inbound '$tag' 缺 listen_port"
+
+  frag="$(urlencode "${NODE_NAME}-${disp}-${tag}-Socks5-${ipver}")"
+
+  printf 'socks5://%s:%s@%s:%s#%s\n' \
+    "$(urlencode "$user")" \
+    "$(urlencode "$pw")" \
+    "$(uri_host "$host")" \
+    "$port" \
+    "$frag"
+}
+
+case "$mode" in
+  txt)
+    echo "Server v4: ${SERVER_IP}  v6: ${SERVER_IP6:-<none>}"
+    echo "Protocols: ${AVAIL_PROTO_TEXT}"
+    echo "HY2 range: enabled=${HY2_RANGE_ENABLED:-0} tag=${HY2_RANGE_TAG:-<none>} offset=${HY2_RANGE_OFFSET:-<none>} hop=${HY2_RANGE_HOP_INTERVAL}"
+    echo
+    echo "Inbounds:"
+    inbound_rows | while IFS=$'\t' read -r p tag port sni obfs_type obfs_pass up down; do
+      ports=""
+      if [[ "$p" == "hy2" ]]; then
+        ports="$(hy2_range_ports "$tag" "$port")"
+      fi
+      echo "  ${p} ${tag} port=${port}${ports:+ ports=$ports}"
+    done
+    echo
+
+    jq -r --arg filter "$filter_user" '
+      .[]
+      | select($filter == "" or .name == $filter or (.alias // "") == $filter)
+      | [
+          .name,
+          (.egress // "direct"),
+          .uuid,
+          .password,
+          (.alias // "")
+        ]
+      | @tsv
+    ' "$USERS_FILE" | while IFS=$'\t' read -r name eg uuid pw alias; do
+      disp="$alias"
+      [[ -z "$disp" ]] && disp="$name"
+
+      echo "================ user: ${name} (egress=${eg}${alias:+, alias=$alias}) ================"
+
+      inbound_rows | while IFS=$'\t' read -r p tag port sni obfs_type obfs_pass up down; do
+        ports=""
+
+        if [[ "$p" == "hy2" ]]; then
+          ports="$(hy2_range_ports "$tag" "$port")"
+        fi
+
+        case "$p" in
+          vless)
+            vless_uri "$SERVER_IP" "$port" "$uuid" "$disp" "$tag" "v4" "$sni"
+            [[ -n "${SERVER_IP6:-}" ]] && vless_uri "$SERVER_IP6" "$port" "$uuid" "$disp" "$tag" "v6" "$sni"
+            ;;
+          hy2)
+            hy2_uri "$SERVER_IP" "$port" "$pw" "$disp" "$tag" "v4" "$obfs_type" "$obfs_pass" "$ports"
+            [[ -n "${SERVER_IP6:-}" ]] && hy2_uri "$SERVER_IP6" "$port" "$pw" "$disp" "$tag" "v6" "$obfs_type" "$obfs_pass" "$ports"
+            ;;
+          socks5)
+            socks5_uri "$SERVER_IP" "$port" "$name" "$pw" "$disp" "$tag" "v4"
+            [[ -n "${SERVER_IP6:-}" ]] && socks5_uri "$SERVER_IP6" "$port" "$name" "$pw" "$disp" "$tag" "v6"
+            ;;
+        esac
+      done
+
+      echo
+    done
+    ;;
+
+  node)
+    INB_TMP="$(mktemp)"
+    trap 'rm -f "$INB_TMP"' EXIT
+
+    {
+      inbound_rows | while IFS=$'\t' read -r p tag port sni obfs_type obfs_pass up down; do
+        ports=""
+        if [[ "$p" == "hy2" ]]; then
+          ports="$(hy2_range_ports "$tag" "$port")"
+        fi
+
+        jq -cn \
+          --arg protocol "$p" \
+          --arg tag "$tag" \
+          --arg port "$port" \
+          --arg sni "$sni" \
+          --arg obfs_type "$obfs_type" \
+          --arg obfs_pass "$obfs_pass" \
+          --arg up "$up" \
+          --arg down "$down" \
+          --arg ports "$ports" \
+          --arg hop "$HY2_RANGE_HOP_INTERVAL" '
+          {
+            protocol: $protocol,
+            tag: $tag,
+            port: ($port | tonumber),
+            sni: $sni,
+            obfs_type: $obfs_type,
+            obfs_password: $obfs_pass,
+            up_mbps: (if $up == "" then null else ($up | tonumber) end),
+            down_mbps: (if $down == "" then null else ($down | tonumber) end),
+            ports: (if $ports == "" then null else $ports end),
+            hop_interval: (if $ports == "" then null else $hop end)
+          }
+        '
+      done
+    } | jq -s '.' > "$INB_TMP"
+
+    jq \
+      --arg filter "$filter_user" \
+      --arg srv "$SERVER_IP" \
+      --arg srv6 "${SERVER_IP6:-}" \
+      --arg node "$NODE_NAME" \
+      --arg pbk "$REALITY_PUBLIC_KEY" \
+      --arg sid "$REALITY_SHORT_ID" \
+      --arg default_rsni "$REALITY_SNI" \
+      --arg hy2_sni "$HY2_SNI" \
+      --slurpfile inb "$INB_TMP" '
+      [
+        .[]
+        | select($filter == "" or .name == $filter or (.alias // "") == $filter)
+        | . as $u
+        | {
+            name: $u.name,
+            alias: ($u.alias // ""),
+            egress: ($u.egress // "direct"),
+            uuid: $u.uuid,
+            password: $u.password,
+            nodes: [
+              $inb[0][]
+              | if .protocol == "vless" then
+                  {
+                    protocol: "vless",
+                    tag,
+                    type: "vless",
+                    server: $srv,
+                    server_v6: $srv6,
+                    port,
+                    uuid: $u.uuid,
+                    flow: "xtls-rprx-vision",
+                    sni: (if .sni == "" then $default_rsni else .sni end),
+                    pbk: $pbk,
+                    sid: $sid
+                  }
+                elif .protocol == "hy2" then
+                  {
+                    protocol: "hy2",
+                    tag,
+                    type: "hysteria2",
+                    server: $srv,
+                    server_v6: $srv6,
+                    port,
+                    ports,
+                    hop_interval,
+                    password: $u.password,
+                    sni: $hy2_sni,
+                    obfs: (
+                      if .obfs_type == "" then
+                        null
+                      else
+                        {type: .obfs_type, password: .obfs_password}
+                      end
+                    ),
+                    up_mbps,
+                    down_mbps
+                  }
+                elif .protocol == "socks5" then
+                  {
+                    protocol: "socks5",
+                    tag,
+                    type: "socks5",
+                    server: $srv,
+                    server_v6: $srv6,
+                    port,
+                    username: $u.name,
+                    password: $u.password
+                  }
+                else
+                  empty
+                end
+            ]
+          }
+      ]
+    ' "$USERS_FILE"
+    ;;
+esac

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SB_ROOT=/opt/sb-deploy
+BIN_DIR="$SB_ROOT/bin"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+
+# 子命令 -> 目标脚本
+declare -A ROUTES=(
+  [genenv]=sb-genenv
+  [user]=sb-user
+  [apply]=sb-apply
+  [show]=sb-show
+  [export]=sb-export
+  [outbound]=sb-outbound
+  [inbound]=sb-inbound
+  [clear]=sb-clear
+)
+
+usage() {
+  cat <<U
+用法:
+  pi <命令> [参数...]
+
+命令:
+  genenv      生成 node.env / users.json / 证书 / REALITY 密钥    (= sb-genenv)
+  user        用户增删改查、改 egress                              (= sb-user)
+  apply       渲染模板→校验→落盘→重启→ufw 对账                    (= sb-apply)
+  show        打印分享链接 / JSON 节点（支持协议过滤）             (= sb-show)
+  export      导出每用户订阅到 out/sub/（支持协议过滤）            (= sb-export)
+  outbound    落地 outbound / upstream / domain / inbound 管理     (= sb-outbound)
+  inbound     inbound 增删改查 / clone / HY2 端口跳跃                (= sb-inbound)
+  clear       一键清空 env/certs/out（debug 用）                   (= sb-clear)
+
+  list        列出所有可用子命令
+  help        显示本帮助（-h / --help 等价）
+
+说明:
+  - pi <命令> 会把后面的参数原样转发给对应的 sb-* 脚本
+  - 每个子命令自己的用法：pi <命令> -h 或直接看 sb-<命令>
+  - pi 与 sb-* 两种叫法完全等价，可混用
+
+示例:
+  pi genenv
+  pi user add direct netflix
+  pi outbound add isp1 socks 1.2.3.4 1080 u p
+  pi apply
+  pi show txt vless
+  pi export vless default
+U
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+  ""|-h|--help|help)
+    usage
+    exit 0
+    ;;
+  list)
+    printf '%s\n' "${!ROUTES[@]}" | sort
+    exit 0
+    ;;
+esac
+
+target="${ROUTES[$cmd]:-}"
+[[ -n "$target" ]] || { log "未知命令: '$cmd'"; usage >&2; exit 1; }
+
+shift
+
+# 优先走 PATH 里的软链，回退到 bin 目录
+if command -v "$target" >/dev/null 2>&1; then
+  exec "$target" "$@"
+elif [[ -x "$BIN_DIR/$target" ]]; then
+  exec "$BIN_DIR/$target" "$@"
+else
+  die "找不到目标脚本 $target（既不在 PATH，也不在 $BIN_DIR）"
+fi
+EOF

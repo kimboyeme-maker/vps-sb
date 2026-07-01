@@ -1,0 +1,916 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SB_ROOT=/opt/sb-deploy
+ENV_FILE="$SB_ROOT/env/node.env"
+PATCH_FILE="$SB_ROOT/env/inbounds.json"
+TPL="$SB_ROOT/templates/config.json.tpl"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+
+summary() {
+  cat <<'S'
+summary:
+  sb-inbound 管理 sing-box inbound 的修改意图。
+
+  它不会直接修改 templates/config.json.tpl，也不会直接修改 out/config.json。
+  真正生效由 sb-apply 统一完成。
+
+  端口策略:
+    INBOUND_PORT_MIN=20000
+      - 所有 inbound listen_port 必须 >= 这个值，否则直接失败
+
+    INBOUND_PORT_SUGGEST_MIN=40000
+      - 低于这个值允许，但会 WARN
+      - 建议 VLESS/HY2/SOCKS5 都使用 40000+ 高位端口
+
+  HY2 range:
+    - 只保存 offset，不保存 start/end
+    - sb-apply 每次根据最终 hy2 listen_port 自动重新计算范围
+S
+}
+
+usage() {
+  cat <<'U'
+usage:
+  sb-inbound summary
+  sb-inbound help
+  sb-inbound -h
+  sb-inbound --help
+
+  sb-inbound list
+  sb-inbound show <tag>
+
+  sb-inbound set   <tag> <key> <value>
+  sb-inbound rm    <tag> <key>
+  sb-inbound del   <tag> <key>
+  sb-inbound reset <tag> <key>
+
+  sb-inbound delete  <tag>
+  sb-inbound restore <tag>
+
+  sb-inbound clone <from-tag> <new-tag> [listen_port]
+
+  sb-inbound hy2 range <offset> [tag]
+  sb-inbound hy2 range off [tag]
+  sb-inbound hy2 range show [tag]
+
+examples:
+  sb-inbound list
+  sb-inbound show hy2-in
+
+  sb-inbound set vless-in listen_port 40443
+  sb-inbound set hy2-in listen_port 40500
+  sb-inbound set socks5-in listen_port 40080
+
+  sb-inbound set hy2-in up_mbps 80
+  sb-inbound set hy2-in down_mbps 300
+  sb-inbound set hy2-in obfs.type salamander
+  sb-inbound set hy2-in obfs.password abc123
+  sb-inbound set hy2-in tls.alpn '["h3"]'
+
+  sb-inbound rm hy2-in obfs
+  sb-inbound reset hy2-in obfs
+
+  sb-inbound clone vless-in vless-41443 41443
+  sb-inbound clone hy2-in hy2-41500 41500
+
+  sb-inbound delete socks5-in
+  sb-inbound restore socks5-in
+
+  sb-inbound hy2 range 1000
+  sb-inbound hy2 range 1000 hy2-in
+  sb-inbound hy2 range show
+  sb-inbound hy2 range off
+
+value parse:
+  40500              -> number
+  true               -> boolean
+  false              -> boolean
+  null               -> null
+  ["h3"]             -> array
+  {"type":"x"}       -> object
+  www.apple.com      -> string
+
+blocked keys:
+  users
+  users.*
+  tag
+  type
+
+notes:
+  - key 支持 a.b.c 链式路径
+  - listen_port 必须 >= INBOUND_PORT_MIN
+  - listen_port 低于 INBOUND_PORT_SUGGEST_MIN 会 WARN
+  - rm/del 表示最终 config 删除字段
+  - reset 表示取消修改，恢复模板默认
+  - clone 适合做 vless/hy2 多端口备用 inbound
+  - hy2 range 最终 nftables/ufw 由 sb-apply 对账
+U
+}
+
+fail_usage() {
+  usage >&2
+  die "$1"
+}
+
+for dep in jq envsubst awk grep head; do
+  command -v "$dep" >/dev/null || die "缺依赖 $dep"
+done
+
+ensure_env() {
+  [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+}
+
+ensure_env_default() {
+  local key="$1"
+  local value="$2"
+
+  ensure_env
+  grep -q "^${key}=" "$ENV_FILE" || {
+    echo "${key}=${value}" >> "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  }
+}
+
+ensure_port_policy_defaults() {
+  ensure_env_default "INBOUND_PORT_MIN" "20000"
+  ensure_env_default "INBOUND_PORT_SUGGEST_MIN" "40000"
+  ensure_env_default "HY2_RANGE_HOP_INTERVAL" "30"
+}
+
+load_env() {
+  ensure_port_policy_defaults
+  set -a
+  source "$ENV_FILE"
+  set +a
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+set_env() {
+  local key="$1"
+  local value="$2"
+  local qvalue
+  local tmp
+
+  ensure_port_policy_defaults
+
+  qvalue="$(shell_quote "$value")"
+  tmp="$(mktemp)"
+
+  awk -v k="$key" -v v="$qvalue" '
+    BEGIN { done=0 }
+    $0 ~ "^" k "=" {
+      print k "=" v
+      done=1
+      next
+    }
+    { print }
+    END {
+      if (!done) print k "=" v
+    }
+  ' "$ENV_FILE" > "$tmp"
+
+  install -m 600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+ensure_patch() {
+  mkdir -p "$(dirname "$PATCH_FILE")"
+
+  if [[ ! -f "$PATCH_FILE" ]]; then
+    cat > "$PATCH_FILE" <<'JSON'
+{
+  "version": 1,
+  "patch": {},
+  "delete_fields": {},
+  "delete_inbounds": [],
+  "clones": {}
+}
+JSON
+    chmod 600 "$PATCH_FILE"
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+
+  jq '
+    if type != "object" then
+      error("inbounds.json 必须是 object")
+    else
+      .
+    end
+    | .version = (.version // 1)
+    | .patch = (.patch // {})
+    | .delete_fields = (.delete_fields // {})
+    | .delete_inbounds = (.delete_inbounds // [])
+    | .clones = (.clones // {})
+    | if (.patch | type) != "object" then error(".patch 必须是 object") else . end
+    | if (.delete_fields | type) != "object" then error(".delete_fields 必须是 object") else . end
+    | if (.delete_inbounds | type) != "array" then error(".delete_inbounds 必须是 array") else . end
+    | if (.clones | type) != "object" then error(".clones 必须是 object") else . end
+  ' "$PATCH_FILE" > "$tmp" || {
+    rm -f "$tmp"
+    die "$PATCH_FILE 格式错误"
+  }
+
+  install -m 600 "$tmp" "$PATCH_FILE"
+  rm -f "$tmp"
+}
+
+render_base_config() {
+  ensure_env
+  [[ -f "$TPL" ]] || die "缺 $TPL"
+
+  load_env
+
+  local tmp
+  tmp="$(mktemp)"
+
+  local VARS
+  VARS='${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+
+  envsubst "$VARS" < "$TPL" > "$tmp"
+
+  jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1 || {
+    rm -f "$tmp"
+    die "无法从模板解析 .inbounds，请确认 $TPL 渲染后是合法 JSON"
+  }
+
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+base_tags_json() {
+  render_base_config | jq -c '[.inbounds[]?.tag | select(. != null and . != "")]'
+}
+
+clone_tags_json() {
+  ensure_patch
+  jq -c '(.clones // {}) | keys' "$PATCH_FILE"
+}
+
+deleted_tags_json() {
+  ensure_patch
+  jq -c '(.delete_inbounds // [])' "$PATCH_FILE"
+}
+
+known_tags_json() {
+  local base
+  local clones
+  local deleted
+
+  base="$(base_tags_json)"
+  clones="$(clone_tags_json)"
+  deleted="$(deleted_tags_json)"
+
+  jq -cn \
+    --argjson base "$base" \
+    --argjson clones "$clones" \
+    --argjson deleted "$deleted" '
+    ($base + $clones)
+    | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+    | map(select(. as $x | ($deleted | index($x) | not)))
+  '
+}
+
+known_tags_text() {
+  known_tags_json | jq -r 'join(", ")'
+}
+
+validate_tag_syntax() {
+  local tag="$1"
+
+  [[ -n "$tag" ]] || die "tag 不能为空"
+
+  if [[ ! "$tag" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+    die "非法 tag: '$tag'；只允许 A-Z a-z 0-9 _ . : -"
+  fi
+}
+
+tag_exists() {
+  local tag="$1"
+  known_tags_json | jq -e --arg t "$tag" 'index($t) != null' >/dev/null
+}
+
+require_tag() {
+  local tag="$1"
+  local options
+
+  validate_tag_syntax "$tag"
+
+  if ! tag_exists "$tag"; then
+    options="$(known_tags_text)"
+    die "不存在的 inbound tag: '$tag'；可选值：${options:-<none>}"
+  fi
+}
+
+require_not_deleted() {
+  local tag="$1"
+
+  if deleted_tags_json | jq -e --arg t "$tag" 'index($t) != null' >/dev/null; then
+    die "inbound '$tag' 已标记删除；先执行 sb-inbound restore $tag"
+  fi
+}
+
+require_new_tag() {
+  local tag="$1"
+  local options
+
+  validate_tag_syntax "$tag"
+
+  if tag_exists "$tag"; then
+    options="$(known_tags_text)"
+    die "inbound tag '$tag' 已存在；当前可选值：${options:-<none>}"
+  fi
+}
+
+validate_key() {
+  local key="$1"
+
+  [[ -n "$key" ]] || die "key 不能为空"
+
+  case "$key" in
+    users|users.*|tag|type)
+      die "禁止修改 key: '$key'；users 由 users.json 注入，tag/type 只能通过 clone/delete 管理"
+      ;;
+  esac
+
+  if [[ ! "$key" =~ ^[A-Za-z0-9_:-]+(\.[A-Za-z0-9_:-]+)*$ ]]; then
+    die "非法 key: '$key'；key 只支持 a.b.c 形式，片段允许 A-Z a-z 0-9 _ : -"
+  fi
+}
+
+path_json() {
+  local key="$1"
+  jq -cn --arg k "$key" '$k | split(".")'
+}
+
+value_json() {
+  local value="$1"
+  jq -cn --arg v "$value" 'try ($v | fromjson) catch $v'
+}
+
+write_patch_tmp() {
+  local tmp="$1"
+  install -m 600 "$tmp" "$PATCH_FILE"
+  rm -f "$tmp"
+}
+
+current_upstream_inbounds_has() {
+  local tag="$1"
+
+  load_env
+
+  jq -nr --arg cur "${UPSTREAM_INBOUNDS:-}" --arg t "$tag" '
+    $cur
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; ""))
+    | map(select(length > 0))
+    | index($t) != null
+  ' | grep -qx true
+}
+
+base_inbound_type() {
+  local tag="$1"
+
+  render_base_config | jq -r --arg t "$tag" '
+    .inbounds[]?
+    | select(.tag == $t)
+    | .type // empty
+  ' | head -n 1
+}
+
+clone_from_tag() {
+  local tag="$1"
+  ensure_patch
+  jq -r --arg t "$tag" '.clones[$t].from // empty' "$PATCH_FILE"
+}
+
+inbound_type() {
+  local tag="$1"
+  local t
+  local from
+
+  t="$(base_inbound_type "$tag")"
+  if [[ -n "$t" ]]; then
+    echo "$t"
+    return 0
+  fi
+
+  from="$(clone_from_tag "$tag")"
+  if [[ -n "$from" ]]; then
+    base_inbound_type "$from"
+  fi
+}
+
+default_hy2_tag() {
+  local tag
+
+  tag="$(
+    render_base_config | jq -r '
+      .inbounds[]?
+      | select(.type == "hysteria2")
+      | .tag
+    ' | head -n 1
+  )"
+
+  [[ -n "$tag" ]] || die "没有找到 hysteria2 inbound，无法设置 hy2 range"
+  echo "$tag"
+}
+
+require_hy2_tag() {
+  local tag="$1"
+  local t
+
+  require_tag "$tag"
+  t="$(inbound_type "$tag")"
+
+  [[ "$t" == "hysteria2" ]] || die "'$tag' 不是 hysteria2 inbound，当前 type=${t:-<unknown>}"
+}
+
+effective_listen_port() {
+  local tag="$1"
+  local port
+
+  ensure_patch
+
+  port="$(jq -r --arg t "$tag" '.patch[$t].listen_port // empty' "$PATCH_FILE")"
+  if [[ -n "$port" ]]; then
+    echo "$port"
+    return 0
+  fi
+
+  port="$(jq -r --arg t "$tag" '.clones[$t].listen_port // empty' "$PATCH_FILE")"
+  if [[ -n "$port" ]]; then
+    echo "$port"
+    return 0
+  fi
+
+  render_base_config | jq -r --arg t "$tag" '
+    .inbounds[]?
+    | select(.tag == $t)
+    | .listen_port // empty
+  ' | head -n 1
+}
+
+validate_port_policy_values() {
+  load_env
+
+  INBOUND_PORT_MIN="${INBOUND_PORT_MIN:-20000}"
+  INBOUND_PORT_SUGGEST_MIN="${INBOUND_PORT_SUGGEST_MIN:-40000}"
+
+  [[ "$INBOUND_PORT_MIN" =~ ^[0-9]+$ ]] || die "INBOUND_PORT_MIN 必须是数字，收到 '$INBOUND_PORT_MIN'"
+  [[ "$INBOUND_PORT_SUGGEST_MIN" =~ ^[0-9]+$ ]] || die "INBOUND_PORT_SUGGEST_MIN 必须是数字，收到 '$INBOUND_PORT_SUGGEST_MIN'"
+
+  (( INBOUND_PORT_MIN >= 1 && INBOUND_PORT_MIN <= 65535 )) || die "INBOUND_PORT_MIN 必须在 1-65535"
+  (( INBOUND_PORT_SUGGEST_MIN >= INBOUND_PORT_MIN && INBOUND_PORT_SUGGEST_MIN <= 65535 )) || die "INBOUND_PORT_SUGGEST_MIN 必须 >= INBOUND_PORT_MIN 且 <= 65535"
+}
+
+validate_port() {
+  local port="$1"
+  local label="${2:-listen_port}"
+
+  validate_port_policy_values
+
+  [[ "$port" =~ ^[0-9]+$ ]] || die "$label 必须是数字，收到 '$port'"
+  (( port >= 1 && port <= 65535 )) || die "$label 范围必须是 1-65535，收到 '$port'"
+
+  (( port >= INBOUND_PORT_MIN )) || die "$label=$port 低于 INBOUND_PORT_MIN=$INBOUND_PORT_MIN，不允许使用"
+
+  if (( port < INBOUND_PORT_SUGGEST_MIN )); then
+    log "WARN: $label=$port 低于建议值 INBOUND_PORT_SUGGEST_MIN=$INBOUND_PORT_SUGGEST_MIN，建议使用 ${INBOUND_PORT_SUGGEST_MIN}+ 的高位端口"
+  fi
+}
+
+validate_positive_int() {
+  local name="$1"
+  local value="$2"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name 必须是数字，收到 '$value'"
+}
+
+validate_set_value_by_key() {
+  local key="$1"
+  local value="$2"
+
+  case "$key" in
+    listen_port)
+      validate_port "$value" "listen_port"
+      ;;
+    up_mbps|down_mbps)
+      validate_positive_int "$key" "$value"
+      ;;
+  esac
+}
+
+validate_offset() {
+  local offset="$1"
+
+  [[ "$offset" =~ ^[0-9]+$ ]] || die "offset 必须是数字，收到 '$offset'"
+  (( offset >= 2 && offset <= 60000 )) || die "offset 范围建议是 2-60000，收到 '$offset'"
+}
+
+print_hy2_range_calc() {
+  local tag="$1"
+  local offset="$2"
+  local port
+  local half
+  local start
+  local end
+  local suggested_base
+
+  validate_port_policy_values
+
+  port="$(effective_listen_port "$tag")"
+  [[ -n "$port" ]] || {
+    echo "range: tag=$tag offset=$offset port=<unknown>"
+    return 0
+  }
+
+  validate_port "$port" "hy2 listen_port"
+  validate_offset "$offset"
+
+  half=$(( offset / 2 ))
+  start=$(( port - half ))
+  end=$(( port + half ))
+
+  if (( start < 1 || end > 65535 )); then
+    die "HY2 range 超出合法端口范围：${start}-${end}/udp"
+  fi
+
+  if (( start < INBOUND_PORT_MIN )); then
+    suggested_base=$(( INBOUND_PORT_MIN + half ))
+    die "HY2 range 起始端口 ${start} 低于 INBOUND_PORT_MIN=${INBOUND_PORT_MIN}。请把 ${tag}.listen_port 提高到至少 ${suggested_base}，或降低 offset"
+  fi
+
+  if (( start < INBOUND_PORT_SUGGEST_MIN )); then
+    suggested_base=$(( INBOUND_PORT_SUGGEST_MIN + half ))
+    log "WARN: HY2 range 起始端口 ${start} 低于建议值 INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN}，建议把 ${tag}.listen_port 调到至少 ${suggested_base}"
+  fi
+
+  echo "range: tag=$tag port=$port offset=$offset => ${start}-${end}/udp"
+}
+
+cmd="${1:-}"
+shift || true
+
+ensure_patch
+ensure_port_policy_defaults
+
+case "$cmd" in
+  summary)
+    summary
+    ;;
+
+  -h|--help|help|"")
+    summary
+    echo
+    usage
+    ;;
+
+  list)
+    echo "base inbounds:"
+    render_base_config | jq -r '
+      .inbounds[]?
+      | "  " + (.tag // "-")
+        + "\t" + (.type // "-")
+        + "\tport=" + ((.listen_port // "-") | tostring)
+    '
+
+    echo
+    echo "clones:"
+    jq -r '
+      if ((.clones // {}) | length) == 0 then
+        "  <none>"
+      else
+        .clones
+        | to_entries[]
+        | "  " + .key
+          + "\tfrom=" + (.value.from // "-")
+          + "\tport=" + ((.value.listen_port // "-") | tostring)
+      end
+    ' "$PATCH_FILE"
+
+    echo
+    echo "deleted inbounds:"
+    jq -r '
+      if ((.delete_inbounds // []) | length) == 0 then
+        "  <none>"
+      else
+        .delete_inbounds[] | "  " + .
+      end
+    ' "$PATCH_FILE"
+
+    echo
+    echo "patched tags:"
+    jq -r '
+      ((.patch // {}) | keys) as $p
+      | ((.delete_fields // {}) | keys) as $d
+      | (($p + $d) | unique)
+      | if length == 0 then
+          "  <none>"
+        else
+          .[] | "  " + .
+        end
+    ' "$PATCH_FILE"
+
+    echo
+    echo "known active tags:"
+    known_tags_json | jq -r 'if length == 0 then "  <none>" else .[] | "  " + . end'
+
+    echo
+    load_env
+    echo "port policy:"
+    echo "  INBOUND_PORT_MIN=${INBOUND_PORT_MIN:-20000}"
+    echo "  INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN:-40000}"
+
+    echo
+    echo "hy2 range:"
+    echo "  HY2_RANGE_ENABLED=${HY2_RANGE_ENABLED:-0}"
+    echo "  HY2_RANGE_TAG=${HY2_RANGE_TAG:-}"
+    echo "  HY2_RANGE_OFFSET=${HY2_RANGE_OFFSET:-}"
+    echo "  HY2_RANGE_MODE=${HY2_RANGE_MODE:-redirect}"
+    echo "  HY2_RANGE_HOP_INTERVAL=${HY2_RANGE_HOP_INTERVAL:-30}"
+    if [[ "${HY2_RANGE_ENABLED:-0}" == "1" && -n "${HY2_RANGE_TAG:-}" && -n "${HY2_RANGE_OFFSET:-}" ]]; then
+      print_hy2_range_calc "$HY2_RANGE_TAG" "$HY2_RANGE_OFFSET" | sed 's/^/  /'
+    fi
+    ;;
+
+  show)
+    tag="${1:-}"
+    [[ -n "$tag" ]] || fail_usage "缺少 tag，例如: sb-inbound show hy2-in"
+    require_tag "$tag"
+
+    echo "base:"
+    render_base_config | jq --arg t "$tag" '
+      .inbounds[]?
+      | select(.tag == $t)
+    '
+
+    echo
+    echo "clone:"
+    jq --arg t "$tag" '.clones[$t] // null' "$PATCH_FILE"
+
+    echo
+    echo "patch:"
+    jq --arg t "$tag" '.patch[$t] // {}' "$PATCH_FILE"
+
+    echo
+    echo "delete_fields:"
+    jq --arg t "$tag" '.delete_fields[$t] // []' "$PATCH_FILE"
+
+    echo
+    echo "deleted:"
+    deleted_tags_json | jq --arg t "$tag" 'index($t) != null'
+    ;;
+
+  set)
+    tag="${1:-}"
+    key="${2:-}"
+
+    [[ -n "$tag" && -n "$key" && $# -ge 3 ]] || fail_usage "用法: sb-inbound set <tag> <key> <value>"
+
+    shift 2
+    value="$*"
+
+    require_tag "$tag"
+    require_not_deleted "$tag"
+    validate_key "$key"
+    validate_set_value_by_key "$key" "$value"
+
+    pjson="$(path_json "$key")"
+    vjson="$(value_json "$value")"
+
+    tmp="$(mktemp)"
+    jq \
+      --arg tag "$tag" \
+      --arg key "$key" \
+      --argjson path "$pjson" \
+      --argjson val "$vjson" '
+      .patch[$tag] = ((.patch[$tag] // {}) | setpath($path; $val))
+      | .delete_fields[$tag] = ((.delete_fields[$tag] // []) | map(select(. != $key)))
+      | if ((.delete_fields[$tag] // []) | length) == 0 then
+          del(.delete_fields[$tag])
+        else
+          .
+        end
+    ' "$PATCH_FILE" > "$tmp"
+
+    write_patch_tmp "$tmp"
+    log "OK: 已设置 inbound '$tag' $key=$value。跑 sb-apply 生效。"
+    ;;
+
+  rm|del)
+    tag="${1:-}"
+    key="${2:-}"
+
+    [[ -n "$tag" && -n "$key" ]] || fail_usage "用法: sb-inbound rm <tag> <key>"
+
+    require_tag "$tag"
+    require_not_deleted "$tag"
+    validate_key "$key"
+
+    pjson="$(path_json "$key")"
+
+    tmp="$(mktemp)"
+    jq \
+      --arg tag "$tag" \
+      --arg key "$key" \
+      --argjson path "$pjson" '
+      .patch[$tag] = ((.patch[$tag] // {}) | delpaths([$path]))
+      | if ((.patch[$tag] // {}) == {}) then
+          del(.patch[$tag])
+        else
+          .
+        end
+      | .delete_fields[$tag] = (((.delete_fields[$tag] // []) + [$key]) | unique)
+    ' "$PATCH_FILE" > "$tmp"
+
+    write_patch_tmp "$tmp"
+    log "OK: 已标记删除 inbound '$tag' 的字段 '$key'。跑 sb-apply 生效。"
+    ;;
+
+  reset)
+    tag="${1:-}"
+    key="${2:-}"
+
+    [[ -n "$tag" && -n "$key" ]] || fail_usage "用法: sb-inbound reset <tag> <key>"
+
+    require_tag "$tag"
+    validate_key "$key"
+
+    pjson="$(path_json "$key")"
+
+    tmp="$(mktemp)"
+    jq \
+      --arg tag "$tag" \
+      --arg key "$key" \
+      --argjson path "$pjson" '
+      .patch[$tag] = ((.patch[$tag] // {}) | delpaths([$path]))
+      | if ((.patch[$tag] // {}) == {}) then
+          del(.patch[$tag])
+        else
+          .
+        end
+      | .delete_fields[$tag] = ((.delete_fields[$tag] // []) | map(select(. != $key)))
+      | if ((.delete_fields[$tag] // []) | length) == 0 then
+          del(.delete_fields[$tag])
+        else
+          .
+        end
+    ' "$PATCH_FILE" > "$tmp"
+
+    write_patch_tmp "$tmp"
+    log "OK: 已 reset inbound '$tag' 的字段 '$key'，恢复模板默认。跑 sb-apply 生效。"
+    ;;
+
+  delete)
+    tag="${1:-}"
+    [[ -n "$tag" ]] || fail_usage "用法: sb-inbound delete <tag>"
+
+    require_tag "$tag"
+
+    if current_upstream_inbounds_has "$tag"; then
+      die "$tag 正被 UPSTREAM_INBOUNDS 引用，先执行: sb-outbound inbound rm $tag"
+    fi
+
+    tmp="$(mktemp)"
+    jq --arg tag "$tag" '
+      .delete_inbounds = (((.delete_inbounds // []) + [$tag]) | unique)
+    ' "$PATCH_FILE" > "$tmp"
+
+    write_patch_tmp "$tmp"
+    log "OK: 已标记删除 inbound '$tag'。跑 sb-apply 生效。"
+    ;;
+
+  restore)
+    tag="${1:-}"
+    [[ -n "$tag" ]] || fail_usage "用法: sb-inbound restore <tag>"
+
+    validate_tag_syntax "$tag"
+
+    tmp="$(mktemp)"
+    jq --arg tag "$tag" '
+      .delete_inbounds = ((.delete_inbounds // []) | map(select(. != $tag)))
+    ' "$PATCH_FILE" > "$tmp"
+
+    write_patch_tmp "$tmp"
+    log "OK: 已恢复 inbound '$tag'。跑 sb-apply 生效。"
+    ;;
+
+  clone)
+    from="${1:-}"
+    new="${2:-}"
+    port="${3:-}"
+
+    [[ -n "$from" && -n "$new" ]] || fail_usage "用法: sb-inbound clone <from-tag> <new-tag> [listen_port]"
+
+    require_tag "$from"
+    require_not_deleted "$from"
+    require_new_tag "$new"
+
+    if [[ -n "$port" ]]; then
+      validate_port "$port" "listen_port"
+    fi
+
+    tmp="$(mktemp)"
+    jq \
+      --arg from "$from" \
+      --arg new "$new" \
+      --arg port "$port" '
+      .clones[$new] =
+        ({from: $from}
+         + (if $port != "" then {listen_port: ($port | tonumber)} else {} end))
+      | .delete_inbounds = ((.delete_inbounds // []) | map(select(. != $new)))
+    ' "$PATCH_FILE" > "$tmp"
+
+    write_patch_tmp "$tmp"
+    log "OK: 已记录 clone $from -> $new${port:+ listen_port=$port}。跑 sb-apply 生效。"
+    ;;
+
+  hy2)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      range)
+        action="${1:-}"
+        shift || true
+
+        case "$action" in
+          show)
+            load_env
+            tag="${1:-${HY2_RANGE_TAG:-}}"
+            [[ -z "$tag" ]] && tag="$(default_hy2_tag)"
+
+            require_hy2_tag "$tag"
+
+            echo "HY2_RANGE_ENABLED=${HY2_RANGE_ENABLED:-0}"
+            echo "HY2_RANGE_TAG=${HY2_RANGE_TAG:-$tag}"
+            echo "HY2_RANGE_OFFSET=${HY2_RANGE_OFFSET:-}"
+            echo "HY2_RANGE_MODE=${HY2_RANGE_MODE:-redirect}"
+            echo "HY2_RANGE_HOP_INTERVAL=${HY2_RANGE_HOP_INTERVAL:-30}"
+
+            if [[ -n "${HY2_RANGE_OFFSET:-}" ]]; then
+              print_hy2_range_calc "$tag" "$HY2_RANGE_OFFSET"
+            else
+              echo "range: <unset>"
+            fi
+            ;;
+
+          off)
+            tag="${1:-}"
+
+            if [[ -n "$tag" ]]; then
+              require_hy2_tag "$tag"
+            fi
+
+            set_env "HY2_RANGE_ENABLED" "0"
+            log "OK: 已关闭 HY2 range。跑 sb-apply 生效。"
+            ;;
+
+          "")
+            fail_usage "用法: sb-inbound hy2 range <offset> [tag] | off [tag] | show [tag]"
+            ;;
+
+          *)
+            offset="$action"
+            tag="${1:-}"
+
+            validate_offset "$offset"
+
+            if [[ -z "$tag" ]]; then
+              tag="$(default_hy2_tag)"
+            fi
+
+            require_hy2_tag "$tag"
+
+            print_hy2_range_calc "$tag" "$offset" >&2
+
+            set_env "HY2_RANGE_ENABLED" "1"
+            set_env "HY2_RANGE_TAG" "$tag"
+            set_env "HY2_RANGE_OFFSET" "$offset"
+            set_env "HY2_RANGE_MODE" "redirect"
+
+            log "OK: 已设置 HY2 range tag=$tag offset=$offset mode=redirect。"
+            log "INFO: 跑 sb-apply 后由 sb-apply 负责 nftables/ufw 对账。"
+            ;;
+        esac
+        ;;
+
+      *)
+        fail_usage "用法: sb-inbound hy2 range <offset> [tag] | off [tag] | show [tag]"
+        ;;
+    esac
+    ;;
+
+  *)
+    fail_usage "未知命令: '$cmd'"
+    ;;
+esac
+EOF

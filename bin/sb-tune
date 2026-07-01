@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die(){ log "FAIL: $*"; exit 1; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+summary(){ cat <<'S'
+summary:
+  sb-tune 管系统层调优：BBR/BBRv3 检查、sysctl、journald、XanMod 内核安装规划。
+  默认 check/plan 不改系统；apply/bbrv3/kernel 会改系统。
+S
+}
+usage(){ cat <<'U'
+usage:
+  sb-tune summary
+  sb-tune help|-h|--help
+  sb-tune check
+  sb-tune plan [tiny|balanced|hy2]
+  sb-tune apply [tiny|balanced|hy2]
+  sb-tune bbrv3 [auto|v2|v3]
+  sb-tune kernel xanmod [auto|v2|v3]
+  sb-tune journald [tiny|balanced|hy2]
+  sb-tune sysctl [tiny|balanced|hy2]
+
+profiles:
+  tiny      1C/1G 小鸡，保守 buffer 和日志区
+  balanced 2G-4G 常规 VPS
+  hy2      偏 HY2/UDP，buffer 稍大
+U
+}
+mem_mb(){ awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
+disk_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$2); print $2}' || echo 0; }
+profile_values(){
+  local p="${1:-balanced}" m d
+  m="$(mem_mb)"; d="$(disk_gb)"
+  case "$p" in
+    tiny)
+      echo "RMEM=33554432 WMEM=33554432 JOURNAL_SYSTEM=100M JOURNAL_FILE=20M JOURNAL_RUNTIME=50M BACKLOG=16384 SYN_BACKLOG=8192 NOTSENT=131072" ;;
+    balanced)
+      echo "RMEM=67108864 WMEM=67108864 JOURNAL_SYSTEM=200M JOURNAL_FILE=50M JOURNAL_RUNTIME=100M BACKLOG=32768 SYN_BACKLOG=16384 NOTSENT=262144" ;;
+    hy2)
+      if (( m < 1500 )); then
+        echo "RMEM=33554432 WMEM=33554432 JOURNAL_SYSTEM=100M JOURNAL_FILE=20M JOURNAL_RUNTIME=50M BACKLOG=16384 SYN_BACKLOG=8192 NOTSENT=131072"
+      else
+        echo "RMEM=134217728 WMEM=134217728 JOURNAL_SYSTEM=300M JOURNAL_FILE=80M JOURNAL_RUNTIME=150M BACKLOG=65536 SYN_BACKLOG=32768 NOTSENT=262144"
+      fi ;;
+    *) die "未知 profile: $p" ;;
+  esac
+}
+show_check(){
+  echo "kernel=$(uname -r)"
+  echo "mem_mb=$(mem_mb) disk_root_gb=$(disk_gb)"
+  echo "congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  echo "qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  echo "bbr_module=$(modinfo tcp_bbr 2>/dev/null | awk -F: '/version/{print $2}' | xargs || true)"
+  if has systemctl; then systemctl is-active --quiet systemd-journald 2>/dev/null && echo "journald=active" || echo "journald=not-active"; fi
+  if has apt; then echo "apt=yes"; fi
+}
+write_sysctl(){
+  local p="${1:-balanced}" vals
+  vals="$(profile_values "$p")"; eval "$vals"
+  cat > /etc/sysctl.d/99-sb-deploy.conf <<EOF2
+# sb-deploy network tuning profile=$p
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = $RMEM
+net.core.wmem_max = $WMEM
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 87380 $RMEM
+net.ipv4.tcp_wmem = 4096 65536 $WMEM
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = $NOTSENT
+net.core.netdev_max_backlog = $BACKLOG
+net.ipv4.tcp_max_syn_backlog = $SYN_BACKLOG
+net.ipv4.ip_forward = 1
+fs.file-max = 1000000
+EOF2
+  sysctl --system >/dev/null
+  log "OK: sysctl applied profile=$p"
+}
+write_journald(){
+  local p="${1:-balanced}" vals
+  vals="$(profile_values "$p")"; eval "$vals"
+  mkdir -p /etc/systemd/journald.conf.d
+  cat > /etc/systemd/journald.conf.d/sb-deploy-size.conf <<EOF2
+[Journal]
+SystemMaxUse=$JOURNAL_SYSTEM
+SystemMaxFileSize=$JOURNAL_FILE
+RuntimeMaxUse=$JOURNAL_RUNTIME
+EOF2
+  if has systemctl; then systemctl restart systemd-journald || true; fi
+  log "OK: journald limits applied profile=$p"
+}
+install_xanmod(){
+  local abi="${1:-auto}" codename pkg
+  [[ $EUID -eq 0 ]] || die "需要 root"
+  has apt || die "当前系统没有 apt，暂只支持 Debian/Ubuntu"
+  apt update
+  apt install -y curl wget gnupg2 ca-certificates lsb-release apt-transport-https
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+  [[ -n "$codename" ]] || die "无法识别 VERSION_CODENAME"
+  wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $codename main" > /etc/apt/sources.list.d/xanmod-release.list
+  apt update
+  if [[ "$abi" == "auto" ]]; then
+    tmp="$(mktemp)"; wget -q https://dl.xanmod.org/check_x86-64_psabi.sh -O "$tmp"; chmod +x "$tmp"
+    out="$($tmp || true)"; rm -f "$tmp"
+    if grep -q 'x86-64-v3 supported' <<<"$out"; then abi=v3; else abi=v2; fi
+    log "INFO: auto ABI=$abi"
+  fi
+  case "$abi" in v2) pkg=linux-xanmod-x64v2;; v3) pkg=linux-xanmod-x64v3;; *) die "ABI 只支持 auto/v2/v3";; esac
+  apt install -y "$pkg"
+  log "OK: 已安装 $pkg。需要 reboot 后才能验证 BBRv3。"
+}
+cmd="${1:-check}"; shift || true
+case "$cmd" in
+  summary) summary ;;
+  help|-h|--help) summary; echo; usage ;;
+  check) show_check ;;
+  plan)
+    p="${1:-balanced}"; echo "profile=$p"; show_check; echo "planned: $(profile_values "$p")"; echo "will write: /etc/sysctl.d/99-sb-deploy.conf and /etc/systemd/journald.conf.d/sb-deploy-size.conf" ;;
+  sysctl) write_sysctl "${1:-balanced}" ;;
+  journald) write_journald "${1:-balanced}" ;;
+  apply)
+    p="${1:-balanced}"; write_sysctl "$p"; write_journald "$p"; log "OK: tune apply profile=$p" ;;
+  bbrv3) install_xanmod "${1:-auto}" ;;
+  kernel)
+    sub="${1:-}"; shift || true; [[ "$sub" == "xanmod" ]] || die "用法: sb-tune kernel xanmod [auto|v2|v3]"; install_xanmod "${1:-auto}" ;;
+  *) die "未知命令: $cmd" ;;
+esac

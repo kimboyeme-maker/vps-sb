@@ -1,0 +1,635 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SB_ROOT=/opt/sb-deploy
+F="$SB_ROOT/out/outbounds.json"
+ENV_FILE="$SB_ROOT/env/node.env"
+TPL="$SB_ROOT/templates/config.json.tpl"
+OUT="$SB_ROOT/out/config.json"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+
+for dep in jq envsubst; do
+  command -v "$dep" >/dev/null || die "缺依赖 $dep"
+done
+
+usage() {
+  cat >&2 <<U
+用法:
+  sb-outbound list
+  sb-outbound add <name> <type> <参数...>
+  sb-outbound del <name>
+  sb-outbound show <name>
+  sb-outbound enable <name>
+  sb-outbound disable
+
+  sb-outbound domain list
+  sb-outbound domain show <name>
+  sb-outbound domain set <name> [strategy]
+  sb-outbound domain del <name>
+  sb-outbound domain rm  <name>
+
+  sb-outbound inbound list
+  sb-outbound inbound allow <inbound[,inbound...]>
+  sb-outbound inbound set   <inbound[,inbound...]>
+  sb-outbound inbound del   <inbound[,inbound...]>
+  sb-outbound inbound rm    <inbound[,inbound...]>
+  sb-outbound inbound clear
+
+类型-参数:
+  socks <host> <port> [user] [pass]
+  http  <host> <port> [user] [pass]
+  ss    <host> <port> <method> <password>
+
+domain_strategy:
+  prefer_ipv4
+  prefer_ipv6
+  ipv4_only
+  ipv6_only
+
+例:
+  sb-outbound add isp1 socks proxy.example.com 1080 user pass
+  sb-outbound enable isp1
+
+  sb-outbound inbound set vless-in
+  sb-outbound inbound allow hy2-in
+  sb-outbound inbound rm hy2-in
+
+  sb-outbound domain set isp1 ipv4_only
+  sb-apply
+U
+  exit 1
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+set_env() {
+  local key="$1"
+  local value="$2"
+  local qvalue
+  local tmp
+
+  [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+
+  qvalue="$(shell_quote "$value")"
+  tmp="$(mktemp)"
+
+  awk -v k="$key" -v v="$qvalue" '
+    BEGIN { done=0 }
+    $0 ~ "^" k "=" {
+      print k "=" v
+      done=1
+      next
+    }
+    { print }
+    END {
+      if (!done) print k "=" v
+    }
+  ' "$ENV_FILE" > "$tmp"
+
+  install -m 600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+load_env() {
+  [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+  set -a
+  source "$ENV_FILE"
+  set +a
+}
+
+ensure_file() {
+  mkdir -p "$(dirname "$F")"
+
+  if [[ ! -f "$F" ]]; then
+    echo '[]' > "$F"
+    chmod 600 "$F"
+  fi
+
+  jq -e '
+    type == "array"
+    and all(.[]; type == "object")
+  ' "$F" >/dev/null || die "$F 必须是 array of objects"
+}
+
+available_inbounds_json() {
+  if [[ -f "$OUT" ]] && jq -e '.inbounds | type == "array"' "$OUT" >/dev/null 2>&1; then
+    jq -c '[.inbounds[]?.tag | select(. != null and . != "")]' "$OUT"
+    return 0
+  fi
+
+  [[ -f "$ENV_FILE" ]] || die "无法读取可选 inbound：缺 $ENV_FILE，先跑 sb-genenv"
+  [[ -f "$TPL" ]] || die "无法读取可选 inbound：缺 $TPL"
+
+  load_env
+
+  local tmp
+  tmp="$(mktemp)"
+
+  local VARS
+  VARS='${VLESS_PORT} ${HY2_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+
+  envsubst "$VARS" < "$TPL" > "$tmp"
+
+  if ! jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    die "无法从模板解析 .inbounds，请先确认 $TPL 是可渲染 JSON"
+  fi
+
+  jq -c '[.inbounds[]?.tag | select(. != null and . != "")]' "$tmp"
+  rm -f "$tmp"
+}
+
+available_inbounds_text() {
+  available_inbounds_json | jq -r 'join(", ")'
+}
+
+inbound_args_json() {
+  local raw="$*"
+  local item
+  local allowed_json
+  local allowed_text
+
+  raw="${raw//,/ }"
+  [[ -n "${raw// /}" ]] || die "缺少 inbound 参数"
+
+  allowed_json="$(available_inbounds_json)"
+  allowed_text="$(jq -r 'join(", ")' <<<"$allowed_json")"
+
+  [[ "$(jq 'length' <<<"$allowed_json")" != "0" ]] || die "没有可选 inbound，无法校验"
+
+  for item in $raw; do
+    if ! jq -e --arg t "$item" 'index($t) != null' <<<"$allowed_json" >/dev/null; then
+      die "非法 inbound tag: '$item'；可选值：${allowed_text}"
+    fi
+  done
+
+  printf '%s\n' $raw | jq -R . | jq -s '
+    map(select(length > 0))
+    | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+  '
+}
+
+ob_exists() {
+  local name="$1"
+  jq -e --arg n "$name" '
+    any(.[]; (.tag // .name) == $n)
+  ' "$F" >/dev/null
+}
+
+get_ob() {
+  local name="$1"
+  jq -c --arg n "$name" '
+    .[]
+    | select((.tag // .name) == $n)
+  ' "$F" | head -n 1
+}
+
+validate_domain_strategy() {
+  local ds="$1"
+
+  case "$ds" in
+    prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only)
+      return 0
+      ;;
+    *)
+      die "domain_strategy 仅支持 prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only，收到 '$ds'"
+      ;;
+  esac
+}
+
+write_json() {
+  local tmp="$1"
+  install -m 600 "$tmp" "$F"
+  rm -f "$tmp"
+}
+
+ensure_file
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  list)
+    jq -r '
+      if length == 0 then
+        "无自定义 outbound"
+      else
+        .[]
+        | [
+            (.tag // .name // "-"),
+            (.type // "-"),
+            ((.server // "-") + ":" + ((.server_port // "-") | tostring)),
+            (.domain_strategy // "-")
+          ]
+        | @tsv
+      end
+    ' "$F"
+    ;;
+
+  add)
+    name="${1:-}"
+    type="${2:-}"
+
+    [[ -n "$name" ]] || die "缺少参数: name"
+    [[ -n "$type" ]] || die "缺少参数: type (socks|http|ss)"
+    [[ "$type" == "socks" || "$type" == "http" || "$type" == "ss" ]] || die "type 仅支持 socks|http|ss，收到 '$type'"
+
+    ob_exists "$name" && die "outbound '$name' 已存在"
+
+    case "$type" in
+      socks|http)
+        server="${3:-}"
+        port="${4:-}"
+        user="${5:-}"
+        pass="${6:-}"
+
+        [[ -n "$server" ]] || die "缺少参数: $type 需要 <host>"
+        [[ -n "$port" ]] || die "缺少参数: $type 需要 <port>"
+        [[ "$port" =~ ^[0-9]+$ ]] || die "参数错误: port 必须是数字，收到 '$port'"
+        (( port >= 1 && port <= 65535 )) || die "参数错误: port 范围必须是 1-65535，收到 '$port'"
+
+        tmp="$(mktemp)"
+        jq \
+          --arg n "$name" \
+          --arg t "$type" \
+          --arg s "$server" \
+          --argjson p "$port" \
+          --arg u "$user" \
+          --arg pw "$pass" '
+          def norm:
+            map(
+              if (has("tag") | not) and has("name") then
+                . + {tag: .name}
+              else
+                .
+              end
+              | del(.name)
+            );
+
+          norm
+          | . += [
+              {
+                tag: $n,
+                type: $t,
+                server: $s,
+                server_port: ($p | tonumber)
+              }
+              + (
+                if $u != "" then
+                  {username: $u, password: $pw}
+                else
+                  {}
+                end
+              )
+            ]
+        ' "$F" > "$tmp"
+        ;;
+
+      ss)
+        server="${3:-}"
+        port="${4:-}"
+        method="${5:-}"
+        password="${6:-}"
+
+        [[ -n "$server" ]] || die "缺少参数: ss 需要 <host>"
+        [[ -n "$port" ]] || die "缺少参数: ss 需要 <port>"
+        [[ -n "$method" ]] || die "缺少参数: ss 需要 <method>"
+        [[ -n "$password" ]] || die "缺少参数: ss 需要 <password>"
+        [[ "$port" =~ ^[0-9]+$ ]] || die "参数错误: port 必须是数字，收到 '$port'"
+        (( port >= 1 && port <= 65535 )) || die "参数错误: port 范围必须是 1-65535，收到 '$port'"
+
+        tmp="$(mktemp)"
+        jq \
+          --arg n "$name" \
+          --arg s "$server" \
+          --argjson p "$port" \
+          --arg m "$method" \
+          --arg pw "$password" '
+          def norm:
+            map(
+              if (has("tag") | not) and has("name") then
+                . + {tag: .name}
+              else
+                .
+              end
+              | del(.name)
+            );
+
+          norm
+          | . += [
+              {
+                tag: $n,
+                type: "shadowsocks",
+                server: $s,
+                server_port: ($p | tonumber),
+                method: $m,
+                password: $pw
+              }
+            ]
+        ' "$F" > "$tmp"
+        ;;
+    esac
+
+    write_json "$tmp"
+    log "OK: 已加 outbound $name ($type)。跑 sb-apply 应用。"
+    ;;
+
+  del)
+    name="${1:-}"
+    [[ -n "$name" ]] || die "缺少参数: name"
+
+    ob_exists "$name" || die "无此 outbound '$name'"
+
+    tmp="$(mktemp)"
+    jq --arg n "$name" '
+      def norm:
+        map(
+          if (has("tag") | not) and has("name") then
+            . + {tag: .name}
+          else
+            .
+          end
+          | del(.name)
+        );
+
+      norm
+      | map(select(.tag != $n))
+    ' "$F" > "$tmp"
+
+    write_json "$tmp"
+    log "OK: 已删 outbound $name。跑 sb-apply 应用。"
+    ;;
+
+  show)
+    name="${1:-}"
+    [[ -n "$name" ]] || die "缺少参数: name"
+
+    ob_exists "$name" || die "无此 outbound '$name'"
+    get_ob "$name" | jq '.'
+    ;;
+
+  enable)
+    [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+
+    name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+      count="$(jq 'length' "$F")"
+
+      if [[ "$count" == "0" ]]; then
+        die "没有任何 outbound，请先 sb-outbound add"
+      elif [[ "$count" == "1" ]]; then
+        name="$(jq -r '.[0].tag // .[0].name' "$F")"
+        log "INFO: 未指定 name，自动选择唯一 outbound: $name"
+      else
+        die "存在多个 outbound，请明确指定：sb-outbound enable <name>"
+      fi
+    fi
+
+    ob_exists "$name" || die "无此 outbound '$name'"
+
+    ob="$(get_ob "$name")"
+    type="$(jq -r '.type' <<<"$ob")"
+    server="$(jq -r '.server // ""' <<<"$ob")"
+    port="$(jq -r '.server_port // ""' <<<"$ob")"
+    user="$(jq -r '.username // ""' <<<"$ob")"
+    pass="$(jq -r '.password // ""' <<<"$ob")"
+
+    [[ -n "$server" && "$server" != "null" ]] || die "outbound '$name' 缺 server"
+    [[ -n "$port" && "$port" != "null" ]] || die "outbound '$name' 缺 server_port"
+
+    set_env "UPSTREAM_ENABLED" "1"
+    set_env "UPSTREAM_NAME" "$name"
+    set_env "UPSTREAM_TYPE" "$type"
+    set_env "UPSTREAM_HOST" "$server"
+    set_env "UPSTREAM_PORT" "$port"
+    set_env "UPSTREAM_USER" "$user"
+    set_env "UPSTREAM_PASS" "$pass"
+
+    log "OK: 已启用 outbound '$name' 作为 UPSTREAM。"
+    log "INFO: egress=upstream 的用户会走 $name；跑 sb-apply 生效。"
+    ;;
+
+  disable)
+    [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+
+    set_env "UPSTREAM_ENABLED" "0"
+
+    log "OK: 已禁用 UPSTREAM（UPSTREAM_ENABLED=0）。跑 sb-apply 生效。"
+    ;;
+
+  domain)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      list)
+        jq -r '
+          if length == 0 then
+            "无自定义 outbound"
+          else
+            .[]
+            | [
+                (.tag // .name // "-"),
+                (.server // "-"),
+                ((.server_port // "-") | tostring),
+                (.domain_strategy // "<unset>")
+              ]
+            | @tsv
+          end
+        ' "$F"
+        ;;
+
+      show)
+        name="${1:-}"
+        [[ -n "$name" ]] || die "缺少参数: name"
+
+        ob_exists "$name" || die "无此 outbound '$name'"
+
+        get_ob "$name" | jq '{
+          tag: (.tag // .name),
+          server,
+          server_port,
+          domain_strategy: (.domain_strategy // null)
+        }'
+        ;;
+
+      set)
+        name="${1:-}"
+        strategy="${2:-ipv4_only}"
+
+        [[ -n "$name" ]] || die "缺少参数: name"
+        validate_domain_strategy "$strategy"
+
+        ob_exists "$name" || die "无此 outbound '$name'"
+
+        tmp="$(mktemp)"
+        jq --arg n "$name" --arg ds "$strategy" '
+          def norm:
+            map(
+              if (has("tag") | not) and has("name") then
+                . + {tag: .name}
+              else
+                .
+              end
+              | del(.name)
+            );
+
+          norm
+          | map(
+              if .tag == $n then
+                . + {domain_strategy: $ds}
+              else
+                .
+              end
+            )
+        ' "$F" > "$tmp"
+
+        write_json "$tmp"
+        log "OK: 已设置 outbound '$name' domain_strategy=$strategy。跑 sb-apply 应用。"
+        ;;
+
+      del|rm)
+        name="${1:-}"
+        [[ -n "$name" ]] || die "缺少参数: name"
+
+        ob_exists "$name" || die "无此 outbound '$name'"
+
+        tmp="$(mktemp)"
+        jq --arg n "$name" '
+          def norm:
+            map(
+              if (has("tag") | not) and has("name") then
+                . + {tag: .name}
+              else
+                .
+              end
+              | del(.name)
+            );
+
+          norm
+          | map(
+              if .tag == $n then
+                del(.domain_strategy)
+              else
+                .
+              end
+            )
+        ' "$F" > "$tmp"
+
+        write_json "$tmp"
+        log "OK: 已删除 outbound '$name' 的 domain_strategy。跑 sb-apply 应用。"
+        ;;
+
+      *)
+        usage
+        ;;
+    esac
+    ;;
+
+  inbound)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      list)
+        load_env
+        echo "current:"
+        if [[ -z "${UPSTREAM_INBOUNDS:-}" ]]; then
+          echo "  <empty>"
+        else
+          echo "$UPSTREAM_INBOUNDS" | tr ',' '\n' | sed 's/^/  /'
+        fi
+        echo "available:"
+        available_inbounds_json | jq -r '.[] | "  " + .'
+        ;;
+
+      allow)
+        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound inbound allow vless-in,hy2-in"
+        load_env
+
+        cur="${UPSTREAM_INBOUNDS:-}"
+        add_json="$(inbound_args_json "$@")"
+
+        new="$(
+          jq -nr \
+            --arg cur "$cur" \
+            --argjson add "$add_json" '
+            def splitcsv($s):
+              $s
+              | split(",")
+              | map(gsub("^\\s+|\\s+$"; ""))
+              | map(select(length > 0));
+
+            (splitcsv($cur) + $add)
+            | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+            | join(",")
+          '
+        )"
+
+        set_env "UPSTREAM_INBOUNDS" "$new"
+        log "OK: UPSTREAM_INBOUNDS=${new:-<empty>}。跑 sb-apply 生效。"
+        ;;
+
+      set)
+        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound inbound set vless-in,hy2-in"
+
+        set_json="$(inbound_args_json "$@")"
+        new="$(jq -r 'join(",")' <<<"$set_json")"
+
+        set_env "UPSTREAM_INBOUNDS" "$new"
+        log "OK: UPSTREAM_INBOUNDS=${new:-<empty>}。跑 sb-apply 生效。"
+        ;;
+
+      del|rm)
+        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound inbound rm hy2-in"
+        load_env
+
+        cur="${UPSTREAM_INBOUNDS:-}"
+        del_json="$(inbound_args_json "$@")"
+
+        new="$(
+          jq -nr \
+            --arg cur "$cur" \
+            --argjson del "$del_json" '
+            def splitcsv($s):
+              $s
+              | split(",")
+              | map(gsub("^\\s+|\\s+$"; ""))
+              | map(select(length > 0));
+
+            splitcsv($cur)
+            | map(select(. as $x | ($del | index($x) | not)))
+            | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+            | join(",")
+          '
+        )"
+
+        set_env "UPSTREAM_INBOUNDS" "$new"
+
+        if [[ -z "$new" ]]; then
+          log "WARN: UPSTREAM_INBOUNDS 已为空；sb-apply 不会生成 upstream 路由规则。"
+        else
+          log "OK: UPSTREAM_INBOUNDS=$new。跑 sb-apply 生效。"
+        fi
+        ;;
+
+      clear)
+        set_env "UPSTREAM_INBOUNDS" ""
+        log "OK: UPSTREAM_INBOUNDS=<empty>。跑 sb-apply 生效。"
+        ;;
+
+      *)
+        usage
+        ;;
+    esac
+    ;;
+
+  *)
+    usage
+    ;;
+esac

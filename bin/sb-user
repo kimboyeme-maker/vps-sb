@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SB_ROOT=/opt/sb-deploy
+F="$SB_ROOT/env/users.json"
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+command -v jq >/dev/null || die "缺 jq"
+
+usage() { cat >&2 <<U
+用法:
+  sb-user list
+  sb-user add  [direct|upstream] [alias]   # 账号(hex4)/密码(hex16)自动生成
+  sb-user del  <account|alias>                   # 删用户（别名 rm / remove）
+  sb-user set-egress <account> <direct|upstream>
+
+egress 含义（决定该用户的出口）:
+  direct   = 从本机 SJC 直接出网，对端看到本机美国原生 IP（吃 xTom 三网回程）
+  upstream = 经本机转发到落地上游（住宅 SOCKS5 / 链的其它节点），对端看到住宅 IP
+             需在 node.env 里 UPSTREAM_ENABLED=1 并填 HOST/PORT/认证才真正生效
+alias 仅本地备注用途（如 chatgpt / netflix / bob-laptop），不进 config.json，
+      只用于 list 显示和订阅节点命名。用单个 token，不要带空格。
+改完记得跑 sb-apply 生效。
+U
+exit 1; }
+
+[[ -f "$F" ]] || die "缺 $F，先跑 sb-genenv"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list)
+    printf 'account\t\tegress\talias\tuuid\n'
+    jq -r '.[] | "\(.name)\t\(.egress)\t\(.alias // "-")\t\(.uuid)"' "$F" ;;
+  add)
+    eg="${1:-direct}"; alias="${2:-}"
+    [[ "$eg" == direct || "$eg" == upstream ]] || die "egress 只能 direct|upstream"
+    name="$(openssl rand -hex 4)"          # 账号：8 hex 字符
+    while jq -e --arg n "$name" 'any(.[]; .name==$n)' "$F" >/dev/null; do name="$(openssl rand -hex 4)"; done
+    # 如果指定了 alias，检查 alias 是否已存在（alias 是唯一键）
+    if [[ -n "$alias" ]]; then
+      jq -e --arg a "$alias" 'any(.[]; .alias==$a)' "$F" >/dev/null && die "alias '$alias' 已存在"
+    fi
+    uuid="$(sing-box generate uuid)"
+    pw="$(openssl rand -hex 16)"           # 密码：32 hex 字符
+    tmp="$(mktemp)"
+    jq --arg n "$name" --arg u "$uuid" --arg p "$pw" --arg e "$eg" --arg a "$alias" \
+       '. += [ {name:$n, uuid:$u, password:$p, egress:$e, alias:$a} ]' "$F" > "$tmp"
+    install -m 600 "$tmp" "$F"; rm -f "$tmp"
+    # 读取当前 UPSTREAM_ENABLED 状态
+    UPSTREAM_STATUS="$(grep '^UPSTREAM_ENABLED=' "$SB_ROOT/env/node.env" 2>/dev/null | cut -d= -f2 || echo '?')"
+    [[ "$eg" == "upstream" ]] && UPSTREAM_NOTE=" | 外跳状态: UPSTREAM_ENABLED=$UPSTREAM_STATUS" || UPSTREAM_NOTE=""
+    log "INFO: 新用户已生成 → account=$name  password=$pw  uuid=$uuid  egress=$eg  alias=${alias:-<none>}$UPSTREAM_NOTE"
+    log "OK: 已写入 users.json，跑 sb-apply 生效。" ;;
+  del|rm|remove)
+    key="${1:-}"; [[ -n "$key" ]] || usage
+    # 支持按 name 或 alias 删除
+    jq -e --arg k "$key" 'any(.[]; .name==$k or .alias==$k)' "$F" >/dev/null || die "无此用户(按 account 或 alias): $key"
+    tmp="$(mktemp)"; jq --arg k "$key" 'map(select(.name!=$k and .alias!=$k))' "$F" > "$tmp"
+    install -m 600 "$tmp" "$F"; rm -f "$tmp"
+    log "OK: 已删用户 $key。跑 sb-apply 生效。" ;;
+  set-egress)
+    key="${1:-}"; eg="${2:-}"; [[ -n "$key" && -n "$eg" ]] || usage
+    [[ "$eg" == direct || "$eg" == upstream ]] || die "egress 只能 direct|upstream"
+    jq -e --arg k "$key" 'any(.[]; .name==$k or .alias==$k)' "$F" >/dev/null || die "无此用户 $key"
+    tmp="$(mktemp)"; jq --arg k "$key" --arg e "$eg" \
+      'map(if .name==$k or .alias==$k then .egress=$e else . end)' "$F" > "$tmp"
+    install -m 600 "$tmp" "$F"; rm -f "$tmp"
+    log "OK: $key egress=$eg。跑 sb-apply 生效。" ;;
+  *) usage ;;
+esac

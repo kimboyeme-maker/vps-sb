@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SB_ROOT=/opt/sb-deploy
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "FAIL: $*"; exit 1; }
+
+read -p "警告: 即将删除 env/ certs/ out/。确认吗? (yes/no) " confirm
+[[ "$confirm" == "yes" ]] || { log "已取消"; exit 0; }
+
+log "清空 env/"
+rm -rf "$SB_ROOT/env/"*
+log "清空 certs/"
+rm -rf "$SB_ROOT/certs/"*
+log "清空 out/"
+rm -rf "$SB_ROOT/out/"*
+
+log "OK: 已清空所有文件。重新部署请跑 sb-genenv"
+EOF

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+BROOT="$SB_ROOT/backups"
+log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die(){ log "FAIL: $*"; exit 1; }
+summary(){ cat <<'S'
+summary:
+  sb-backup 管理 /opt/sb-deploy 快照。sb-apply 成功后可以调用
+  sb-backup auto-apply-success 自动备份；失败不会备份。
+S
+}
+usage(){ cat <<'U'
+usage:
+  sb-backup summary
+  sb-backup help|-h|--help
+  sb-backup create [reason]
+  sb-backup auto-apply-success
+  sb-backup list
+  sb-backup show <id>
+  sb-backup diff <id>
+  sb-backup restore <id>
+  sb-backup prune <keep-count>
+
+notes:
+  - 备份包含 env/ certs/ templates/ bin/ out/config.json out/outbounds.json out/inbounds.json
+  - 不包含 out/sub 订阅产物，避免备份过大
+  - restore 会覆盖当前配置，恢复后建议 sb-apply
+U
+}
+mkdir -p "$BROOT"
+backup_id(){ date -u +%Y%m%dT%H%M%SZ; }
+copy_path(){
+  local src="$1" dst="$2"
+  [[ -e "$src" ]] || return 0
+  mkdir -p "$(dirname "$dst")"
+  cp -a "$src" "$dst"
+}
+create_backup(){
+  local reason="${1:-manual}" id dir
+  id="$(backup_id)"; dir="$BROOT/$id"
+  while [[ -e "$dir" ]]; do sleep 1; id="$(backup_id)"; dir="$BROOT/$id"; done
+  mkdir -p "$dir/root"; chmod 700 "$dir"
+  copy_path "$SB_ROOT/env" "$dir/root/env"
+  copy_path "$SB_ROOT/certs" "$dir/root/certs"
+  copy_path "$SB_ROOT/templates" "$dir/root/templates"
+  copy_path "$SB_ROOT/bin" "$dir/root/bin"
+  mkdir -p "$dir/root/out"
+  copy_path "$SB_ROOT/out/config.json" "$dir/root/out/config.json"
+  copy_path "$SB_ROOT/out/outbounds.json" "$dir/root/out/outbounds.json"
+  copy_path "$SB_ROOT/out/inbounds.json" "$dir/root/out/inbounds.json"
+  cat > "$dir/manifest.json" <<JSON
+{"id":"$id","created_at":"$(date -u +%FT%TZ)","reason":"$reason","root":"$SB_ROOT"}
+JSON
+  chmod -R go-rwx "$dir"
+  echo "$id"
+}
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  summary) summary ;;
+  help|-h|--help|"") summary; echo; usage ;;
+  create) id="$(create_backup "${1:-manual}")"; log "OK: backup created $id" ;;
+  auto-apply-success)
+    [[ "${SB_BACKUP_ON_APPLY:-1}" == "1" ]] || exit 0
+    id="$(create_backup "apply-success")"; log "OK: auto backup created $id" ;;
+  list)
+    find "$BROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r | while read -r id; do
+      [[ -f "$BROOT/$id/manifest.json" ]] && jq -r '"\(.id)\t\(.created_at)\t\(.reason)"' "$BROOT/$id/manifest.json" || echo "$id"
+    done ;;
+  show)
+    id="${1:-}"; [[ -n "$id" ]] || die "用法: sb-backup show <id>"; [[ -d "$BROOT/$id" ]] || die "backup 不存在: $id"
+    jq . "$BROOT/$id/manifest.json"; find "$BROOT/$id/root" -maxdepth 3 -type f | sed "s#^$BROOT/$id/root/##" | sort ;;
+  diff)
+    id="${1:-}"; [[ -n "$id" ]] || die "用法: sb-backup diff <id>"; [[ -d "$BROOT/$id/root" ]] || die "backup 不存在: $id"
+    diff -ruN "$BROOT/$id/root" "$SB_ROOT" --exclude backups --exclude 'out/sub' || true ;;
+  restore)
+    id="${1:-}"; [[ -n "$id" ]] || die "用法: sb-backup restore <id>"; [[ -d "$BROOT/$id/root" ]] || die "backup 不存在: $id"
+    cur="$(create_backup "pre-restore-$id")"; log "INFO: restore 前已创建当前快照 $cur"
+    for d in env certs templates bin; do [[ -e "$BROOT/$id/root/$d" ]] && rm -rf "$SB_ROOT/$d" && cp -a "$BROOT/$id/root/$d" "$SB_ROOT/$d"; done
+    mkdir -p "$SB_ROOT/out"
+    for f in config.json outbounds.json inbounds.json; do [[ -e "$BROOT/$id/root/out/$f" ]] && cp -a "$BROOT/$id/root/out/$f" "$SB_ROOT/out/$f"; done
+    log "OK: restored $id。建议运行 sb-apply" ;;
+  prune)
+    keep="${1:-20}"; [[ "$keep" =~ ^[0-9]+$ ]] || die "keep-count 必须是数字"
+    mapfile -t ids < <(find "$BROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r)
+    for ((i=keep; i<${#ids[@]}; i++)); do rm -rf "$BROOT/${ids[$i]}"; log "DEL: ${ids[$i]}"; done ;;
+  *) die "未知命令: $cmd" ;;
+esac

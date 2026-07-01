@@ -1,0 +1,803 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SB_ROOT=/opt/sb-deploy
+ENV_FILE="$SB_ROOT/env/node.env"
+USERS_FILE="$SB_ROOT/env/users.json"
+INBOUNDS_FILE="$SB_ROOT/env/inbounds.json"
+TPL="$SB_ROOT/templates/config.json.tpl"
+OUT="$SB_ROOT/out/config.json"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+dbg() { [[ "${DEBUG:-0}" == 1 ]] && printf '[debug] %s\n' "$*" >&2 || true; }
+die() { log "FAIL: $*"; exit 1; }
+
+usage() {
+  cat <<'U'
+usage:
+  sb-apply
+  sb-apply help
+  sb-apply -h
+  sb-apply --help
+
+summary:
+  sb-apply 是最终编译器：
+
+    1. 读取 env/node.env
+    2. 渲染 templates/config.json.tpl
+    3. 自动读取 env/inbounds.json
+    4. 自动处理 sb-inbound 记录的 set/rm/clone/delete
+    5. 按 inbound type 自动注入 users
+    6. 检查所有 inbound listen_port 是否符合端口策略
+    7. 自动合并 out/outbounds.json
+    8. 自动生成 upstream route
+    9. 自动校验 UPSTREAM_INBOUNDS
+   10. 自动计算 HY2 range
+   11. sing-box check 通过后才落盘
+   12. 重启 sing-box
+   13. UFW 端口对账
+   14. HY2 range nftables dnat 对账
+
+port policy:
+  INBOUND_PORT_MIN=20000
+    - 所有 inbound listen_port 低于该值直接失败
+
+  INBOUND_PORT_SUGGEST_MIN=40000
+    - 低于该值允许，但 WARN
+    - 建议所有协议使用 40000+ 高位端口
+
+notes:
+  - 改了 node.env / users.json / outbounds.json / inbounds.json 后都跑 sb-apply
+  - sing-box check 不通过时不会覆盖正式 config
+  - HY2_RANGE_ENABLED=1 时需要系统有 nft 命令
+U
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+[[ $# -eq 0 ]] || {
+  usage >&2
+  die "参数过多"
+}
+
+[[ -f "$ENV_FILE"   ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+[[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，先跑 sb-genenv"
+[[ -f "$TPL"        ]] || die "缺 $TPL"
+
+for dep in envsubst jq sing-box ufw ss awk grep sort head; do
+  command -v "$dep" >/dev/null || die "缺依赖 $dep"
+done
+
+ensure_env_default() {
+  local key="$1"
+  local value="$2"
+
+  grep -q "^${key}=" "$ENV_FILE" || {
+    echo "${key}=${value}" >> "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  }
+}
+
+ensure_env_default "SOCKS5_PORT" "40080"
+ensure_env_default "INBOUND_PORT_MIN" "20000"
+ensure_env_default "INBOUND_PORT_SUGGEST_MIN" "40000"
+ensure_env_default "HY2_RANGE_HOP_INTERVAL" "30"
+
+dbg "载入并导出 node.env"
+set -a
+source "$ENV_FILE"
+set +a
+
+validate_domain_strategy() {
+  local ds="${1:-}"
+
+  [[ -z "$ds" ]] && return 0
+
+  case "$ds" in
+    prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only)
+      return 0
+      ;;
+    *)
+      die "domain_strategy 仅支持 prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only，收到 '$ds'"
+      ;;
+  esac
+}
+
+validate_port_policy() {
+  INBOUND_PORT_MIN="${INBOUND_PORT_MIN:-20000}"
+  INBOUND_PORT_SUGGEST_MIN="${INBOUND_PORT_SUGGEST_MIN:-40000}"
+
+  [[ "$INBOUND_PORT_MIN" =~ ^[0-9]+$ ]] || die "INBOUND_PORT_MIN 必须是数字，收到 '$INBOUND_PORT_MIN'"
+  [[ "$INBOUND_PORT_SUGGEST_MIN" =~ ^[0-9]+$ ]] || die "INBOUND_PORT_SUGGEST_MIN 必须是数字，收到 '$INBOUND_PORT_SUGGEST_MIN'"
+
+  (( INBOUND_PORT_MIN >= 1 && INBOUND_PORT_MIN <= 65535 )) || die "INBOUND_PORT_MIN 范围必须是 1-65535"
+  (( INBOUND_PORT_SUGGEST_MIN >= INBOUND_PORT_MIN && INBOUND_PORT_SUGGEST_MIN <= 65535 )) || die "INBOUND_PORT_SUGGEST_MIN 必须 >= INBOUND_PORT_MIN 且 <= 65535"
+}
+
+validate_port() {
+  local name="$1"
+  local port="$2"
+
+  [[ "$port" =~ ^[0-9]+$ ]] || die "$name 必须是数字，收到 '$port'"
+  (( port >= 1 && port <= 65535 )) || die "$name 范围必须是 1-65535，收到 '$port'"
+}
+
+validate_offset() {
+  local offset="$1"
+
+  [[ "$offset" =~ ^[0-9]+$ ]] || die "HY2_RANGE_OFFSET 必须是数字，收到 '$offset'"
+  (( offset >= 2 && offset <= 60000 )) || die "HY2_RANGE_OFFSET 范围建议是 2-60000，收到 '$offset'"
+}
+
+validate_domain_strategy "${UPSTREAM_DOMAIN_STRATEGY:-}"
+validate_port_policy
+
+if [[ "${UPSTREAM_ENABLED:-0}" == "1" ]]; then
+  if [[ -z "${UPSTREAM_NAME:-}" ]]; then
+    [[ -n "${UPSTREAM_HOST:-}" && -n "${UPSTREAM_PORT:-}" ]] || die "UPSTREAM_ENABLED=1 且 UPSTREAM_NAME 为空时，HOST/PORT 不能为空"
+  fi
+fi
+
+if [[ "${UPSTREAM_ENABLED:-0}" != "1" ]] && jq -e 'any(.[]; .egress=="upstream")' "$USERS_FILE" >/dev/null; then
+  log "WARN: 存在 egress=upstream 的用户但 UPSTREAM_ENABLED=0，这些用户将直出。"
+fi
+
+if [[ "${UPSTREAM_ENABLED:-0}" == "1" ]] \
+  && jq -e 'any(.[]; .egress=="upstream")' "$USERS_FILE" >/dev/null \
+  && [[ -z "${UPSTREAM_INBOUNDS:-}" ]]; then
+  log "WARN: UPSTREAM_INBOUNDS 为空，本次不会生成 upstream 路由规则，egress=upstream 用户会落到 catch-all direct。"
+fi
+
+if [[ "${HY2_OBFS:-salamander}" == "salamander" && -z "${HY2_OBFS_PASS:-}" ]]; then
+  die "HY2_OBFS=salamander 但 HY2_OBFS_PASS 为空，请先检查 $ENV_FILE"
+fi
+
+if [[ "${HY2_RANGE_ENABLED:-0}" == "1" ]]; then
+  [[ -n "${HY2_RANGE_TAG:-}" ]] || die "HY2_RANGE_ENABLED=1 但 HY2_RANGE_TAG 为空"
+  [[ -n "${HY2_RANGE_OFFSET:-}" ]] || die "HY2_RANGE_ENABLED=1 但 HY2_RANGE_OFFSET 为空"
+  validate_offset "$HY2_RANGE_OFFSET"
+fi
+
+TMP="$(mktemp)"
+TMP2="$(mktemp)"
+
+dbg "envsubst 填标量"
+VARS='${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+envsubst "$VARS" < "$TPL" > "$TMP"
+
+dbg "读取 inbound overlay"
+
+INBOUND_PATCH_JSON='{"version":1,"patch":{},"delete_fields":{},"delete_inbounds":[],"clones":{}}'
+
+if [[ -f "$INBOUNDS_FILE" ]]; then
+  INBOUND_PATCH_JSON="$(
+    jq -c '
+      if type != "object" then
+        error("inbounds.json 必须是 object")
+      else
+        .
+      end
+      | .version = (.version // 1)
+      | .patch = (.patch // {})
+      | .delete_fields = (.delete_fields // {})
+      | .delete_inbounds = (.delete_inbounds // [])
+      | .clones = (.clones // {})
+
+      | if (.patch | type) != "object" then error(".patch 必须是 object") else . end
+      | if (.delete_fields | type) != "object" then error(".delete_fields 必须是 object") else . end
+      | if (.delete_inbounds | type) != "array" then error(".delete_inbounds 必须是 array") else . end
+      | if (.clones | type) != "object" then error(".clones 必须是 object") else . end
+
+      | .delete_inbounds = (
+          .delete_inbounds
+          | map(tostring)
+          | unique
+        )
+
+      | .delete_fields = (
+          .delete_fields
+          | with_entries(
+              .value = (
+                if (.value | type) == "array" then
+                  (.value | map(tostring) | unique)
+                else
+                  error(".delete_fields." + .key + " 必须是 array")
+                end
+              )
+            )
+        )
+
+      | .clones = (
+          .clones
+          | with_entries(
+              .value = (
+                if (.value | type) == "object" then
+                  .value
+                else
+                  error(".clones." + .key + " 必须是 object")
+                end
+              )
+            )
+        )
+    ' "$INBOUNDS_FILE"
+  )" || die "$INBOUNDS_FILE 格式错误"
+fi
+
+dbg "读取自定义 outbounds"
+
+CUSTOM_OB_JSON='[]'
+
+if [[ -f "$SB_ROOT/out/outbounds.json" ]]; then
+  CUSTOM_OB_JSON="$(jq -c '
+    def valid_ds($ds):
+      ["prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only"] | index($ds);
+
+    def normalize_outbounds:
+      if type == "array" then
+        .
+      elif type == "object" then
+        [.]
+      else
+        error("outbounds.json 必须是 object 或 array")
+      end;
+
+    normalize_outbounds
+    | if any(.[]; type != "object") then
+        error("outbounds.json 数组里必须全是 object，不能数组套数组")
+      else
+        .
+      end
+
+    | map(
+        if (has("tag") | not) and has("name") then
+          . + {tag: .name}
+        else
+          .
+        end
+        | del(.name)
+
+        | if has("domain_strategy") then
+            .domain_strategy as $ds
+            | if ($ds == null or $ds == "" or $ds == "none" or $ds == "as_is") then
+                del(.domain_strategy)
+              elif valid_ds($ds) then
+                .
+              else
+                error("不支持的 domain_strategy: " + ($ds | tostring))
+              end
+          else
+            .
+          end
+      )
+
+    | if any(.[]; ((.tag // "") == "")) then
+        error("outbounds.json 每个 outbound 都必须有 tag 或 name")
+      else
+        .
+      end
+
+    | if (([.[].tag] | length) != ([.[].tag] | unique | length)) then
+        error("outbounds.json 存在重复 tag")
+      else
+        .
+      end
+  ' "$SB_ROOT/out/outbounds.json")" || die "$SB_ROOT/out/outbounds.json 格式错误"
+fi
+
+dbg "jq 组装 inbounds / users / upstream / outbounds / rules"
+
+jq \
+  --slurpfile users "$USERS_FILE" \
+  --argjson inbound_patch "$INBOUND_PATCH_JSON" \
+  --argjson custom_ob "$CUSTOM_OB_JSON" \
+  --arg up_en  "${UPSTREAM_ENABLED:-0}" \
+  --arg up_name "${UPSTREAM_NAME:-}" \
+  --arg up_type "${UPSTREAM_TYPE:-socks}" \
+  --arg up_host "${UPSTREAM_HOST:-}" \
+  --argjson up_port "${UPSTREAM_PORT:-0}" \
+  --arg up_user "${UPSTREAM_USER:-}" \
+  --arg up_pass "${UPSTREAM_PASS:-}" \
+  --arg up_ds "${UPSTREAM_DOMAIN_STRATEGY:-}" \
+  --arg up_inbounds "${UPSTREAM_INBOUNDS:-}" \
+  --arg hy2_obfs "${HY2_OBFS:-salamander}" \
+  --arg hy2_obfs_pass "${HY2_OBFS_PASS:-}" '
+  def csv_tags($s):
+    $s
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; ""))
+    | map(select(length > 0));
+
+  def deepmerge($a; $b):
+    reduce ($b | keys_unsorted[]) as $k ($a;
+      .[$k] =
+        (
+          if ((.[$k] | type) == "object") and (($b[$k] | type) == "object") then
+            deepmerge(.[$k]; $b[$k])
+          else
+            $b[$k]
+          end
+        )
+    );
+
+  def tag_list:
+    [.inbounds[]?.tag | select(. != null and . != "")];
+
+  def tag_text:
+    (tag_list | join(", "));
+
+  def require_unique_inbound_tags:
+    if ((tag_list | length) != (tag_list | unique | length)) then
+      error("最终 inbounds 存在重复 tag")
+    else
+      .
+    end;
+
+  def require_all_inbounds_have_tag:
+    if any(.inbounds[]?; ((.tag // "") == "")) then
+      error("存在没有 tag 的 inbound")
+    else
+      .
+    end;
+
+  ($users[0]) as $u
+  | (csv_tags($up_inbounds)) as $route_inbounds
+
+  | reduce (($inbound_patch.clones // {}) | to_entries[]) as $c (.;
+      if (.inbounds | any(.tag == $c.key)) then
+        error("clone 目标 inbound 已存在: " + $c.key)
+      elif (($c.value.from // "") == "") then
+        error("clone " + $c.key + " 缺 from")
+      elif (.inbounds | any(.tag == $c.value.from) | not) then
+        error("clone 来源 inbound 不存在: " + ($c.value.from // "") + "；可选值：" + tag_text)
+      else
+        (.inbounds[] | select(.tag == $c.value.from)) as $src
+        | .inbounds += [
+            (
+              $src
+              + {tag: $c.key}
+              + (
+                if ($c.value.listen_port // null) != null then
+                  {listen_port: $c.value.listen_port}
+                else
+                  {}
+                end
+              )
+            )
+          ]
+      end
+    )
+
+  | require_all_inbounds_have_tag
+  | require_unique_inbound_tags
+
+  | .inbounds |= map(
+      if .type == "vless" then
+        .users = [ $u[] | {uuid, name, flow:"xtls-rprx-vision"} ]
+      elif .type == "hysteria2" then
+        .users = [ $u[] | {name, password} ]
+      elif .type == "socks" then
+        .users = [ $u[] | {username: .name, password} ]
+      else
+        .
+      end
+    )
+
+  | .inbounds |= map(
+      if .type == "hysteria2" then
+        if $hy2_obfs == "salamander" then
+          if $hy2_obfs_pass == "" then
+            error("HY2_OBFS=salamander 但 HY2_OBFS_PASS 为空")
+          else
+            .obfs = {
+              type: "salamander",
+              password: $hy2_obfs_pass
+            }
+          end
+        elif $hy2_obfs == "plain" or $hy2_obfs == "none" or $hy2_obfs == "" then
+          del(.obfs)
+        else
+          error("HY2_OBFS 只支持 salamander / plain / none")
+        end
+      else
+        .
+      end
+    )
+
+  | reduce (($inbound_patch.patch // {}) | to_entries[]) as $p (.;
+      if (.inbounds | any(.tag == $p.key)) then
+        .inbounds |= map(
+          if .tag == $p.key then
+            deepmerge(.; $p.value)
+          else
+            .
+          end
+        )
+      else
+        error("inbounds.json 修改了不存在的 inbound: " + $p.key + "；可选值：" + tag_text)
+      end
+    )
+
+  | reduce (($inbound_patch.delete_fields // {}) | to_entries[]) as $d (.;
+      if (.inbounds | any(.tag == $d.key)) then
+        .inbounds |= map(
+          if .tag == $d.key then
+            reduce (($d.value // [])[]) as $key (.;
+              delpaths([($key | split("."))])
+            )
+          else
+            .
+          end
+        )
+      else
+        error("inbounds.json 删除字段引用了不存在的 inbound: " + $d.key + "；可选值：" + tag_text)
+      end
+    )
+
+  | ($inbound_patch.delete_inbounds // []) as $deleted
+  | .inbounds |= map(
+      select(.tag as $t | ($deleted | index($t) | not))
+    )
+
+  | require_all_inbounds_have_tag
+  | require_unique_inbound_tags
+
+  | (tag_list) as $valid_inbounds
+  | ([ $route_inbounds[] | select(. as $x | ($valid_inbounds | index($x) | not)) ]) as $bad_inbounds
+  | if ($bad_inbounds | length) > 0 then
+      error(
+        "UPSTREAM_INBOUNDS 包含不存在的 inbound: "
+        + ($bad_inbounds | join(", "))
+        + "；可选值："
+        + ($valid_inbounds | join(", "))
+      )
+    else
+      .
+    end
+
+  | if ($custom_ob | length) > 0 then
+      .outbounds |= . + $custom_ob
+    else
+      .
+    end
+
+  | ($up_en=="1") as $on
+  | ([ $u[] | select(.egress=="upstream") | .name ]) as $upnames
+
+  | if $on and ($upnames | length > 0) and ($route_inbounds | length > 0) then
+      if $up_name != "" then
+        if (.outbounds | any(.tag == $up_name)) then
+          .route.rules += [
+            {
+              inbound: $route_inbounds,
+              auth_user: $upnames,
+              outbound: $up_name
+            }
+          ]
+        else
+          error("UPSTREAM_NAME=" + $up_name + " 但 outbounds.json / outbounds 里没有同名 tag")
+        end
+      else
+        .outbounds += [
+          {
+            type: $up_type,
+            tag: "upstream",
+            server: $up_host,
+            server_port: $up_port
+          }
+          + (
+            if $up_ds != "" then
+              {domain_strategy: $up_ds}
+            else
+              {}
+            end
+          )
+          + (
+            if $up_user != "" then
+              {username: $up_user, password: $up_pass}
+            else
+              {}
+            end
+          )
+        ]
+        | .route.rules += [
+            {
+              inbound: $route_inbounds,
+              auth_user: $upnames,
+              outbound: "upstream"
+            }
+          ]
+      end
+    else
+      .
+    end
+
+  | if ((.outbounds | map(.tag) | length) != (.outbounds | map(.tag) | unique | length)) then
+      error("最终 outbounds 存在重复 tag")
+    else
+      .
+    end
+
+  | .route.rules += [
+      {
+        outbound: "direct"
+      }
+    ]
+' "$TMP" > "$TMP2" || die "jq 组装失败"
+
+dbg "检查最终 inbound 端口策略"
+
+NON_NUM_PORTS="$(
+  jq -r '
+    .inbounds[]?
+    | select(.listen_port != null)
+    | select((.listen_port | tostring | test("^[0-9]+$")) | not)
+    | "\(.tag):\(.listen_port)"
+  ' "$TMP2"
+)"
+
+if [[ -n "$NON_NUM_PORTS" ]]; then
+  die "存在非数字 listen_port:
+$NON_NUM_PORTS"
+fi
+
+BAD_PORTS="$(
+  jq -r --argjson min "$INBOUND_PORT_MIN" '
+    .inbounds[]?
+    | select(.listen_port != null)
+    | select((.listen_port | tonumber) < $min)
+    | "\(.tag):\(.listen_port)"
+  ' "$TMP2"
+)"
+
+if [[ -n "$BAD_PORTS" ]]; then
+  die "存在低于 INBOUND_PORT_MIN=${INBOUND_PORT_MIN} 的 inbound 端口:
+$BAD_PORTS
+
+处理方式示例:
+  sb-inbound set vless-in listen_port 40443
+  sb-inbound set hy2-in listen_port 40500
+  sb-inbound set socks5-in listen_port 40080
+  sb-apply"
+fi
+
+WARN_PORTS="$(
+  jq -r --argjson min "$INBOUND_PORT_MIN" --argjson sug "$INBOUND_PORT_SUGGEST_MIN" '
+    .inbounds[]?
+    | select(.listen_port != null)
+    | select((.listen_port | tonumber) >= $min and (.listen_port | tonumber) < $sug)
+    | "\(.tag):\(.listen_port)"
+  ' "$TMP2"
+)"
+
+if [[ -n "$WARN_PORTS" ]]; then
+  log "WARN: 以下 inbound 端口低于建议值 INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN}，建议使用 ${INBOUND_PORT_SUGGEST_MIN}+："
+  while read -r line; do
+    [[ -n "$line" ]] && log "WARN:   $line"
+  done <<< "$WARN_PORTS"
+fi
+
+dbg "计算 HY2 range"
+
+HY2_RANGE_ALLOW=""
+HY2_RANGE_INFO=""
+HY2_RANGE_START=""
+HY2_RANGE_END=""
+HY2_RANGE_PORT=""
+HY2_RANGE_TAG_FINAL=""
+
+if [[ "${HY2_RANGE_ENABLED:-0}" == "1" ]]; then
+  command -v nft >/dev/null || die "HY2 range 需要 nftables，请先安装: apt install -y nftables"
+
+  HY2_RANGE_TAG_FINAL="${HY2_RANGE_TAG:-hy2-in}"
+
+  HY2_RANGE_TYPE="$(
+    jq -r --arg tag "$HY2_RANGE_TAG_FINAL" '
+      .inbounds[]?
+      | select(.tag == $tag)
+      | .type // empty
+    ' "$TMP2" | head -n 1
+  )"
+
+  if [[ -z "$HY2_RANGE_TYPE" ]]; then
+    AVAIL="$(jq -r '[.inbounds[]?.tag | select(. != null and . != "")] | join(", ")' "$TMP2")"
+    die "HY2_RANGE_TAG=$HY2_RANGE_TAG_FINAL 不存在；可选值：${AVAIL:-<none>}"
+  fi
+
+  [[ "$HY2_RANGE_TYPE" == "hysteria2" ]] || die "HY2_RANGE_TAG=$HY2_RANGE_TAG_FINAL 不是 hysteria2 inbound，当前 type=$HY2_RANGE_TYPE"
+
+  HY2_RANGE_PORT="$(
+    jq -r --arg tag "$HY2_RANGE_TAG_FINAL" '
+      .inbounds[]?
+      | select(.tag == $tag)
+      | .listen_port // empty
+    ' "$TMP2" | head -n 1
+  )"
+
+  [[ -n "$HY2_RANGE_PORT" ]] || die "HY2_RANGE_TAG=$HY2_RANGE_TAG_FINAL 没有 listen_port"
+
+  validate_port "HY2_RANGE_PORT" "$HY2_RANGE_PORT"
+  validate_offset "$HY2_RANGE_OFFSET"
+
+  HALF=$(( HY2_RANGE_OFFSET / 2 ))
+  HY2_RANGE_START=$(( HY2_RANGE_PORT - HALF ))
+  HY2_RANGE_END=$(( HY2_RANGE_PORT + HALF ))
+
+  (( HY2_RANGE_START >= 1 )) || die "HY2 range 起始端口小于 1：${HY2_RANGE_START}"
+  (( HY2_RANGE_END <= 65535 )) || die "HY2 range 结束端口大于 65535：${HY2_RANGE_END}"
+  (( HY2_RANGE_START <= HY2_RANGE_END )) || die "HY2 range 非法：${HY2_RANGE_START}-${HY2_RANGE_END}"
+
+  if (( HY2_RANGE_START < INBOUND_PORT_MIN )); then
+    SUGGEST_BASE=$(( INBOUND_PORT_MIN + HALF ))
+    die "HY2 range 起始端口 ${HY2_RANGE_START} 低于 INBOUND_PORT_MIN=${INBOUND_PORT_MIN}。请提高 ${HY2_RANGE_TAG_FINAL}.listen_port 至少到 ${SUGGEST_BASE}，或降低 HY2_RANGE_OFFSET"
+  fi
+
+  if (( HY2_RANGE_START < INBOUND_PORT_SUGGEST_MIN )); then
+    SUGGEST_BASE=$(( INBOUND_PORT_SUGGEST_MIN + HALF ))
+    log "WARN: HY2 range 起始端口 ${HY2_RANGE_START} 低于建议值 INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN}，建议把 ${HY2_RANGE_TAG_FINAL}.listen_port 调到至少 ${SUGGEST_BASE}"
+  fi
+
+  HY2_RANGE_ALLOW="${HY2_RANGE_START}:${HY2_RANGE_END}/udp"
+  HY2_RANGE_INFO="${HY2_RANGE_TAG_FINAL}:${HY2_RANGE_START}-${HY2_RANGE_END}->${HY2_RANGE_PORT}/udp"
+
+  log "INFO: HY2 range ${HY2_RANGE_INFO}"
+fi
+
+dbg "语法校验（过了才落盘）"
+
+if ! sing-box check -c "$TMP2" 2>&1 | tee /tmp/sb-check.log; then
+  die "sing-box check 未通过，已保留临时文件供调试:
+  - 渲染后的 config: $TMP2
+  - jq 输入 envsubst 后: $TMP
+  查看 sing-box 错误信息: cat /tmp/sb-check.log
+  修复后重跑 sb-apply"
+fi
+
+[[ -f "$OUT" ]] && {
+  cp -a "$OUT" "$OUT.bak.$(date +%s)"
+  dbg "已备份旧 config"
+}
+
+install -m 600 "$TMP2" "$OUT"
+log "OK: 已生成 $OUT"
+
+apply_hy2_nft() {
+  local table="sb_hy2_range"
+
+  if [[ "${HY2_RANGE_ENABLED:-0}" == "1" && -n "$HY2_RANGE_START" && -n "$HY2_RANGE_END" && -n "$HY2_RANGE_PORT" ]]; then
+    nft list table inet "$table" >/dev/null 2>&1 && nft delete table inet "$table" || true
+
+    nft add table inet "$table"
+    nft 'add chain inet sb_hy2_range prerouting { type nat hook prerouting priority dstnat; policy accept; }'
+    nft add rule inet "$table" prerouting udp dport "${HY2_RANGE_START}-${HY2_RANGE_END}" dnat to ":${HY2_RANGE_PORT}"
+
+    log "OK: nftables HY2 range dnat 已应用：udp ${HY2_RANGE_START}-${HY2_RANGE_END} -> ${HY2_RANGE_PORT}"
+  else
+    if command -v nft >/dev/null 2>&1; then
+      if nft list table inet "$table" >/dev/null 2>&1; then
+        nft delete table inet "$table" || true
+        log "OK: 已清理 HY2 range nftables 表"
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+dbg "重启 sing-box"
+
+systemctl restart sing-box
+sleep 1
+
+systemctl is-active --quiet sing-box || die "sing-box 未起来，看 journalctl -u sing-box -e"
+
+log "OK: sing-box 运行中"
+
+dbg "应用 HY2 range nftables"
+apply_hy2_nft
+
+TCP_PORTS="$(
+  jq -r '
+    .inbounds[]
+    | select(.type=="vless" or .type=="trojan" or .type=="vmess" or .type=="socks" or .type=="http")
+    | select(.listen_port != null)
+    | .listen_port
+  ' "$OUT" | sort -u
+)"
+
+UDP_PORTS="$(
+  jq -r '
+    .inbounds[]
+    | select(.type=="hysteria2" or .type=="tuic")
+    | select(.listen_port != null)
+    | .listen_port
+  ' "$OUT" | sort -u
+)"
+
+SSH_PORT="$(
+  ss -tnlpH 2>/dev/null \
+    | awk '/sshd/{n=split($4,a,":"); print a[n]}' \
+    | grep -E '^[0-9]+$' \
+    | sort -u \
+    | head -1 \
+    || true
+)"
+
+SSH_PORT="${SSH_PORT:-22}"
+
+dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} HY2_RANGE=${HY2_RANGE_ALLOW:-}"
+
+declare -A WANT
+
+WANT["${SSH_PORT}/tcp"]=1
+
+for p in $TCP_PORTS; do
+  WANT["${p}/tcp"]=1
+done
+
+for p in $UDP_PORTS; do
+  WANT["${p}/udp"]=1
+done
+
+if [[ -n "${HY2_RANGE_ALLOW:-}" ]]; then
+  WANT["$HY2_RANGE_ALLOW"]=1
+fi
+
+for e in ${EXTRA_ALLOW:-}; do
+  if [[ "$e" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]]; then
+    WANT["$e"]=1
+  else
+    log "WARN: 跳过非法 EXTRA_ALLOW 条目 '$e'"
+  fi
+done
+
+if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow "${SSH_PORT}/tcp" >/dev/null
+  ufw --force enable >/dev/null
+fi
+
+CUR="$(
+  ufw status \
+    | awk '/ALLOW/{print $1}' \
+    | grep -E '^[0-9]+(:[0-9]+)?/(tcp|udp)$' \
+    | sort -u \
+    || true
+)"
+
+for w in "${!WANT[@]}"; do
+  grep -qx "$w" <<<"$CUR" || {
+    log "ADD ufw allow $w"
+    ufw allow "$w" >/dev/null
+  }
+done
+
+while read -r c; do
+  [[ -z "$c" ]] && continue
+
+  [[ -z "${WANT[$c]:-}" ]] && {
+    log "DEL ufw delete allow $c (回收)"
+    ufw delete allow "$c" >/dev/null || true
+  }
+done <<<"$CUR"
+
+ufw reload >/dev/null 2>&1 || true
+
+NUSERS="$(jq 'length' "$USERS_FILE")"
+UPSTAT="$([[ "${UPSTREAM_ENABLED:-0}" == "1" ]] && echo on || echo off)"
+ALLOWED="$(
+  ufw status \
+    | awk '/ALLOW/{print $1}' \
+    | grep -E '/(tcp|udp)$' \
+    | tr '\n' ' ' \
+    || true
+)"
+INBOUND_TAGS="$(jq -r '[.inbounds[]?.tag] | join(",")' "$OUT")"
+
+log "INFO: 部署完成 | users=${NUSERS} upstream=${UPSTAT} | inbounds=${INBOUND_TAGS:-<empty>} | tcp ${TCP_PORTS:-<none>} · udp ${UDP_PORTS:-<none>} | hy2_range=${HY2_RANGE_INFO:-off} | ufw: ${ALLOWED}| 下一步 sb-export"
+
+rm -f "$TMP" "$TMP2" /tmp/sb-check.log
+dbg "已清理临时文件"
