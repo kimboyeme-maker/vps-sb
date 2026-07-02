@@ -6,7 +6,7 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- [ROOT] [--with-tune] [--ref BRANCH]
 # 例:
 #   ... | bash -s --                      # 装到默认 /opt/sb-deploy
-#   ... | bash -s -- /srv/sb --with-tune  # 装到 /srv/sb，并装可选 sb-tune
+#   ... | bash -s -- /srv/sb              # 装到 /srv/sb
 
 REPO="kimboyeme-maker/vps_proxy"
 REF="main"
