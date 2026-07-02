@@ -401,20 +401,71 @@ jq \
       .
     end;
 
-  # sb-route v1 只支持直接可映射字段；geosite/geoip 需 rule_set，未启用 → 直接报错
+  # sb-route v1：
+  # - outbound 规则：domain/domain-suffix/domain-keyword/domain-regex/ip-cidr -> outbound
+  # - action 规则：protocol/network/port/domain... -> action，例如 hijack-dns
+  # geosite/geoip 需 rule_set，未启用 → 直接报错
   def route_field($t):
     {
       "domain":"domain","domain-suffix":"domain_suffix","domain-keyword":"domain_keyword",
       "domain-regex":"domain_regex","ip-cidr":"ip_cidr"
     }[$t]
-    // error("sb-route: 不支持的 match_type: " + ($t|tostring) + "。v1 仅支持 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr；geosite/geoip 需 rule_set(未启用)");
+    // error("sb-route: 不支持的 outbound match_type: " + ($t|tostring) + "。v1 仅支持 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr；geosite/geoip 需 rule_set(未启用)");
 
-  def compile_route_rules:
-    [ ($routes.rules // [])[] |
-      { (route_field(.match_type)): [ .match_value ], outbound: .outbound }
-      + (if ((.auth_user // []) | length) > 0 then {auth_user: .auth_user} else {} end)
-      + (if ((.inbound // []) | length) > 0 then {inbound: .inbound} else {} end)
+  def action_match($r):
+    if ($r.match_type == "domain") then {domain: [ $r.match_value ]}
+    elif ($r.match_type == "domain-suffix") then {domain_suffix: [ $r.match_value ]}
+    elif ($r.match_type == "domain-keyword") then {domain_keyword: [ $r.match_value ]}
+    elif ($r.match_type == "domain-regex") then {domain_regex: [ $r.match_value ]}
+    elif ($r.match_type == "ip-cidr") then {ip_cidr: [ $r.match_value ]}
+    elif ($r.match_type == "protocol") then {protocol: $r.match_value}
+    elif ($r.match_type == "network") then {network: $r.match_value}
+    elif ($r.match_type == "port") then {port: ($r.match_value | tonumber)}
+    else error("sb-route: 不支持的 action match_type: " + ($r.match_type|tostring) + "。action 规则支持 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr/protocol/network/port")
+    end;
+
+  def route_scope($r):
+    (if (($r.auth_user // []) | length) > 0 then {auth_user: $r.auth_user} else {} end)
+    + (if (($r.inbound // []) | length) > 0 then {inbound: $r.inbound} else {} end);
+
+  def action_extras($r):
+    (if (($r.port // null) != null) then {port: ($r.port | tonumber)} else {} end)
+    + (if (($r.network // null) != null) then {network: $r.network} else {} end)
+    + (if (($r.protocol // null) != null) then {protocol: $r.protocol} else {} end);
+
+  def is_action_rule($r):
+    (($r.kind // "") == "action") or (($r.action // "") != "");
+
+  def compile_action_rules:
+    [ ($routes.rules // [])[] as $r
+      | select(is_action_rule($r))
+      | (action_match($r) + action_extras($r) + {action: $r.action} + route_scope($r))
     ];
+
+  def compile_outbound_rules:
+    [ ($routes.rules // [])[] as $r
+      | select(is_action_rule($r) | not)
+      | { (route_field($r.match_type)): [ $r.match_value ], outbound: $r.outbound }
+        + route_scope($r)
+    ];
+
+  def insert_after_sniff($rules):
+    if (($rules | length) == 0) then
+      .
+    elif any(.route.rules[]?; (.action? == "sniff")) then
+      .route.rules = (
+        reduce .route.rules[] as $rr ({done:false, out:[]};
+          .out += [$rr]
+          | if ((.done | not) and ($rr.action? == "sniff")) then
+              .out += $rules | .done = true
+            else
+              .
+            end
+        ) | .out
+      )
+    else
+      .route.rules = ($rules + (.route.rules // []))
+    end;
 
   # DNS server 规范化成 sing-box 1.12+ typed server（servers 以 tag 为键的 object）
   def compile_dns_servers:
@@ -553,8 +604,11 @@ jq \
   | ($routes.enabled == true and (($routes.rules // []) | length > 0)) as $r_on
   | ($routes.position // "before-upstream") as $pos
 
-  # sb-route 硬覆盖层：position=before-upstream(默认) 时插在 auth_user upstream 之前
-  | (if $r_on and ($pos == "before-upstream") then .route.rules += compile_route_rules else . end)
+  # sb-route action 规则：插到 sniff 后面，优先于 ip_is_private reject，适合 hijack-dns
+  | (if $r_on then insert_after_sniff(compile_action_rules) else . end)
+
+  # sb-route outbound 硬覆盖层：position=before-upstream(默认) 时插在 auth_user upstream 之前
+  | (if $r_on and ($pos == "before-upstream") then .route.rules += compile_outbound_rules else . end)
 
   | if $on and ($upnames | length > 0) and ($route_inbounds | length > 0) then
       if $up_name != "" then
@@ -625,8 +679,8 @@ jq \
       .
     end
 
-  # sb-route 硬覆盖层：position=after-upstream(高级) 时插在 upstream 之后、final 之前
-  | (if $r_on and ($pos == "after-upstream") then .route.rules += compile_route_rules else . end)
+  # sb-route outbound 硬覆盖层：position=after-upstream(高级) 时插在 upstream 之后、final 之前
+  | (if $r_on and ($pos == "after-upstream") then .route.rules += compile_outbound_rules else . end)
 
   | .route.rules += [
       {

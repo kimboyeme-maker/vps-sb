@@ -7,23 +7,35 @@ F="$SB_ROOT/env/routes.json"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
 
-VALID_TYPES="domain domain-suffix domain-keyword domain-regex ip-cidr"
+OUTBOUND_TYPES="domain domain-suffix domain-keyword domain-regex ip-cidr"
+ACTION_TYPES="domain domain-suffix domain-keyword domain-regex ip-cidr protocol network port"
+VALID_ACTIONS="hijack-dns reject"
 
 summary() {
   cat <<'S'
 summary:
-  sb-route 管理自定义分流规则（写 env/routes.json，编译由 sb-apply 完成）。
+  sb-route 管理自定义 route.rules 意图（写 env/routes.json，编译由 sb-apply 完成）。
+
+  支持两类规则：
+
+    1. outbound 分流规则
+       domain / domain-suffix / domain-keyword / domain-regex / ip-cidr -> outbound
+
+    2. action 动作规则
+       protocol / network / port / domain... -> action
+       例如 DNS 劫持：
+         { "protocol": "dns", "action": "hijack-dns" }
+         { "network": "udp", "port": 53, "action": "hijack-dns" }
 
   语义（sb-apply 编译后的 route.rules 顺序）：
-    sniff -> ip_is_private reject -> sb-route 规则 -> auth_user upstream -> final direct
+    sniff -> sb-route action 规则 -> ip_is_private reject -> sb-route outbound 规则 -> auth_user upstream -> final direct
 
-  即 sb-route 是"硬覆盖层"：默认插在用户级 upstream 分流之前（position=before-upstream），
-  可覆盖用户默认出口。position=after-upstream 则相反（高级）。
+  action 规则会被 sb-apply 插到 sniff 后面，优先于 private reject。
+  outbound 规则仍然按 position 控制，默认 before-upstream。
 
   规则可 global（影响所有用户）或 scoped（--user / --inbound，仅影响指定用户/入站）。
-  global 规则创建时会 WARN，因为它在用户级 upstream 前生效、影响所有用户。
+  global 规则创建时会 WARN。
 
-  v1 仅支持直接可映射字段：domain / domain-suffix / domain-keyword / domain-regex / ip-cidr。
   geosite / geoip 需要 rule_set（未启用），直接报错，不静默接受。
 S
 }
@@ -33,34 +45,55 @@ usage() {
 usage:
   sb-route enable | disable
   sb-route position before-upstream | after-upstream
+
+  # outbound 分流规则
   sb-route add <match_type> <value> <outbound> [--user U]... [--inbound I]...
+
+  # action 动作规则，两种写法都支持
+  sb-route add <match_type> <value> action <action> [key value]... [--user U]... [--inbound I]...
+  sb-route add-action <match_type> <value> <action> [key value]... [--user U]... [--inbound I]...
+
   sb-route list
   sb-route rm <index>
   sb-route reset
   sb-route show
   sb-route help | -h | --help
 
-match_type:
+outbound match_type:
   domain | domain-suffix | domain-keyword | domain-regex | ip-cidr
-  （geosite / geoip 需 rule_set，v1 未启用，会报错）
 
-scope（可重复、可混用两种写法）：
+Action match_type:
+  domain | domain-suffix | domain-keyword | domain-regex | ip-cidr | protocol | network | port
+
+Action:
+  hijack-dns
+  reject
+
+scope（可重复、可混用两种写法）:
   --user <name|alias>     或  auth_user=<name>
   --inbound <tag>         或  inbound=<tag>
   不带任何 scope = global 规则（影响所有用户，创建时 WARN）
 
 examples:
   sb-route enable
+
+  # DNS hijack
+  sb-route add protocol dns action hijack-dns
+  sb-route add network udp action hijack-dns port 53
+
+  # user scoped route override
   sb-route add domain-suffix openai.com  upstream --user default
   sb-route add domain-suffix netflix.com direct   --user chatgpt
   sb-route add domain-suffix github.com  direct   --user chatgpt --inbound vless-in
   sb-route add ip-cidr      1.1.1.0/24   direct
+
   sb-route position after-upstream
   sb-route list
   sb-route rm 2
 
 notes:
   - 改完跑 sb-apply 生效
+  - action 规则需要新版 sb-apply 支持，否则 jq 编译会失败
   - outbound 必须是已存在的 outbound tag（direct / upstream / sb-outbound 加的），拼错 sing-box check 会拦
 U
 }
@@ -70,23 +103,121 @@ mkdir -p "$SB_ROOT/env"
 
 ensure_file() {
   [[ -f "$F" ]] || printf '{\n  "enabled": false,\n  "position": "before-upstream",\n  "rules": []\n}\n' > "$F"
-  # 补缺字段（幂等）
-  local tmp; tmp="$(mktemp)"
+  local tmp
+  tmp="$(mktemp)"
   jq '
-    (.enabled //= false)
+    if type != "object" then error("routes.json 必须是 object") else . end
+    | (.enabled //= false)
     | (.position //= "before-upstream")
     | (.rules //= [])
-  ' "$F" > "$tmp" && install -m 600 "$tmp" "$F"; rm -f "$tmp"
+    | if (.rules | type) != "array" then error(".rules 必须是 array") else . end
+  ' "$F" > "$tmp" || { rm -f "$tmp"; die "$F 格式错误"; }
+  install -m 600 "$tmp" "$F"
+  rm -f "$tmp"
 }
 
 write_json() {
-  local tmp; tmp="$(mktemp)"
+  local tmp
+  tmp="$(mktemp)"
   cat > "$tmp"
   jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "内部错误：生成了非法 JSON"; }
-  install -m 600 "$tmp" "$F"; rm -f "$tmp"
+  install -m 600 "$tmp" "$F"
+  rm -f "$tmp"
 }
 
-cmd="${1:-}"; [[ $# -gt 0 ]] && shift || true
+contains_word() {
+  local needle="$1"
+  local haystack="$2"
+  grep -qw -- "$needle" <<<"$haystack"
+}
+
+validate_outbound_match_type() {
+  local mt="$1"
+  case "$mt" in
+    geosite|geoip)
+      die "geosite/geoip 需要 rule_set 支持，当前 sb-route v1 未启用。请先用 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr。"
+      ;;
+  esac
+  contains_word "$mt" "$OUTBOUND_TYPES" || die "outbound 规则不支持 match_type '$mt'。可选：$OUTBOUND_TYPES"
+}
+
+validate_action_match_type() {
+  local mt="$1"
+  case "$mt" in
+    geosite|geoip)
+      die "geosite/geoip 需要 rule_set 支持，当前 sb-route v1 未启用。请先用 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr/protocol/network/port。"
+      ;;
+  esac
+  contains_word "$mt" "$ACTION_TYPES" || die "action 规则不支持 match_type '$mt'。可选：$ACTION_TYPES"
+}
+
+validate_action() {
+  local action="$1"
+  contains_word "$action" "$VALID_ACTIONS" || die "action 仅支持：$VALID_ACTIONS，收到 '$action'"
+}
+
+validate_network() {
+  local network="$1"
+  [[ "$network" == "tcp" || "$network" == "udp" ]] || die "network 仅支持 tcp/udp，收到 '$network'"
+}
+
+validate_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "port 必须是数字，收到 '$port'"
+  (( port >= 1 && port <= 65535 )) || die "port 范围必须是 1-65535，收到 '$port'"
+}
+
+validate_match_value() {
+  local mt="$1"
+  local val="$2"
+
+  case "$mt" in
+    network)
+      validate_network "$val"
+      ;;
+    port)
+      validate_port "$val"
+      ;;
+    protocol)
+      [[ -n "$val" ]] || die "protocol value 不能为空"
+      ;;
+  esac
+}
+
+append_extra_json() {
+  local json="$1"
+  local key="$2"
+  local value="$3"
+
+  case "$key" in
+    port)
+      validate_port "$value"
+      jq -c --argjson v "$value" '. + {port:$v}' <<<"$json"
+      ;;
+    network)
+      validate_network "$value"
+      jq -c --arg v "$value" '. + {network:$v}' <<<"$json"
+      ;;
+    protocol)
+      [[ -n "$value" ]] || die "protocol value 不能为空"
+      jq -c --arg v "$value" '. + {protocol:$v}' <<<"$json"
+      ;;
+    *)
+      die "action 额外参数暂只支持 key value: port/network/protocol，收到 '$key'"
+      ;;
+  esac
+}
+
+array_json_from_args() {
+  if [[ "$#" -eq 0 ]]; then
+    printf '[]\n'
+  else
+    printf '%s\n' "$@" | jq -R . | jq -s 'map(select(length > 0)) | unique'
+  fi
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift || true
 
 case "$cmd" in
   -h|--help|help) summary; echo; usage; exit 0 ;;
@@ -96,8 +227,15 @@ esac
 ensure_file
 
 case "$cmd" in
-  enable)  jq '.enabled=true'  "$F" | write_json; log "OK: routes enabled。跑 sb-apply 生效。" ;;
-  disable) jq '.enabled=false' "$F" | write_json; log "OK: routes disabled。跑 sb-apply 生效。" ;;
+  enable)
+    jq '.enabled=true' "$F" | write_json
+    log "OK: routes enabled。跑 sb-apply 生效。"
+    ;;
+
+  disable)
+    jq '.enabled=false' "$F" | write_json
+    log "OK: routes disabled。跑 sb-apply 生效。"
+    ;;
 
   position)
     p="${1:-}"
@@ -106,54 +244,128 @@ case "$cmd" in
     log "OK: position=$p。跑 sb-apply 生效。"
     ;;
 
-  add)
-    mt="${1:-}"; val="${2:-}"; ob="${3:-}"
-    [[ -n "$mt" && -n "$val" && -n "$ob" ]] || { usage >&2; die "add 需要 <match_type> <value> <outbound>"; }
-    shift 3 || true
+  add|add-action)
+    mode="outbound"
 
-    case "$mt" in
-      geosite|geoip) die "geosite/geoip 需要 rule_set 支持，当前 sb-route v1 未启用。请先用 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr。" ;;
-    esac
-    grep -qw -- "$mt" <<<"$VALID_TYPES" || die "不支持的 match_type '$mt'。可选：$VALID_TYPES"
+    if [[ "$cmd" == "add-action" ]]; then
+      mt="${1:-}"
+      val="${2:-}"
+      action="${3:-}"
+      [[ -n "$mt" && -n "$val" && -n "$action" ]] || { usage >&2; die "add-action 需要 <match_type> <value> <action>"; }
+      shift 3 || true
+      mode="action"
+    else
+      mt="${1:-}"
+      val="${2:-}"
+      third="${3:-}"
+      [[ -n "$mt" && -n "$val" && -n "$third" ]] || { usage >&2; die "add 需要 <match_type> <value> <outbound> 或 <match_type> <value> action <action>"; }
 
-    users=(); inbounds=()
+      if [[ "$third" == "action" ]]; then
+        action="${4:-}"
+        [[ -n "$action" ]] || die "add action 需要 <action>"
+        shift 4 || true
+        mode="action"
+      else
+        ob="$third"
+        shift 3 || true
+        mode="outbound"
+      fi
+    fi
+
+    users=()
+    inbounds=()
+    extra_json='{}'
+
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --user)    shift; [[ $# -gt 0 ]] || die "--user 缺参数"; users+=("$1") ;;
-        --inbound) shift; [[ $# -gt 0 ]] || die "--inbound 缺参数"; inbounds+=("$1") ;;
-        auth_user=*) users+=("${1#auth_user=}") ;;
-        inbound=*)   inbounds+=("${1#inbound=}") ;;
-        *) die "未知参数 '$1'（scope 用 --user/--inbound 或 auth_user=/inbound=）" ;;
+        --user)
+          shift
+          [[ $# -gt 0 ]] || die "--user 缺参数"
+          users+=("$1")
+          ;;
+        --inbound)
+          shift
+          [[ $# -gt 0 ]] || die "--inbound 缺参数"
+          inbounds+=("$1")
+          ;;
+        auth_user=*)
+          users+=("${1#auth_user=}")
+          ;;
+        inbound=*)
+          inbounds+=("${1#inbound=}")
+          ;;
+        port|network|protocol)
+          [[ "$mode" == "action" ]] || die "'$1' 额外参数只支持 action 规则"
+          key="$1"
+          shift
+          [[ $# -gt 0 ]] || die "$key 缺参数"
+          extra_json="$(append_extra_json "$extra_json" "$key" "$1")"
+          ;;
+        *)
+          die "未知参数 '$1'（scope 用 --user/--inbound 或 auth_user=/inbound=；action 额外参数用 port/network/protocol）"
+          ;;
       esac
       shift
     done
 
-    au_json="[]"; [[ ${#users[@]}    -gt 0 ]] && au_json="$(printf '%s\n' "${users[@]}"    | jq -R . | jq -sc .)"
-    in_json="[]"; [[ ${#inbounds[@]} -gt 0 ]] && in_json="$(printf '%s\n' "${inbounds[@]}" | jq -R . | jq -sc .)"
+    au_json="$(array_json_from_args "${users[@]}")"
+    in_json="$(array_json_from_args "${inbounds[@]}")"
 
     if [[ ${#users[@]} -eq 0 && ${#inbounds[@]} -eq 0 ]]; then
-      log "WARN: 这是 global sb-route 规则，会在用户级 upstream 分流前生效，影响所有用户。"
+      log "WARN: 这是 global sb-route 规则，会影响所有用户。"
     fi
 
-    jq --arg mt "$mt" --arg val "$val" --arg ob "$ob" \
-       --argjson au "$au_json" --argjson in "$in_json" '
-      .rules += [
-        { match_type:$mt, match_value:$val, outbound:$ob }
-        + (if ($au|length)>0 then {auth_user:$au} else {} end)
-        + (if ($in|length)>0 then {inbound:$in} else {} end)
-      ]
-    ' "$F" | write_json
-    log "OK: 已加规则 [$mt $val -> $ob]$([[ ${#users[@]} -gt 0 ]] && echo " user=${users[*]}")$([[ ${#inbounds[@]} -gt 0 ]] && echo " inbound=${inbounds[*]}")。跑 sb-apply 生效。"
+    if [[ "$mode" == "action" ]]; then
+      validate_action_match_type "$mt"
+      validate_match_value "$mt" "$val"
+      validate_action "$action"
+
+      jq --arg mt "$mt" --arg val "$val" --arg action "$action" \
+         --argjson au "$au_json" --argjson in "$in_json" --argjson extra "$extra_json" '
+        .rules += [
+          ({kind:"action", match_type:$mt, match_value:$val, action:$action} + $extra)
+          + (if ($au|length)>0 then {auth_user:$au} else {} end)
+          + (if ($in|length)>0 then {inbound:$in} else {} end)
+        ]
+      ' "$F" | write_json
+
+      log "OK: 已加 action 规则 [$mt $val -> action=$action]$([[ "$extra_json" != "{}" ]] && echo " extra=$extra_json")$([[ ${#users[@]} -gt 0 ]] && echo " user=${users[*]}")$([[ ${#inbounds[@]} -gt 0 ]] && echo " inbound=${inbounds[*]}")。跑 sb-apply 生效。"
+    else
+      validate_outbound_match_type "$mt"
+      validate_match_value "$mt" "$val"
+
+      jq --arg mt "$mt" --arg val "$val" --arg ob "$ob" \
+         --argjson au "$au_json" --argjson in "$in_json" '
+        .rules += [
+          {kind:"outbound", match_type:$mt, match_value:$val, outbound:$ob}
+          + (if ($au|length)>0 then {auth_user:$au} else {} end)
+          + (if ($in|length)>0 then {inbound:$in} else {} end)
+        ]
+      ' "$F" | write_json
+
+      log "OK: 已加 outbound 规则 [$mt $val -> $ob]$([[ ${#users[@]} -gt 0 ]] && echo " user=${users[*]}")$([[ ${#inbounds[@]} -gt 0 ]] && echo " inbound=${inbounds[*]}")。跑 sb-apply 生效。"
+    fi
     ;;
 
   list|show)
-    en="$(jq -r '.enabled' "$F")"; pos="$(jq -r '.position' "$F")"
+    en="$(jq -r '.enabled' "$F")"
+    pos="$(jq -r '.position' "$F")"
     printf 'routes: enabled=%s position=%s\n' "$en" "$pos"
-    jq -r '.rules | to_entries[] |
-      "  [\(.key)] \(.value.match_type) \(.value.match_value) -> \(.value.outbound)" +
-      (if (.value.auth_user // [])|length>0 then "  user=\(.value.auth_user|join(","))" else "" end) +
-      (if (.value.inbound   // [])|length>0 then "  inbound=\(.value.inbound|join(","))" else "" end) +
-      (if ((.value.auth_user // [])|length==0) and ((.value.inbound // [])|length==0) then "  [GLOBAL]" else "" end)
+    jq -r '
+      .rules | to_entries[] |
+      .key as $i | .value as $r |
+      "  [\($i)] " +
+      (if (($r.kind // "") == "action" or ($r.action // "") != "") then
+        "ACTION " + ($r.match_type // "-") + " " + (($r.match_value // "-")|tostring) + " -> action=" + ($r.action // "-")
+        + (if ($r.port // null) != null then "  port=\($r.port)" else "" end)
+        + (if ($r.network // null) != null then "  network=\($r.network)" else "" end)
+        + (if ($r.protocol // null) != null then "  protocol=\($r.protocol)" else "" end)
+      else
+        "OUTBOUND " + ($r.match_type // "-") + " " + (($r.match_value // "-")|tostring) + " -> " + ($r.outbound // "-")
+      end)
+      + (if (($r.auth_user // [])|length)>0 then "  user=\($r.auth_user|join(","))" else "" end)
+      + (if (($r.inbound // [])|length)>0 then "  inbound=\($r.inbound|join(","))" else "" end)
+      + (if ((($r.auth_user // [])|length)==0) and ((($r.inbound // [])|length)==0) then "  [GLOBAL]" else "" end)
     ' "$F"
     ;;
 
@@ -171,6 +383,13 @@ case "$cmd" in
     log "OK: 已清空所有规则（enabled/position 保留）。跑 sb-apply 生效。"
     ;;
 
-  "") usage >&2; die "缺子命令" ;;
-  *)  usage >&2; die "未知子命令 '$cmd'" ;;
+  "")
+    usage >&2
+    die "缺子命令"
+    ;;
+
+  *)
+    usage >&2
+    die "未知子命令 '$cmd'"
+    ;;
 esac

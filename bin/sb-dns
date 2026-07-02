@@ -7,52 +7,93 @@ F="$SB_ROOT/env/dns.json"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
 
-TYPES="local udp tcp tls https h3 quic"
+VALID_STRATEGIES="prefer_ipv4 prefer_ipv6 ipv4_only ipv6_only"
+VALID_SERVER_TYPES="local udp tcp tls quic https h3"
 
 summary() {
   cat <<'S'
 summary:
-  sb-dns 管理服务端出站 DNS 解析策略（写 env/dns.json，编译由 sb-apply 完成）。
+  sb-dns 管理 DNS 意图文件 env/dns.json，最终由 sb-apply 编译到 sing-box config。
 
-  默认禁用、且只有一个 local server（用系统解析器），不内置任何 DoH。
-  高级用户可手动添加 typed server（sing-box 1.12+ 格式）。
+  存储层：
+    env/dns.json:
+      {
+        enabled,
+        servers: { tag -> {type, server, server_port?, path?, domain_resolver?} },
+        rules,
+        final,
+        strategy,
+        route_default
+      }
 
-  重要（sing-box typed server 语义）：
-    - https/h3 用 server(主机) + path(默认 /dns-query)，不是整条 URL
-    - server 是域名(非 IP)时，必须指定 --resolver <tag> 来解析这个 DNS server 自己的域名
-      （否则 sing-box 会因为无法解析 DNS server 的域名而失败）
+  最终层：
+    - dns.servers / dns.rules / dns.final / dns.strategy 会编译到 top-level dns
+    - route_default 会编译到 top-level route.default_domain_resolver
+
+  注意：
+    sing-box 最终配置里 dns 和 route 是同层级；
+    这里只是把 route.default_domain_resolver 的管理入口放在 sb-dns，
+    因为它引用的是 dns server tag。
 S
 }
 
 usage() {
   cat <<'U'
 usage:
-  sb-dns enable | disable
-  sb-dns server add <tag> <type> <host|url> [--path P] [--resolver TAG] [--port N]
-  sb-dns server rm <tag>
-  sb-dns final <tag>
-  sb-dns strategy <prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only|">
-  sb-dns route-default <tag>
-  sb-dns list
-  sb-dns help | -h | --help
+  sb-dns status
+  sb-dns show
+  sb-dns enable
+  sb-dns off | disable
+  sb-dns reset
 
-type:
-  local | udp | tcp | tls | https | h3 | quic
-  local 不需要 host；https/h3 可带 --path（默认 /dns-query）
+  sb-dns server list
+  sb-dns server add <tag> <type> [args...]
+  sb-dns server del|rm <tag>
+  sb-dns server show <tag>
+
+  sb-dns final <server-tag>
+  sb-dns final off|clear|del|rm
+  sb-dns final show
+
+  sb-dns strategy <prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only>
+  sb-dns strategy off|clear|del|rm
+  sb-dns strategy show
+
+  sb-dns route-default show
+  sb-dns route-default set <key> <value>
+  sb-dns route-default rm|del <key> [value]
+  sb-dns route-default off|clear
+
+server types:
+  local
+  udp   <server> [port]
+  tcp   <server> [port]
+  tls   <server> [port]
+  quic  <server> [port]
+  https <server> [port] [path]
+  h3    <server> [port] [path]
+
+route-default keys:
+  server    DNS server tag，必须已存在于 dns.json 的 servers 里
+  strategy  prefer_ipv4 | prefer_ipv6 | ipv4_only | ipv6_only
 
 examples:
   sb-dns enable
-  sb-dns server add cf   https 1.1.1.1               # IP 型 DoH，无需 resolver
-  sb-dns server add cf   https https://1.1.1.1/dns-query   # URL 会自动拆成 server+path
-  sb-dns server add ali  https dns.alidns.com --resolver local   # 域名型，必须给 resolver
-  sb-dns final cf
-  sb-dns strategy prefer_ipv4
-  sb-dns route-default local
+  sb-dns server add google tls 8.8.8.8
+  sb-dns server add local local
+
+  sb-dns route-default set server google
+  sb-dns route-default set strategy prefer_ipv6
+  sb-dns route-default show
+
+  sb-dns server add cloudflare https 1.1.1.1 443 /dns-query
+  sb-dns final google
+  sb-dns strategy prefer_ipv6
 
 notes:
+  - route-default 写 env/dns.json 的 route_default object
+  - sb-apply 会把它编译成最终 config.route.default_domain_resolver
   - 改完跑 sb-apply 生效
-  - final / route-default 引用的 tag 必须已 server add
-  - server 是域名却没 --resolver 会直接报错，不静默接受
 U
 }
 
@@ -60,128 +101,396 @@ command -v jq >/dev/null || die "缺依赖 jq"
 mkdir -p "$SB_ROOT/env"
 
 ensure_file() {
-  [[ -f "$F" ]] || printf '{\n  "enabled": false,\n  "servers": { "local": { "type": "local" } },\n  "rules": [],\n  "final": "",\n  "strategy": "",\n  "route_default": ""\n}\n' > "$F"
-  local tmp; tmp="$(mktemp)"
+  if [[ ! -f "$F" ]]; then
+    cat > "$F" <<'JSON'
+{
+  "enabled": false,
+  "servers": {},
+  "rules": []
+}
+JSON
+    chmod 600 "$F"
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
   jq '
-    (.enabled //= false) | (.servers //= {"local":{"type":"local"}})
-    | (.rules //= []) | (.final //= "") | (.strategy //= "") | (.route_default //= "")
-  ' "$F" > "$tmp" && install -m 600 "$tmp" "$F"; rm -f "$tmp"
+    if type != "object" then error("dns.json 必须是 object") else . end
+    | .enabled = (.enabled // false)
+    | .servers = (.servers // {})
+    | .rules = (.rules // [])
+    | if (.servers | type) != "object" then error(".servers 必须是 object") else . end
+    | if (.rules | type) != "array" then error(".rules 必须是 array") else . end
+  ' "$F" > "$tmp" || { rm -f "$tmp"; die "$F 格式错误"; }
+
+  install -m 600 "$tmp" "$F"
+  rm -f "$tmp"
 }
 
 write_json() {
-  local tmp; tmp="$(mktemp)"; cat > "$tmp"
+  local tmp
+  tmp="$(mktemp)"
+  cat > "$tmp"
   jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "内部错误：生成了非法 JSON"; }
-  install -m 600 "$tmp" "$F"; rm -f "$tmp"
+  install -m 600 "$tmp" "$F"
+  rm -f "$tmp"
 }
 
-is_ip() {
-  local h="$1"
-  [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0   # v4
-  [[ "$h" == *:* ]] && return 0                                # v6（含冒号）
-  return 1
+validate_strategy() {
+  local s="${1:-}"
+  [[ -n "$s" ]] || die "缺少 strategy"
+
+  case "$s" in
+    prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only)
+      return 0
+      ;;
+    *)
+      die "strategy 仅支持：$VALID_STRATEGIES，收到 '$s'"
+      ;;
+  esac
 }
 
-cmd="${1:-}"; [[ $# -gt 0 ]] && shift || true
+validate_server_type() {
+  local t="${1:-}"
+  [[ -n "$t" ]] || die "缺少 server type"
+
+  case "$t" in
+    local|udp|tcp|tls|quic|https|h3)
+      return 0
+      ;;
+    *)
+      die "server type 仅支持：$VALID_SERVER_TYPES，收到 '$t'"
+      ;;
+  esac
+}
+
+validate_port() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "port 必须是数字，收到 '$port'"
+  (( port >= 1 && port <= 65535 )) || die "port 范围必须是 1-65535，收到 '$port'"
+}
+
+server_exists() {
+  local tag="$1"
+  jq -e --arg tag "$tag" '.servers | has($tag)' "$F" >/dev/null
+}
+
+server_list_text() {
+  jq -r '.servers | keys | if length == 0 then "<none>" else join(", ") end' "$F"
+}
+
+require_server() {
+  local tag="$1"
+  [[ -n "$tag" ]] || die "缺少 server tag"
+  if ! server_exists "$tag"; then
+    die "DNS server '$tag' 不存在；可选值：$(server_list_text)。先用: sb-dns server add <tag> <type> ..."
+  fi
+}
+
+normalize_server_json() {
+  local tag="$1"
+  local type="$2"
+  local server="${3:-}"
+  local port="${4:-}"
+  local path="${5:-}"
+
+  validate_server_type "$type"
+
+  case "$type" in
+    local)
+      [[ -z "$server" && -z "$port" && -z "$path" ]] || die "local server 不需要额外参数"
+      jq -cn --arg type "$type" '{type:$type}'
+      ;;
+
+    udp|tcp|tls|quic)
+      [[ -n "$server" ]] || die "$type server 需要 <server>"
+      if [[ -n "$port" ]]; then
+        validate_port "$port"
+        jq -cn --arg type "$type" --arg server "$server" --argjson port "$port" \
+          '{type:$type, server:$server, server_port:$port}'
+      else
+        jq -cn --arg type "$type" --arg server "$server" \
+          '{type:$type, server:$server}'
+      fi
+      ;;
+
+    https|h3)
+      [[ -n "$server" ]] || die "$type server 需要 <server>"
+      [[ -n "$path" ]] || path="/dns-query"
+      [[ "$path" == /* ]] || die "path 必须以 / 开头，收到 '$path'"
+
+      if [[ -n "$port" ]]; then
+        validate_port "$port"
+        jq -cn --arg type "$type" --arg server "$server" --argjson port "$port" --arg path "$path" \
+          '{type:$type, server:$server, server_port:$port, path:$path}'
+      else
+        jq -cn --arg type "$type" --arg server "$server" --arg path "$path" \
+          '{type:$type, server:$server, path:$path}'
+      fi
+      ;;
+  esac
+}
+
+set_route_default_key() {
+  local key="$1"
+  local value="$2"
+
+  [[ -n "$key" ]] || die "route-default set 需要 <key> <value>"
+  [[ -n "$value" ]] || die "route-default set $key 需要 <value>"
+
+  case "$key" in
+    server)
+      require_server "$value"
+      jq --arg v "$value" '.route_default = (.route_default // {}) | .route_default.server = $v' "$F" | write_json
+      log "OK: route_default.server=$value。跑 sb-apply 生效。"
+      ;;
+    strategy)
+      validate_strategy "$value"
+      jq --arg v "$value" '.route_default = (.route_default // {}) | .route_default.strategy = $v' "$F" | write_json
+      log "OK: route_default.strategy=$value。跑 sb-apply 生效。"
+      ;;
+    *)
+      die "route-default 仅支持 key: server / strategy，收到 '$key'"
+      ;;
+  esac
+}
+
+rm_route_default_key() {
+  local key="$1"
+  local expected="${2:-}"
+  [[ -n "$key" ]] || die "route-default rm 需要 <key> [value]"
+
+  case "$key" in
+    server|strategy)
+      if [[ -n "$expected" ]]; then
+        current="$(jq -r --arg k "$key" '.route_default[$k] // ""' "$F")"
+        [[ "$current" == "$expected" ]] || die "route_default.$key 当前是 '${current:-<empty>}'，不是 '$expected'，拒绝删除"
+      fi
+
+      jq --arg k "$key" '
+        if (.route_default // null) == null then
+          .
+        else
+          del(.route_default[$k])
+          | if ((.route_default | type) == "object" and (.route_default | length) == 0) then del(.route_default) else . end
+        end
+      ' "$F" | write_json
+      log "OK: 已删除 route_default.$key。跑 sb-apply 生效。"
+      ;;
+    *)
+      die "route-default rm 仅支持 key: server / strategy，收到 '$key'"
+      ;;
+  esac
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift || true
+
 case "$cmd" in
-  -h|--help|help) summary; echo; usage; exit 0 ;;
-  summary) summary; exit 0 ;;
+  -h|--help|help)
+    summary
+    echo
+    usage
+    exit 0
+    ;;
+  summary)
+    summary
+    exit 0
+    ;;
 esac
 
 ensure_file
 
 case "$cmd" in
-  enable)  jq '.enabled=true'  "$F" | write_json; log "OK: dns enabled。跑 sb-apply 生效。" ;;
-  disable) jq '.enabled=false' "$F" | write_json; log "OK: dns disabled。跑 sb-apply 生效。" ;;
+  status|show|list)
+    jq '.' "$F"
+    ;;
+
+  enable)
+    jq '.enabled = true' "$F" | write_json
+    log "OK: DNS enabled。跑 sb-apply 生效。"
+    ;;
+
+  off|disable)
+    jq '.enabled = false' "$F" | write_json
+    log "OK: DNS disabled。跑 sb-apply 生效。"
+    ;;
+
+  reset)
+    cat <<'JSON' | write_json
+{
+  "enabled": false,
+  "servers": {},
+  "rules": []
+}
+JSON
+    log "OK: 已重置 dns.json。跑 sb-apply 生效。"
+    ;;
 
   server)
-    sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
+    sub="${1:-}"
+    [[ $# -gt 0 ]] && shift || true
+
     case "$sub" in
-      add)
-        tag="${1:-}"; type="${2:-}"; host="${3:-}"
-        [[ -n "$tag" && -n "$type" ]] || { usage >&2; die "server add 需要 <tag> <type> [host]"; }
-        grep -qw -- "$type" <<<"$TYPES" || die "不支持的 type '$type'。可选：$TYPES"
-        [[ $# -ge 2 ]] && shift 2 || shift $#
-        [[ "$type" != "local" && -n "$host" ]] && shift || true
+      list)
+        jq -r '
+          if (.servers | length) == 0 then
+            "无 DNS server"
+          else
+            .servers
+            | to_entries[]
+            | [
+                .key,
+                (.value.type // "-"),
+                (.value.server // "-"),
+                ((.value.server_port // "-") | tostring),
+                (.value.path // "-"),
+                (if (.value.domain_resolver // null) != null then (.value.domain_resolver | tostring) else "-" end)
+              ]
+            | @tsv
+          end
+        ' "$F"
+        ;;
 
-        path=""; resolver=""; port=""
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --path)     shift; path="${1:-}" ;;
-            --resolver) shift; resolver="${1:-}" ;;
-            --port)     shift; port="${1:-}" ;;
-            *) die "未知参数 '$1'" ;;
-          esac
-          shift || true
-        done
+      add|set)
+        tag="${1:-}"
+        type="${2:-}"
+        shift 2 || true
 
-        if [[ "$type" == "local" ]]; then
-          jq --arg t "$tag" '.servers[$t]={type:"local"}' "$F" | write_json
-          log "OK: server $tag=local。跑 sb-apply 生效。"; exit 0
-        fi
+        [[ -n "$tag" ]] || die "缺少参数: tag"
+        [[ "$tag" =~ ^[A-Za-z0-9._@+-]+$ ]] || die "tag 只能包含 A-Za-z0-9._@+-，收到 '$tag'"
+        [[ -n "$type" ]] || die "缺少参数: type"
 
-        [[ -n "$host" ]] || die "type=$type 需要 host（主机名/IP，或 https:// URL）"
+        server_json="$(normalize_server_json "$tag" "$type" "${1:-}" "${2:-}" "${3:-}")"
 
-        # URL 自动拆 host + path
-        if [[ "$host" == *"://"* ]]; then
-          rest="${host#*://}"
-          hostport="${rest%%/*}"
-          urlpath="/${rest#*/}"; [[ "$rest" == "$hostport" ]] && urlpath=""
-          host="${hostport%%:*}"; [[ "$hostport" == *:* ]] && port="${port:-${hostport##*:}}"
-          [[ -z "$path" && -n "$urlpath" ]] && path="$urlpath"
-        fi
-
-        # 域名型必须有 resolver
-        if ! is_ip "$host" && [[ -z "$resolver" ]]; then
-          die "server '$host' 是域名，必须 --resolver <tag> 指定解析它的 DNS server（否则 sing-box 无法解析该 DNS server 的域名）。IP 型则无需 resolver。"
-        fi
-        # https/h3 默认 path
-        if [[ "$type" == "https" || "$type" == "h3" ]] && [[ -z "$path" ]]; then path="/dns-query"; fi
-
-        jq --arg tag "$tag" --arg ty "$type" --arg sv "$host" --arg pa "$path" --arg rs "$resolver" --arg po "$port" '
-          .servers[$tag] = ({type:$ty, server:$sv}
-            + (if $po != "" then {server_port:($po|tonumber)} else {} end)
-            + (if (($ty=="https") or ($ty=="h3")) and ($pa != "") then {path:$pa} else {} end)
-            + (if $rs != "" then {domain_resolver:$rs} else {} end))
+        jq --arg tag "$tag" --argjson v "$server_json" '
+          .servers[$tag] = $v
         ' "$F" | write_json
-        log "OK: server $tag=$type $host$([[ -n "$path" ]] && echo " path=$path")$([[ -n "$resolver" ]] && echo " resolver=$resolver")。跑 sb-apply 生效。"
+
+        log "OK: DNS server '$tag' 已设置为 type=$type。跑 sb-apply 生效。"
         ;;
-      rm)
-        tag="${1:-}"; [[ -n "$tag" ]] || die "server rm 需要 <tag>"
-        jq -e --arg t "$tag" '.servers | has($t)' "$F" >/dev/null || die "无此 server: $tag"
-        jq --arg t "$tag" 'del(.servers[$t])' "$F" | write_json
-        log "OK: 已删 server $tag。跑 sb-apply 生效。"
+
+      show)
+        tag="${1:-}"
+        require_server "$tag"
+        jq --arg tag "$tag" '.servers[$tag]' "$F"
         ;;
-      *) usage >&2; die "server 子命令只支持 add | rm" ;;
+
+      del|rm|delete)
+        tag="${1:-}"
+        require_server "$tag"
+
+        if jq -e --arg tag "$tag" '(.final // "") == $tag' "$F" >/dev/null; then
+          die "server '$tag' 正在被 dns.final 引用；先 sb-dns final off"
+        fi
+
+        if jq -e --arg tag "$tag" '(.route_default.server? // "") == $tag or ((.route_default | type) == "string" and .route_default == $tag)' "$F" >/dev/null; then
+          die "server '$tag' 正在被 route_default 引用；先 sb-dns route-default rm server $tag 或 sb-dns route-default off"
+        fi
+
+        jq --arg tag "$tag" 'del(.servers[$tag])' "$F" | write_json
+        log "OK: DNS server '$tag' 已删除。跑 sb-apply 生效。"
+        ;;
+
+      "")
+        usage >&2
+        die "缺少 server 子命令"
+        ;;
+
+      *)
+        usage >&2
+        die "未知 server 子命令 '$sub'"
+        ;;
     esac
     ;;
 
   final)
-    tag="${1:-}"; [[ -n "$tag" ]] || die "final 需要 <tag>"
-    jq -e --arg t "$tag" '.servers | has($t)' "$F" >/dev/null || die "final 引用的 server 不存在: $tag（先 server add）"
-    jq --arg t "$tag" '.final=$t' "$F" | write_json; log "OK: final=$tag。跑 sb-apply 生效。"
+    sub="${1:-}"
+    case "$sub" in
+      "")
+        usage >&2
+        die "final 需要 <server-tag> 或 off/show"
+        ;;
+      show)
+        jq '{final: (.final // null)}' "$F"
+        ;;
+      off|clear|del|rm|delete|none)
+        jq 'del(.final)' "$F" | write_json
+        log "OK: 已删除 dns.final。跑 sb-apply 生效。"
+        ;;
+      *)
+        require_server "$sub"
+        jq --arg tag "$sub" '.final = $tag' "$F" | write_json
+        log "OK: dns.final=$sub。跑 sb-apply 生效。"
+        ;;
+    esac
     ;;
 
   strategy)
-    s="${1:-}"
-    case "$s" in prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only|"") ;; *) die "strategy 只能 prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only 或空";; esac
-    jq --arg s "$s" '.strategy=$s' "$F" | write_json; log "OK: strategy=${s:-<空>}。跑 sb-apply 生效。"
+    sub="${1:-}"
+    case "$sub" in
+      "")
+        usage >&2
+        die "strategy 需要 <strategy> 或 off/show"
+        ;;
+      show)
+        jq '{strategy: (.strategy // null)}' "$F"
+        ;;
+      off|clear|del|rm|delete|none)
+        jq 'del(.strategy)' "$F" | write_json
+        log "OK: 已删除 dns.strategy。跑 sb-apply 生效。"
+        ;;
+      *)
+        validate_strategy "$sub"
+        jq --arg strategy "$sub" '.strategy = $strategy' "$F" | write_json
+        log "OK: dns.strategy=$sub。跑 sb-apply 生效。"
+        ;;
+    esac
     ;;
 
-  route-default)
-    tag="${1:-}"; [[ -n "$tag" ]] || die "route-default 需要 <tag>"
-    jq -e --arg t "$tag" '.servers | has($t)' "$F" >/dev/null || die "route-default 引用的 server 不存在: $tag"
-    jq --arg t "$tag" '.route_default=$t' "$F" | write_json; log "OK: route_default=$tag。跑 sb-apply 生效。"
+  route-default|route_default|default-domain-resolver|default_domain_resolver)
+    sub="${1:-}"
+    case "$sub" in
+      "")
+        usage >&2
+        die "route-default 需要 set/rm/show/off"
+        ;;
+
+      show)
+        jq '{route_default: (.route_default // null), available_servers: (.servers | keys)}' "$F"
+        ;;
+
+      off|clear|delete|none)
+        jq 'del(.route_default)' "$F" | write_json
+        log "OK: 已删除 route_default；最终不会生成 route.default_domain_resolver。跑 sb-apply 生效。"
+        ;;
+
+      set)
+        key="${2:-}"
+        value="${3:-}"
+        set_route_default_key "$key" "$value"
+        ;;
+
+      rm|del)
+        key="${2:-}"
+        expected="${3:-}"
+        rm_route_default_key "$key" "$expected"
+        ;;
+
+      *)
+        usage >&2
+        die "route-default 子命令只支持 set/rm/del/show/off，收到 '$sub'"
+        ;;
+    esac
     ;;
 
-  list|show)
-    printf 'dns: enabled=%s final=%s strategy=%s route_default=%s\n' \
-      "$(jq -r '.enabled' "$F")" "$(jq -r '.final // "<空>"' "$F")" "$(jq -r '.strategy // "<空>"' "$F")" "$(jq -r '.route_default // "<空>"' "$F")"
-    jq -r '.servers | to_entries[] | "  \(.key): \(.value.type)" +
-      (if .value.server then " \(.value.server)" else "" end) +
-      (if .value.path then " path=\(.value.path)" else "" end) +
-      (if .value.domain_resolver then " resolver=\(.value.domain_resolver)" else "" end)' "$F"
+  "")
+    usage >&2
+    die "缺少子命令"
     ;;
 
-  "") usage >&2; die "缺子命令" ;;
-  *)  usage >&2; die "未知子命令 '$cmd'" ;;
+  *)
+    usage >&2
+    die "未知子命令 '$cmd'"
+    ;;
 esac
