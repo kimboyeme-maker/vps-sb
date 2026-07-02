@@ -3,6 +3,7 @@ set -euo pipefail
 
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 F="$SB_ROOT/out/outbounds.json"
+PATCH_F="$SB_ROOT/env/outbound-patch.json"
 ENV_FILE="$SB_ROOT/env/node.env"
 TPL="$SB_ROOT/templates/config.json.tpl"
 OUT="$SB_ROOT/out/config.json"
@@ -30,6 +31,12 @@ usage() {
   sb-outbound domain del <name>
   sb-outbound domain rm  <name>
 
+  sb-outbound resolver list
+  sb-outbound resolver show <outbound-tag>
+  sb-outbound resolver set <outbound-tag> <dns-server-tag> [strategy]
+  sb-outbound resolver del <outbound-tag>
+  sb-outbound resolver rm  <outbound-tag>
+
   sb-outbound inbound list
   sb-outbound inbound allow <inbound[,inbound...]>
   sb-outbound inbound set   <inbound[,inbound...]>
@@ -42,11 +49,15 @@ usage() {
   http  <host> <port> [user] [pass]
   ss    <host> <port> <method> <password>
 
-domain_strategy:
+domain_strategy / resolver strategy:
   prefer_ipv4
   prefer_ipv6
   ipv4_only
   ipv6_only
+
+resolver:
+  - 用来给已有 outbound 打 domain_resolver patch，包括模板内置 direct。
+  - patch 写入 env/outbound-patch.json，由 sb-apply 合并进最终 config。
 
 例:
   sb-outbound add isp1 socks proxy.example.com 1080 user pass
@@ -57,6 +68,11 @@ domain_strategy:
   sb-outbound inbound rm hy2-in
 
   sb-outbound domain set isp1 ipv4_only
+
+  sb-outbound resolver set direct google prefer_ipv6
+  sb-outbound resolver show direct
+  sb-outbound resolver rm direct
+
   sb-apply
 U
   exit 1
@@ -115,6 +131,31 @@ ensure_file() {
   ' "$F" >/dev/null || die "$F 必须是 array of objects"
 }
 
+ensure_patch_file() {
+  mkdir -p "$(dirname "$PATCH_F")"
+
+  if [[ ! -f "$PATCH_F" ]]; then
+    cat > "$PATCH_F" <<'JSON'
+{
+  "version": 1,
+  "patch": {}
+}
+JSON
+    chmod 600 "$PATCH_F"
+  fi
+
+  jq -e '
+    type == "object"
+    and ((.patch // {}) | type == "object")
+  ' "$PATCH_F" >/dev/null || die "$PATCH_F 必须是 object，且 .patch 必须是 object"
+}
+
+write_patch_json() {
+  local tmp="$1"
+  install -m 600 "$tmp" "$PATCH_F"
+  rm -f "$tmp"
+}
+
 available_inbounds_json() {
   if [[ -f "$OUT" ]] && jq -e '.inbounds | type == "array"' "$OUT" >/dev/null 2>&1; then
     jq -c '[.inbounds[]?.tag | select(. != null and . != "")]' "$OUT"
@@ -130,7 +171,7 @@ available_inbounds_json() {
   tmp="$(mktemp)"
 
   local VARS
-  VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+  VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
 
   envsubst "$VARS" < "$TPL" > "$tmp"
 
@@ -523,6 +564,97 @@ case "$cmd" in
 
         write_json "$tmp"
         log "OK: 已删除 outbound '$name' 的 domain_strategy。跑 sb-apply 应用。"
+        ;;
+
+      *)
+        usage
+        ;;
+    esac
+    ;;
+
+
+  resolver)
+    sub="${1:-}"
+    shift || true
+
+    ensure_patch_file
+
+    case "$sub" in
+      list)
+        jq -r '
+          (.patch // {})
+          | [to_entries[] | select(.value.domain_resolver? != null)] as $items
+          | if ($items | length) == 0 then
+              "无 outbound resolver patch"
+            else
+              $items[]
+              | [
+                  .key,
+                  (.value.domain_resolver.server // "-"),
+                  (.value.domain_resolver.strategy // "-")
+                ]
+              | @tsv
+            end
+        ' "$PATCH_F"
+        ;;
+
+      show)
+        name="${1:-}"
+        [[ -n "$name" ]] || die "缺少参数: outbound-tag"
+
+        jq --arg n "$name" '
+          {
+            tag: $n,
+            domain_resolver: ((.patch[$n].domain_resolver) // null)
+          }
+        ' "$PATCH_F"
+        ;;
+
+      set)
+        name="${1:-}"
+        server="${2:-}"
+        strategy="${3:-}"
+
+        [[ -n "$name" ]] || die "缺少参数: outbound-tag，例如 direct"
+        [[ -n "$server" ]] || die "缺少参数: dns-server-tag，例如 google"
+        if [[ -n "$strategy" ]]; then
+          validate_domain_strategy "$strategy"
+        fi
+
+        tmp="$(mktemp)"
+        jq \
+          --arg n "$name" \
+          --arg server "$server" \
+          --arg strategy "$strategy" '
+          .version = (.version // 1)
+          | .patch = (.patch // {})
+          | .patch[$n] = (.patch[$n] // {})
+          | .patch[$n].domain_resolver = ({server: $server}
+              + (if $strategy != "" then {strategy: $strategy} else {} end))
+        ' "$PATCH_F" > "$tmp"
+
+        write_patch_json "$tmp"
+        log "OK: 已设置 outbound '$name' domain_resolver.server=$server${strategy:+ strategy=$strategy}。跑 sb-apply 应用。"
+        ;;
+
+      del|rm)
+        name="${1:-}"
+        [[ -n "$name" ]] || die "缺少参数: outbound-tag"
+
+        tmp="$(mktemp)"
+        jq --arg n "$name" '
+          .version = (.version // 1)
+          | .patch = (.patch // {})
+          | if (.patch[$n] // null) == null then
+              .
+            else
+              del(.patch[$n].domain_resolver)
+              | if ((.patch[$n] // {}) | length) == 0 then del(.patch[$n]) else . end
+            end
+        ' "$PATCH_F" > "$tmp"
+
+        write_patch_json "$tmp"
+        log "OK: 已删除 outbound '$name' 的 domain_resolver patch。跑 sb-apply 应用。"
         ;;
 
       *)

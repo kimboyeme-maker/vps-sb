@@ -5,6 +5,7 @@ export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 ENV_FILE="$SB_ROOT/env/node.env"
 USERS_FILE="$SB_ROOT/env/users.json"
 INBOUNDS_FILE="$SB_ROOT/env/inbounds.json"
+OUTBOUND_PATCH_FILE="$SB_ROOT/env/outbound-patch.json"
 TPL="$SB_ROOT/templates/config.json.tpl"
 OUT="$SB_ROOT/out/config.json"
 
@@ -31,17 +32,20 @@ summary:
     5. 按 inbound type 自动注入 users
     6. 检查所有 inbound listen_port 是否符合端口策略
     7. 自动合并 out/outbounds.json
-    8. 自动生成 upstream route
-    9. 自动校验 UPSTREAM_INBOUNDS
-   10. 自动计算 HY2 range
-   11. 自动合并 env/dns.json（DNS 策略，默认禁用）
-   12. 自动合并 env/routes.json（自定义分流规则，默认禁用）
-   13. sing-box check 通过后才落盘
-   14. 重启 sing-box
-   15. UFW 端口对账
-   16. HY2 range nftables dnat 对账
+    8. 自动合并 env/outbound-patch.json（修改 direct 等内置 outbound）
+    9. 自动生成 upstream route
+   10. 自动校验 UPSTREAM_INBOUNDS
+   11. 自动计算 HY2 range
+   12. 自动合并 env/dns.json（DNS 策略，默认禁用）
+   13. 自动合并 env/routes.json（自定义分流规则，默认禁用）
+   14. sing-box check 通过后才落盘
+   15. 重启 sing-box
+   16. UFW 端口对账
+   17. HY2 range nftables dnat 对账
 
   DNS / route overlay（均默认禁用，enabled=false 时对 config 零改动）：
+    - env/outbound-patch.json：{patch:{tag→patchObject}}
+                       由 sb-outbound resolver 编辑；sb-apply 负责 deepmerge 到最终 outbounds，例如 direct.domain_resolver
     - env/dns.json  ：{enabled, servers{tag→{type,server,path,...}}, rules[], final, strategy, route_default}
                        由 sb-dns 编辑；sb-apply 负责拼装成 config.dns + route.default_domain_resolver
     - env/routes.json：{enabled, position, rules[]}
@@ -306,6 +310,18 @@ if [[ -f "$SB_ROOT/out/outbounds.json" ]]; then
   ' "$SB_ROOT/out/outbounds.json")" || die "$SB_ROOT/out/outbounds.json 格式错误"
 fi
 
+dbg "读取 outbound patch overlay"
+
+OUTBOUND_PATCH_JSON='{"version":1,"patch":{}}'
+if [[ -f "$OUTBOUND_PATCH_FILE" ]]; then
+  OUTBOUND_PATCH_JSON="$(jq -c '
+    if type != "object" then error("outbound-patch.json 必须是 object") else . end
+    | .version = (.version // 1)
+    | .patch = (.patch // {})
+    | if (.patch | type) != "object" then error(".patch 必须是 object") else . end
+  ' "$OUTBOUND_PATCH_FILE")" || die "$OUTBOUND_PATCH_FILE 格式错误"
+fi
+
 dbg "读取 DNS / route overlay"
 
 DNS_JSON='{"enabled":false}'
@@ -333,6 +349,7 @@ jq \
   --slurpfile users "$USERS_FILE" \
   --argjson inbound_patch "$INBOUND_PATCH_JSON" \
   --argjson custom_ob "$CUSTOM_OB_JSON" \
+  --argjson outbound_patch "$OUTBOUND_PATCH_JSON" \
   --argjson dns "$DNS_JSON" \
   --argjson routes "$ROUTES_JSON" \
   --arg up_en  "${UPSTREAM_ENABLED:-0}" \
@@ -587,6 +604,21 @@ jq \
       .
     end
 
+  # outbound patch overlay：允许修改模板内置 direct / 自定义 outbound / 生成后的 upstream
+  | reduce (($outbound_patch.patch // {}) | to_entries[]) as $op (.;
+      if (.outbounds | any(.tag == $op.key)) then
+        .outbounds |= map(
+          if .tag == $op.key then
+            deepmerge(.; $op.value)
+          else
+            .
+          end
+        )
+      else
+        error("outbound-patch 引用了不存在的 outbound: " + $op.key + "；可选值：" + ([.outbounds[]?.tag] | join(", ")))
+      end
+    )
+
   | if ((.outbounds | map(.tag) | length) != (.outbounds | map(.tag) | unique | length)) then
       error("最终 outbounds 存在重复 tag")
     else
@@ -758,7 +790,7 @@ apply_hy2_nft() {
 
     nft add table inet "$table"
     nft 'add chain inet sb_hy2_range prerouting { type nat hook prerouting priority dstnat; policy accept; }'
-    nft add rule inet "$table" prerouting udp dport "${HY2_RANGE_START}-${HY2_RANGE_END}" redirect to ":${HY2_RANGE_PORT}"
+    nft add rule inet "$table" prerouting udp dport "${HY2_RANGE_START}-${HY2_RANGE_END}" dnat to ":${HY2_RANGE_PORT}"
 
     log "OK: nftables HY2 range dnat 已应用：udp ${HY2_RANGE_START}-${HY2_RANGE_END} -> ${HY2_RANGE_PORT}"
   else
