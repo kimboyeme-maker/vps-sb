@@ -8,7 +8,7 @@ set -euo pipefail
 #   ... | bash -s --                      # 装到默认 /opt/sb-deploy
 #   ... | bash -s -- /srv/sb              # 装到 /srv/sb
 
-REPO="kimboyeme-maker/vps_sb"
+REPO="kimboyeme-maker/vps_proxy"
 REF="main"
 ROOT="/opt/sb-deploy"
 CORE=(
