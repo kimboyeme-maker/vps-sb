@@ -39,7 +39,7 @@ summary:
    13. sing-box check 通过后才落盘
    14. 重启 sing-box
    15. UFW 端口对账
-   16. HY2 range nftables dnat 对账
+   16. HY2 range nftables redirect 对账
 
   DNS / route overlay（均默认禁用，enabled=false 时对 config 零改动）：
     - env/dns.json  ：{enabled, servers{tag→{type,server,path,...}}, rules[], final, strategy, route_default}
@@ -390,7 +390,7 @@ jq \
       "domain":"domain","domain-suffix":"domain_suffix","domain-keyword":"domain_keyword",
       "domain-regex":"domain_regex","ip-cidr":"ip_cidr"
     }[$t]
-    // error("sb-route: 不支持的 match_type '" + ($t|tostring) + "'。v1 仅支持 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr；geosite/geoip 需 rule_set(未启用)");
+    // error("sb-route: 不支持的 match_type: " + ($t|tostring) + "。v1 仅支持 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr；geosite/geoip 需 rule_set(未启用)");
 
   def compile_route_rules:
     [ ($routes.rules // [])[] |
@@ -758,9 +758,9 @@ apply_hy2_nft() {
 
     nft add table inet "$table"
     nft 'add chain inet sb_hy2_range prerouting { type nat hook prerouting priority dstnat; policy accept; }'
-    nft add rule inet "$table" prerouting udp dport "${HY2_RANGE_START}-${HY2_RANGE_END}" dnat to ":${HY2_RANGE_PORT}"
+    nft add rule inet "$table" prerouting udp dport "${HY2_RANGE_START}-${HY2_RANGE_END}" redirect to ":${HY2_RANGE_PORT}"
 
-    log "OK: nftables HY2 range dnat 已应用：udp ${HY2_RANGE_START}-${HY2_RANGE_END} -> ${HY2_RANGE_PORT}"
+    log "OK: nftables HY2 range redirect 已应用：udp ${HY2_RANGE_START}-${HY2_RANGE_END} -> ${HY2_RANGE_PORT}"
   else
     if command -v nft >/dev/null 2>&1; then
       if nft list table inet "$table" >/dev/null 2>&1; then
