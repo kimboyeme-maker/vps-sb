@@ -32,10 +32,10 @@ Scripts self-locate their root (via `readlink -f` on their own path), so you can
 ```bash
 # default
 
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s --
 
 # custom path
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- /srv/sb
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s -- /srv/sb
 
 ```
 
@@ -64,7 +64,7 @@ pi export vless AI
 ### For Japan VPS (transit / fast entry)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s --
 
 pi genenv
 pi inbound set vless-in  listen_port <port>
@@ -101,7 +101,7 @@ Recommended usage:
 - Be conservative with IPv6; only export/use IPv6 when the VPS IPv6 route is actually good.
 
 ````bash
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s --
 
 pi genenv
 
@@ -139,7 +139,7 @@ pi doctor quick
 ### For US VPS (landing / native US IP)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- /srv/sb
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s -- /srv/sb
 
 pi genenv
 pi inbound set vless-in  listen_port <port>
