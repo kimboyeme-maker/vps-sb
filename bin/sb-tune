@@ -782,6 +782,8 @@ bootstrap(){
 }
 
 menu(){
+  local p abi choice
+
   while true; do
     clear 2>/dev/null || true
     cat <<MENU

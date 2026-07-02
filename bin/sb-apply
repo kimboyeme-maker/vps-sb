@@ -63,6 +63,7 @@ port policy:
 
 notes:
   - 改了 node.env / users.json / outbounds.json / inbounds.json 后都跑 sb-apply
+  - VLESS_PORT / HY2_PORT / SOCKS5_PORT 是模板 listen_port 必需参数；缺失或为空会直接失败，不自动补默认值
   - sing-box check 不通过时不会覆盖正式 config
   - HY2_RANGE_ENABLED=1 时需要系统有 nft 命令
   - sb-apply snapshot：apply 全部成功后打一张快照（调 sb-backup），并只保留最近 10 张；平时 sb-apply 不打快照
@@ -104,7 +105,6 @@ ensure_env_default() {
   }
 }
 
-ensure_env_default "SOCKS5_PORT" "40080"
 ensure_env_default "INBOUND_PORT_MIN" "20000"
 ensure_env_default "INBOUND_PORT_SUGGEST_MIN" "40000"
 ensure_env_default "HY2_RANGE_HOP_INTERVAL" "30"
@@ -155,8 +155,76 @@ validate_offset() {
   (( offset >= 2 && offset <= 60000 )) || die "HY2_RANGE_OFFSET 范围建议是 2-60000，收到 '$offset'"
 }
 
+env_key_exists() {
+  local key="$1"
+
+  grep -q "^${key}=" "$ENV_FILE"
+}
+
+env_value() {
+  local key="$1"
+
+  printf '%s' "${!key-}"
+}
+
+require_env_nonempty() {
+  local key="$1"
+  local desc="$2"
+  local value
+
+  if ! env_key_exists "$key"; then
+    die "node.env 缺必需参数 ${key}（${desc}）。sb-apply 不会自动补这个值；请先跑 sb-genenv upgrade 或手动补齐 ${key}=..."
+  fi
+
+  value="$(env_value "$key")"
+  if [[ -z "$value" ]]; then
+    die "node.env 必需参数 ${key} 为空（${desc}）。请在 $ENV_FILE 中补齐有效值。"
+  fi
+}
+
+require_env_port() {
+  local key="$1"
+  local value
+
+  require_env_nonempty "$key" "模板 listen_port 必需参数，必须是 1-65535 的数字"
+  value="$(env_value "$key")"
+  validate_port "$key" "$value"
+}
+
+require_env_uint() {
+  local key="$1"
+  local desc="$2"
+  local value
+
+  require_env_nonempty "$key" "$desc"
+  value="$(env_value "$key")"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "node.env 参数 ${key} 必须是数字，收到 '$value'"
+}
+
+validate_envsubst_inputs() {
+  log "INFO: 检查 envsubst 必需参数：端口 / Reality / HY2 带宽 / HY2 obfs"
+
+  require_env_port "VLESS_PORT"
+  require_env_port "HY2_PORT"
+  require_env_port "SOCKS5_PORT"
+
+  require_env_uint "HY2_UP_MBPS" "HY2 上行带宽参数"
+  require_env_uint "HY2_DOWN_MBPS" "HY2 下行带宽参数"
+
+  require_env_nonempty "REALITY_PRIVATE_KEY" "VLESS Reality private_key"
+  require_env_nonempty "REALITY_SHORT_ID" "VLESS Reality short_id"
+  require_env_nonempty "REALITY_SNI" "VLESS Reality server_name / handshake server"
+
+  if [[ "${HY2_OBFS:-salamander}" == "salamander" ]]; then
+    require_env_nonempty "HY2_OBFS_PASS" "HY2 salamander obfs password"
+  fi
+
+  log "INFO: envsubst 必需参数检查通过：VLESS_PORT=${VLESS_PORT} HY2_PORT=${HY2_PORT} SOCKS5_PORT=${SOCKS5_PORT} HY2_UP_MBPS=${HY2_UP_MBPS} HY2_DOWN_MBPS=${HY2_DOWN_MBPS}"
+}
+
 validate_domain_strategy "${UPSTREAM_DOMAIN_STRATEGY:-}"
 validate_port_policy
+validate_envsubst_inputs
 
 if [[ "${UPSTREAM_ENABLED:-0}" == "1" ]]; then
   if [[ -z "${UPSTREAM_NAME:-}" ]]; then
@@ -190,6 +258,10 @@ TMP2="$(mktemp)"
 dbg "envsubst 填标量"
 VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
 envsubst "$VARS" < "$TPL" > "$TMP"
+
+if ! jq -e '.inbounds | type == "array"' "$TMP" >/dev/null 2>&1; then
+  die "模板经 envsubst 渲染后不是合法 sing-box JSON，或缺 .inbounds[]。请检查 $TPL 以及 node.env 中参与模板渲染的必需参数。临时渲染文件：$TMP"
+fi
 
 dbg "读取 inbound overlay"
 

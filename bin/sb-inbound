@@ -4,7 +4,7 @@ set -euo pipefail
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 ENV_FILE="$SB_ROOT/env/node.env"
 PATCH_FILE="$SB_ROOT/env/inbounds.json"
-TPL="$SB_ROOT/templates/config.json.tpl"
+CONFIG="$SB_ROOT/out/config.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -16,6 +16,11 @@ summary:
 
   它不会直接修改 templates/config.json.tpl，也不会直接修改 out/config.json。
   真正生效由 sb-apply 统一完成。
+
+  truth source:
+    - sb-inbound 只把 env/inbounds.json 当作 overlay/intent 存储。
+    - 当前真实存在的 inbound 以 out/config.json 为准。
+    - sb-inbound 不再读取模板、不再 envsubst 模板；模板只属于 sb-apply 编译阶段。
 
   端口策略:
     INBOUND_PORT_MIN=20000
@@ -104,7 +109,7 @@ notes:
   - listen_port 必须 >= INBOUND_PORT_MIN
   - listen_port 低于 INBOUND_PORT_SUGGEST_MIN 会 WARN
   - rm/del 表示最终 config 删除字段
-  - reset 表示取消修改，恢复模板默认
+  - reset 表示取消该字段的 overlay 修改；最终是否回到默认由 sb-apply 编译结果决定
   - clone 适合做 vless/hy2 多端口备用 inbound
   - hy2 range 最终 nftables/ufw 由 sb-apply 对账
 U
@@ -115,7 +120,7 @@ fail_usage() {
   die "$1"
 }
 
-for dep in jq envsubst awk grep head; do
+for dep in jq awk grep head; do
   command -v "$dep" >/dev/null || die "缺依赖 $dep"
 done
 
@@ -222,31 +227,20 @@ JSON
   rm -f "$tmp"
 }
 
-render_base_config() {
-  ensure_env
-  [[ -f "$TPL" ]] || die "缺 $TPL"
+ensure_config() {
+  [[ -f "$CONFIG" ]] || die "缺 $CONFIG。sb-inbound 以最终 out/config.json 为 truth source，请先跑 sb-apply 生成当前配置。"
 
-  load_env
-
-  local tmp
-  tmp="$(mktemp)"
-
-  local VARS
-  VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
-
-  envsubst "$VARS" < "$TPL" > "$tmp"
-
-  jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1 || {
-    rm -f "$tmp"
-    die "无法从模板解析 .inbounds，请确认 $TPL 渲染后是合法 JSON"
-  }
-
-  cat "$tmp"
-  rm -f "$tmp"
+  jq -e '.inbounds | type == "array"' "$CONFIG" >/dev/null 2>&1 || \
+    die "$CONFIG 不是有效 sing-box config，缺 .inbounds[]"
 }
 
-base_tags_json() {
-  render_base_config | jq -c '[.inbounds[]?.tag | select(. != null and . != "")]'
+current_config() {
+  ensure_config
+  cat "$CONFIG"
+}
+
+current_tags_json() {
+  current_config | jq -c '[.inbounds[]?.tag | select(. != null and . != "")]'
 }
 
 clone_tags_json() {
@@ -264,7 +258,7 @@ known_tags_json() {
   local clones
   local deleted
 
-  base="$(base_tags_json)"
+  base="$(current_tags_json)"
   clones="$(clone_tags_json)"
   deleted="$(deleted_tags_json)"
 
@@ -306,6 +300,18 @@ require_tag() {
   if ! tag_exists "$tag"; then
     options="$(known_tags_text)"
     die "不存在的 inbound tag: '$tag'；可选值：${options:-<none>}"
+  fi
+}
+
+require_current_tag() {
+  local tag="$1"
+  local options
+
+  validate_tag_syntax "$tag"
+
+  if ! current_tags_json | jq -e --arg t "$tag" 'index($t) != null' >/dev/null; then
+    options="$(current_tags_json | jq -r 'join(", ")')"
+    die "clone 来源必须是当前 out/config.json 里真实存在的 inbound: '$tag'；可选值：${options:-<none>}"
   fi
 }
 
@@ -375,10 +381,10 @@ current_upstream_inbounds_has() {
   ' | grep -qx true
 }
 
-base_inbound_type() {
+current_inbound_type() {
   local tag="$1"
 
-  render_base_config | jq -r --arg t "$tag" '
+  current_config | jq -r --arg t "$tag" '
     .inbounds[]?
     | select(.tag == $t)
     | .type // empty
@@ -396,7 +402,7 @@ inbound_type() {
   local t
   local from
 
-  t="$(base_inbound_type "$tag")"
+  t="$(current_inbound_type "$tag")"
   if [[ -n "$t" ]]; then
     echo "$t"
     return 0
@@ -404,7 +410,7 @@ inbound_type() {
 
   from="$(clone_from_tag "$tag")"
   if [[ -n "$from" ]]; then
-    base_inbound_type "$from"
+    current_inbound_type "$from"
   fi
 }
 
@@ -412,7 +418,7 @@ default_hy2_tag() {
   local tag
 
   tag="$(
-    render_base_config | jq -r '
+    current_config | jq -r '
       .inbounds[]?
       | select(.type == "hysteria2")
       | .tag
@@ -451,7 +457,7 @@ effective_listen_port() {
     return 0
   fi
 
-  render_base_config | jq -r --arg t "$tag" '
+  current_config | jq -r --arg t "$tag" '
     .inbounds[]?
     | select(.tag == $t)
     | .listen_port // empty
@@ -574,8 +580,8 @@ case "$cmd" in
     ;;
 
   list)
-    echo "base inbounds:"
-    render_base_config | jq -r '
+    echo "current applied inbounds:"
+    current_config | jq -r '
       .inbounds[]?
       | "  " + (.tag // "-")
         + "\t" + (.type // "-")
@@ -634,7 +640,7 @@ case "$cmd" in
     echo "  HY2_RANGE_ENABLED=${HY2_RANGE_ENABLED:-0}"
     echo "  HY2_RANGE_TAG=${HY2_RANGE_TAG:-}"
     echo "  HY2_RANGE_OFFSET=${HY2_RANGE_OFFSET:-}"
-    echo "  HY2_RANGE_MODE=${HY2_RANGE_MODE:-redirect}"
+    echo "  HY2_RANGE_MODE=${HY2_RANGE_MODE:-dnat}"
     echo "  HY2_RANGE_HOP_INTERVAL=${HY2_RANGE_HOP_INTERVAL:-30}"
     if [[ "${HY2_RANGE_ENABLED:-0}" == "1" && -n "${HY2_RANGE_TAG:-}" && -n "${HY2_RANGE_OFFSET:-}" ]]; then
       print_hy2_range_calc "$HY2_RANGE_TAG" "$HY2_RANGE_OFFSET" | sed 's/^/  /'
@@ -646,8 +652,8 @@ case "$cmd" in
     [[ -n "$tag" ]] || fail_usage "缺少 tag，例如: sb-inbound show hy2-in"
     require_tag "$tag"
 
-    echo "base:"
-    render_base_config | jq --arg t "$tag" '
+    echo "current:"
+    current_config | jq --arg t "$tag" '
       .inbounds[]?
       | select(.tag == $t)
     '
@@ -810,7 +816,7 @@ case "$cmd" in
 
     [[ -n "$from" && -n "$new" ]] || fail_usage "用法: sb-inbound clone <from-tag> <new-tag> [listen_port]"
 
-    require_tag "$from"
+    require_current_tag "$from"
     require_not_deleted "$from"
     require_new_tag "$new"
 
@@ -853,7 +859,7 @@ case "$cmd" in
             echo "HY2_RANGE_ENABLED=${HY2_RANGE_ENABLED:-0}"
             echo "HY2_RANGE_TAG=${HY2_RANGE_TAG:-$tag}"
             echo "HY2_RANGE_OFFSET=${HY2_RANGE_OFFSET:-}"
-            echo "HY2_RANGE_MODE=${HY2_RANGE_MODE:-redirect}"
+            echo "HY2_RANGE_MODE=${HY2_RANGE_MODE:-dnat}"
             echo "HY2_RANGE_HOP_INTERVAL=${HY2_RANGE_HOP_INTERVAL:-30}"
 
             if [[ -n "${HY2_RANGE_OFFSET:-}" ]]; then
@@ -895,9 +901,9 @@ case "$cmd" in
             set_env "HY2_RANGE_ENABLED" "1"
             set_env "HY2_RANGE_TAG" "$tag"
             set_env "HY2_RANGE_OFFSET" "$offset"
-            set_env "HY2_RANGE_MODE" "redirect"
+            set_env "HY2_RANGE_MODE" "dnat"
 
-            log "OK: 已设置 HY2 range tag=$tag offset=$offset mode=redirect。"
+            log "OK: 已设置 HY2 range tag=$tag offset=$offset mode=dnat。"
             log "INFO: 跑 sb-apply 后由 sb-apply 负责 nftables/ufw 对账。"
             ;;
         esac

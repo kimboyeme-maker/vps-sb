@@ -35,8 +35,9 @@ usage:
   sb-show [mode] [protocol] [name_or_alias]
 
 mode:
-  txt                         文本分享链接输出，默认
+  txt                         明文分享链接输出，默认；只输出 vless:// / hysteria2:// / socks5:// 行
   node                        JSON 节点数据输出
+  info                        人类可读信息输出：server / protocols / inbounds / hy2 range
 
 protocol:
   all                         输出全部当前可用协议，默认
@@ -62,9 +63,11 @@ examples:
   sb-show node hy2
   sb-show node socks5
 
+  sb-show txt default
   sb-show txt all default
   sb-show txt vless default
   sb-show node socks5 default
+  sb-show info
 
 help:
   sb-show help
@@ -74,9 +77,11 @@ help:
 notes:
   - protocol 不传时默认 all
   - name_or_alias 不传时输出所有用户
+  - sb-show txt default 会自动识别 default 为用户过滤，不再误判为协议
   - protocol 传错会提示当前可选值
   - 当前可选协议来自 out/config.json 里的 inbounds
-  - HY2 range 会在 txt/node 输出里显示 ports
+  - txt 模式只输出明文 URI 行，不输出标题、注释、分隔符
+  - HY2 range 会在 info/node 输出里显示 ports；txt 仍只输出主监听端口 URI
   - URI 分享链接仍使用 HY2 主监听端口；Clash YAML 的 ports 由 sb-export 输出
 U
 }
@@ -114,8 +119,34 @@ source "$ENV_FILE"
 set +a
 
 mode="${1:-txt}"
-proto="${2:-all}"
-filter_user="${3:-}"
+arg2="${2:-}"
+arg3="${3:-}"
+proto="all"
+filter_user=""
+
+case "$mode" in
+  txt|node|info)
+    ;;
+  *)
+    fail_usage "非法 mode: '$mode'；可选值：txt, node, info"
+    ;;
+esac
+
+case "$arg2" in
+  "")
+    proto="all"
+    filter_user=""
+    ;;
+  all|vless|hy2|socks5)
+    proto="$arg2"
+    filter_user="$arg3"
+    ;;
+  *)
+    proto="all"
+    filter_user="$arg2"
+    [[ -z "$arg3" ]] || fail_usage "非法参数组合：'$arg2' '$arg3'。如果要指定用户，请用: sb-show $mode <protocol> <name_or_alias> 或 sb-show $mode <name_or_alias>"
+    ;;
+esac
 
 NODE_NAME="${NODE_NAME:-NODE}"
 SERVER_IP="${SERVER_IP:-}"
@@ -130,7 +161,6 @@ HY2_RANGE_TAG="${HY2_RANGE_TAG:-}"
 HY2_RANGE_OFFSET="${HY2_RANGE_OFFSET:-}"
 HY2_RANGE_HOP_INTERVAL="${HY2_RANGE_HOP_INTERVAL:-30}"
 
-[[ "$mode" == "txt" || "$mode" == "node" ]] || fail_usage "非法 mode: '$mode'；可选值：txt, node"
 [[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY_PUBLIC_KEY 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_SHORT_ID" ]] || die "REALITY_SHORT_ID 为空，请检查 $ENV_FILE"
@@ -350,9 +380,6 @@ hy2_uri() {
     "$q" \
     "$frag"
 
-  if [[ -n "$ports" ]]; then
-    printf '# hy2-port-hopping: %s ports=%s hop-interval=%s\n' "$tag" "$ports" "$HY2_RANGE_HOP_INTERVAL"
-  fi
 }
 
 socks5_uri() {
@@ -381,37 +408,15 @@ socks5_uri() {
 
 case "$mode" in
   txt)
-    echo "Server v4: ${SERVER_IP}  v6: ${SERVER_IP6:-<none>}"
-    echo "Protocols: ${AVAIL_PROTO_TEXT}"
-    echo "HY2 range: enabled=${HY2_RANGE_ENABLED:-0} tag=${HY2_RANGE_TAG:-<none>} offset=${HY2_RANGE_OFFSET:-<none>} hop=${HY2_RANGE_HOP_INTERVAL}"
-    echo
-    echo "Inbounds:"
-    inbound_rows | while read -r row_b64; do
-      [[ -n "$row_b64" ]] || continue
-      row_json="$(printf '%s' "$row_b64" | base64 -d)"
-      p="$(json_get "$row_json" protocol)"
-      tag="$(json_get "$row_json" tag)"
-      port="$(json_get_num_or_empty "$row_json" port)"
-      ports=""
-      if [[ "$p" == "hy2" ]]; then
-        ports="$(hy2_range_ports "$tag" "$port")"
-      fi
-      echo "  ${p} ${tag} port=${port}${ports:+ ports=$ports}"
-    done
-    echo
-
     user_rows | while read -r user_b64; do
       [[ -n "$user_b64" ]] || continue
       user_json="$(printf '%s' "$user_b64" | base64 -d)"
       name="$(json_get "$user_json" name)"
-      eg="$(json_get "$user_json" egress)"
       uuid="$(json_get "$user_json" uuid)"
       pw="$(json_get "$user_json" password)"
       alias="$(json_get "$user_json" alias)"
       disp="$alias"
       [[ -z "$disp" ]] && disp="$name"
-
-      echo "================ user: ${name} (egress=${eg}${alias:+, alias=$alias}) ================"
 
       inbound_rows | while read -r row_b64; do
         [[ -n "$row_b64" ]] || continue
@@ -444,8 +449,36 @@ case "$mode" in
             ;;
         esac
       done
+    done
+    ;;
 
-      echo
+  info)
+    echo "Server v4: ${SERVER_IP}  v6: ${SERVER_IP6:-<none>}"
+    echo "Protocols: ${AVAIL_PROTO_TEXT}"
+    echo "HY2 range: enabled=${HY2_RANGE_ENABLED:-0} tag=${HY2_RANGE_TAG:-<none>} offset=${HY2_RANGE_OFFSET:-<none>} hop=${HY2_RANGE_HOP_INTERVAL}"
+    echo
+    echo "Inbounds:"
+    inbound_rows | while read -r row_b64; do
+      [[ -n "$row_b64" ]] || continue
+      row_json="$(printf '%s' "$row_b64" | base64 -d)"
+      p="$(json_get "$row_json" protocol)"
+      tag="$(json_get "$row_json" tag)"
+      port="$(json_get_num_or_empty "$row_json" port)"
+      ports=""
+      if [[ "$p" == "hy2" ]]; then
+        ports="$(hy2_range_ports "$tag" "$port")"
+      fi
+      echo "  ${p} ${tag} port=${port}${ports:+ ports=$ports}"
+    done
+    echo
+    echo "Users:"
+    user_rows | while read -r user_b64; do
+      [[ -n "$user_b64" ]] || continue
+      user_json="$(printf '%s' "$user_b64" | base64 -d)"
+      name="$(json_get "$user_json" name)"
+      eg="$(json_get "$user_json" egress)"
+      alias="$(json_get "$user_json" alias)"
+      echo "  ${name} egress=${eg}${alias:+ alias=$alias}"
     done
     ;;
 
