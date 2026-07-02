@@ -1,4 +1,0 @@
-
-
-chmod +x /opt/sb-deploy/bin/pi
-ln -sf /opt/sb-deploy/bin/pi /usr/local/bin/pi
