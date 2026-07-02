@@ -6,112 +6,541 @@ export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 SYSCTL_FILE=/etc/sysctl.d/99-sb-tune.conf
 SYSCTL_BASE=/etc/sysctl.d/99-net.conf
 JOURNALD_FILE=/etc/systemd/journald.conf.d/99-sb-tune.conf
+XANMOD_KEYRING=/usr/share/keyrings/xanmod-archive-keyring.gpg
+XANMOD_LIST=/etc/apt/sources.list.d/xanmod-release.list
+SWAP_FILE=/swapfile
+
+DEPS=(
+  curl wget gnupg2 ca-certificates lsb-release apt-transport-https
+  jq vim socat unzip mtr-tiny dnsutils net-tools openssl gettext-base ufw
+  nftables iproute2 procps xz-utils
+)
 
 log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-die(){ log "FAIL: $*"; exit 1; }
+stage(){ printf '\n[%s] ===== %s =====\n' "$(date +%H:%M:%S)" "$*" >&2; }
+info(){ log "INFO: $*"; }
+ok(){ log "OK: $*"; }
+warn(){ log "WARN: $*"; }
+fail(){ log "FAIL: $*"; }
+die(){ fail "$*"; exit 1; }
 has(){ command -v "$1" >/dev/null 2>&1; }
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "该操作会改系统，需要 root"; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "该操作会改系统，需要 root。请用 root 或 sudo 执行。"; }
+
+explain(){ log "说明: $*"; }
+status(){ log "状态: $*"; }
+advice(){ log "建议: $*"; }
+expect(){ log "期望: $*"; }
+run(){ log "RUN: $*"; "$@"; }
 
 summary(){ cat <<'S'
 summary:
-  sb-tune 是【可选】的一键系统调优：BBR/BBRv3 检查、sysctl、journald、XanMod 内核安装。
+  sb-tune 是交互式 VPS 前置准备 + 系统调优脚本。
 
-  它不是部署工具链的必需品——手动精调仍以文档第 2/3/4 章为准。
-  sb-tune 只是把那些"能一键傻瓜化"的动作包起来，按机器给参数 + log 提示补偿。
+  默认直接运行 sb-tune 会进入标准新机引导 bootstrap：
+    - 安装系统依赖
+    - 可选 full-upgrade
+    - 检查/创建 swap
+    - 安装 sing-box
+    - 写 journald 限制
+    - 写 sysctl 调优
+    - 可选安装 XanMod/BBRv3
+
+  每一步都会说明：
+    - 当前正在做什么
+    - 当前状态是什么
+    - 推荐怎么选
+    - 执行后期望看到什么结果
+
+  想进菜单用：sb-tune menu
+
+  覆盖范围：
+    - 机器 preflight / 推荐 profile
+    - apt 依赖安装 / 可选 full-upgrade
+    - swap 检查 / 创建
+    - sing-box 安装检查 / 安装
+    - journald 小盘限制
+    - sysctl 网络调优
+    - XanMod + BBRv3 安装
+    - reboot-needed 检查
 
   安全边界：
-    check / plan  —— 只读，绝不改系统
-    sysctl/journald/apply/bbrv3/kernel —— 会改系统，需要 root
-
-  与第 4 章的关系：
-    sb-tune 写 /etc/sysctl.d/99-sb-tune.conf（排序在第 4 章 99-net.conf 之后 → 会覆盖重叠键）。
-    apply/sysctl 时会明确 WARN 列出被覆盖的键，绝不悄悄互盖。
-    profile 的 buffer 高于第 4 章对当前内存的保守值时也会 WARN。
+    - check / preflight / recommend / plan / reboot-needed / deps check / swap check / singbox check 只读
+    - deps install / deps upgrade / swap create / singbox install / sysctl / journald / apply / bbrv3 / kernel 会改系统，需要 root
 S
 }
 
 usage(){ cat <<'U'
 usage:
+  sb-tune                         # 标准新机第一步：进入 bootstrap 引导
+  sb-tune bootstrap | first-run    # 引导式一条龙，逐步询问
+  sb-tune menu | interactive       # 进入交互菜单
+
   sb-tune check
+  sb-tune preflight
+  sb-tune recommend
+  sb-tune reboot-needed
+
+  sb-tune deps check
+  sb-tune deps install
+  sb-tune deps upgrade
+
+  sb-tune swap check
+  sb-tune swap create [512M|1G|2G]
+  sb-tune swap off
+
+  sb-tune singbox check
+  sb-tune singbox install
+  sb-tune singbox version
+
   sb-tune plan   [tiny|balanced|hy2]
   sb-tune apply  [tiny|balanced|hy2]
   sb-tune sysctl [tiny|balanced|hy2]
   sb-tune journald [tiny|balanced|hy2]
+
   sb-tune bbrv3  [auto|v2|v3]
   sb-tune kernel xanmod [auto|v2|v3]
+  sb-tune kernel check-abi
+
   sb-tune summary | help | -h | --help
 
 profiles:
-  tiny      1C/1G 小鸡，保守 buffer（RMEM/WMEM=32M，与第 4 章 1G 取值一致）
-  balanced  2G-4G 常规 VPS（buffer=64M）
-  hy2       偏 HY2/UDP，buffer 稍大（128M；检测到 <1.5G 内存时自动降回 tiny）
-
-notes:
-  - 强烈建议先 sb-tune plan 看清要写什么、会覆盖第 4 章哪些键，再 apply
-  - apply 只写 sysctl + journald；装 XanMod 内核用 bbrv3/kernel，且需 reboot 后才生效
+  tiny      1C/1G 小鸡，保守 buffer：RMEM/WMEM=32M
+  balanced  2G-4G 常规 VPS：buffer=64M
+  hy2       偏 HY2/UDP：buffer=128M；检测到 <1.5G 内存时自动降回 tiny
 U
 }
 
+pause(){
+  [[ "${SB_TUNE_NO_PAUSE:-0}" == "1" ]] && return 0
+  read -r -p "按 Enter 继续... " _ || true
+}
+
+ask_yn(){
+  local prompt="$1" default="${2:-N}" ans suffix
+  case "$default" in
+    Y|y) suffix="Y/n" ;;
+    *) suffix="y/N" ;;
+  esac
+  while true; do
+    read -r -p "$prompt [$suffix]: " ans || ans=""
+    [[ -z "$ans" ]] && ans="$default"
+    case "$ans" in
+      Y|y|yes|YES|Yes) return 0 ;;
+      N|n|no|NO|No) return 1 ;;
+      *) echo "请输入 y 或 n" ;;
+    esac
+  done
+}
+
+ask_value(){
+  local prompt="$1" default="$2" ans
+  read -r -p "$prompt [$default]: " ans || ans=""
+  [[ -z "$ans" ]] && ans="$default"
+  printf '%s' "$ans"
+}
+
 mem_mb(){ awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
-disk_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$2); print $2}' || echo 0; }
+swap_mb(){ awk '/SwapTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
+disk_root_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$2); print $2}' || echo 0; }
+disk_avail_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}' || echo 0; }
+cpu_cores(){ nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0; }
+os_id(){ . /etc/os-release 2>/dev/null && echo "${ID:-unknown}" || echo unknown; }
+os_codename(){ . /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}" || true; }
+
+ipv4_addr(){
+  if has ip; then
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true
+  fi
+}
+
+ipv6_addr(){
+  if has ip; then
+    ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true
+  fi
+}
+
+flags_has(){ grep -m1 -qw "$1" /proc/cpuinfo 2>/dev/null; }
+current_cc(){ sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?'; }
+current_qdisc(){ sysctl -n net.core.default_qdisc 2>/dev/null || echo '?'; }
+current_bbr_version(){ modinfo tcp_bbr 2>/dev/null | awk -F: '/^version/{print $2}' | xargs || echo '?'; }
+
+recommend_profile(){
+  local m c
+  m="$(mem_mb)"
+  c="$(cpu_cores)"
+  if (( m > 0 && m < 1500 )); then
+    echo tiny
+  elif (( m > 0 && m < 4500 )); then
+    echo balanced
+  elif (( c > 0 && c <= 1 )); then
+    echo balanced
+  else
+    echo hy2
+  fi
+}
 
 profile_values(){
-  local p="${1:-balanced}" m; m="$(mem_mb)"
+  local p="${1:-balanced}" m
+  m="$(mem_mb)"
   case "$p" in
-    tiny)     echo "RMEM=33554432 WMEM=33554432 JS=100M JF=20M JR=50M BACKLOG=16384 SYN=8192 NOTSENT=131072" ;;
-    balanced) echo "RMEM=67108864 WMEM=67108864 JS=200M JF=50M JR=100M BACKLOG=32768 SYN=16384 NOTSENT=262144" ;;
+    tiny)
+      echo "RMEM=33554432 WMEM=33554432 JS=100M JF=20M JR=50M BACKLOG=16384 SYN=8192 NOTSENT=131072"
+      ;;
+    balanced)
+      echo "RMEM=67108864 WMEM=67108864 JS=200M JF=50M JR=100M BACKLOG=32768 SYN=16384 NOTSENT=262144"
+      ;;
     hy2)
-      if (( m < 1500 )); then
+      if (( m > 0 && m < 1500 )); then
         echo "RMEM=33554432 WMEM=33554432 JS=100M JF=20M JR=50M BACKLOG=16384 SYN=8192 NOTSENT=131072"
       else
         echo "RMEM=134217728 WMEM=134217728 JS=300M JF=80M JR=150M BACKLOG=65536 SYN=32768 NOTSENT=262144"
-      fi ;;
+      fi
+      ;;
     *) die "未知 profile: $p（tiny|balanced|hy2）" ;;
   esac
 }
 
-# 内存 vs profile buffer 的保守性检查
 mem_warn(){
-  local p="$1" m; m="$(mem_mb)"; eval "$(profile_values "$p")"
+  local p="$1" m RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
+  m="$(mem_mb)"
+  eval "$(profile_values "$p")"
   if (( m > 0 && m < 1500 && RMEM > 33554432 )); then
-    log "WARN: 检测到内存 ${m}MB，profile=$p 的 buffer $((RMEM/1024/1024))MB 高于第 4 章对 1G 机器的保守值(32MB)。小内存上大 buffer 可能挤占内存，确认清楚再 apply（或用 tiny）。"
+    warn "检测到内存 ${m}MB，profile=$p 的 buffer $((RMEM/1024/1024))MB 高于 1G 小机保守值 32MB。"
+    advice "小内存 VPS 建议用 tiny，除非你明确知道 HY2/UDP 需要更大 buffer。"
   fi
 }
 
-# 列出本文件会覆盖 99-net.conf 的哪些键
 overlap_warn(){
   [[ -f "$SYSCTL_BASE" ]] || return 0
   local keys=(net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max \
     net.core.rmem_default net.core.wmem_default net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_fastopen \
     net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat \
     net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog net.ipv4.ip_forward fs.file-max)
-  local hit=()
-  local k
+  local hit=() k
   for k in "${keys[@]}"; do
-    grep -qE "^\s*${k//./\\.}\s*=" "$SYSCTL_BASE" 2>/dev/null && hit+=("$k")
+    grep -qE "^[[:space:]]*${k//./\\.}[[:space:]]*=" "$SYSCTL_BASE" 2>/dev/null && hit+=("$k")
   done
   if (( ${#hit[@]} > 0 )); then
-    log "WARN: 以下键在 $SYSCTL_BASE(第 4 章) 已定义，将被 $SYSCTL_FILE 覆盖(本文件排序在后):"
-    for k in "${hit[@]}"; do log "WARN:   $k"; done
-    log "WARN: 若想以第 4 章为准，请删除 $SYSCTL_FILE 或不要 apply。"
+    warn "以下键在 $SYSCTL_BASE 已定义，将被 $SYSCTL_FILE 覆盖，因为 99-sb-tune.conf 排序在后："
+    for k in "${hit[@]}"; do warn "  $k"; done
+    advice "如果要回到手写 99-net.conf，请删除 $SYSCTL_FILE 后重新 sysctl --system。"
+  fi
+}
+
+show_preflight(){
+  stage "Preflight：读取当前机器状态"
+  explain "这一步只读，不改系统。它会判断内存/磁盘/内核/IPv4/IPv6/BBR 状态，并给出 profile 建议。"
+
+  local m s d a c ip4 ip6 rec virt aes avx2 avx512
+  m="$(mem_mb)"; s="$(swap_mb)"; d="$(disk_root_gb)"; a="$(disk_avail_gb)"; c="$(cpu_cores)"
+  ip4="$(ipv4_addr)"; ip6="$(ipv6_addr)"; rec="$(recommend_profile)"
+  flags_has aes && aes=yes || aes=no
+  flags_has avx2 && avx2=yes || avx2=no
+  flags_has avx512f && avx512=yes || avx512=no
+  virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+
+  cat <<EOF2
+machine:
+  os             = $(os_id) $(os_codename)
+  kernel         = $(uname -r)
+  virt           = $virt
+  cpu_cores      = $c
+  mem_mb         = $m
+  swap_mb        = $s
+  disk_root_gb   = $d
+  disk_avail_gb  = $a
+  ipv4           = ${ip4:-<none>}
+  ipv6           = ${ip6:-<none>}
+  aes_ni         = $aes
+  avx2           = $avx2
+  avx512         = $avx512
+network:
+  congestion     = $(current_cc)
+  qdisc          = $(current_qdisc)
+  bbr_module     = $(current_bbr_version)
+files:
+  sysctl_base    = $([[ -f $SYSCTL_BASE ]] && echo "$SYSCTL_BASE" || echo '<none>')
+  sysctl_tune    = $([[ -f $SYSCTL_FILE ]] && echo "$SYSCTL_FILE" || echo '<none>')
+  journald_tune  = $([[ -f $JOURNALD_FILE ]] && echo "$JOURNALD_FILE" || echo '<none>')
+recommend:
+  profile        = $rec
+EOF2
+
+  if (( m > 0 && m < 1500 )); then
+    advice "当前像 1G 小鸡，优先 tiny：32M buffer + journald 限制。"
+  elif (( m > 0 && m < 4500 )); then
+    advice "当前适合 balanced：64M buffer，比较稳。"
+  else
+    advice "内存较大，可以考虑 hy2；但 1C 小鸡不建议盲目把 HY2 带宽拉太高。"
+  fi
+
+  if (( s == 0 && m > 0 && m < 1500 )); then
+    warn "当前没有 swap；1G 机器安装内核/升级包时更容易 OOM。"
+    advice "建议创建 1G swap。"
+  fi
+
+  if (( a > 0 && a < 3 )); then
+    warn "根分区可用空间低于 3G。"
+    advice "先限制 journald，安装 XanMod 前确认空间够。"
+  fi
+
+  if [[ "$(uname -r)" != *xanmod* ]]; then
+    advice "当前内核不是 xanmod；需要 BBRv3 时可以安装 XanMod，安装后必须 reboot。"
+  fi
+
+  if [[ -n "$ip6" ]]; then
+    advice "检测到 IPv6，但是否适合使用要看回程质量；如果你的 v6 回程烂，node.env 里可以留空 SERVER_IP6。"
   fi
 }
 
 show_check(){
+  stage "Check：当前调优状态"
+  explain "这一步只读，用来确认 sysctl、journald、sing-box、XanMod 状态。"
   echo "kernel        = $(uname -r)"
   echo "mem_mb        = $(mem_mb)"
-  echo "disk_root_gb  = $(disk_gb)"
-  echo "congestion    = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
-  echo "qdisc         = $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
-  echo "bbr_module    = $(modinfo tcp_bbr 2>/dev/null | awk -F: '/^version/{print $2}' | xargs || echo '?')"
-  echo "sysctl_base   = $([[ -f $SYSCTL_BASE ]] && echo "$SYSCTL_BASE (第4章)" || echo '<无>')"
-  echo "sysctl_tune   = $([[ -f $SYSCTL_FILE ]] && echo "$SYSCTL_FILE (已存在)" || echo '<未写>')"
-  if has systemctl; then systemctl is-active --quiet systemd-journald 2>/dev/null && echo "journald      = active" || echo "journald      = not-active"; fi
+  echo "swap_mb       = $(swap_mb)"
+  echo "disk_root_gb  = $(disk_root_gb)"
+  echo "disk_avail_gb = $(disk_avail_gb)"
+  echo "congestion    = $(current_cc)"
+  echo "qdisc         = $(current_qdisc)"
+  echo "bbr_module    = $(current_bbr_version)"
+  echo "sysctl_base   = $([[ -f $SYSCTL_BASE ]] && echo "$SYSCTL_BASE" || echo '<无>')"
+  echo "sysctl_tune   = $([[ -f $SYSCTL_FILE ]] && echo "$SYSCTL_FILE" || echo '<未写>')"
+  echo "journald_tune = $([[ -f $JOURNALD_FILE ]] && echo "$JOURNALD_FILE" || echo '<未写>')"
+  if has systemctl; then
+    systemctl is-active --quiet systemd-journald 2>/dev/null && echo "journald      = active" || echo "journald      = not-active"
+    systemctl list-unit-files sing-box.service >/dev/null 2>&1 && echo "sing-box unit = installed" || echo "sing-box unit = <none>"
+  fi
+  has sing-box && echo "sing-box      = $(sing-box version 2>/dev/null | head -1)" || echo "sing-box      = <missing>"
+}
+
+show_recommend(){
+  stage "Recommend：推荐方案"
+  local p m s d a
+  p="$(recommend_profile)"; m="$(mem_mb)"; s="$(swap_mb)"; d="$(disk_root_gb)"; a="$(disk_avail_gb)"
+  status "内存=${m}MB swap=${s}MB 根分区=${d}G 可用=${a}G 推荐 profile=$p"
+  case "$p" in
+    tiny)
+      advice "用 tiny：journald=100M/20M/50M，socket buffer=32M，适合 1C/1G。"
+      ;;
+    balanced)
+      advice "用 balanced：journald=200M/50M/100M，socket buffer=64M，适合 2-4G。"
+      ;;
+    hy2)
+      advice "可以用 hy2：journald=300M/80M/150M，socket buffer=128M；HY2 流量多时再选。"
+      ;;
+  esac
+  if (( s == 0 && m > 0 && m < 1500 )); then
+    advice "建议先创建 1G swap，再 full-upgrade 或装内核。"
+  fi
+  if [[ "$(uname -r)" != *xanmod* ]]; then
+    advice "需要 BBRv3 就安装 XanMod；安装后 reboot，再 check。"
+  fi
+}
+
+deps_missing(){
+  local p missing=()
+  for p in "${DEPS[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+  printf '%s\n' "${missing[@]}"
+}
+
+deps_check(){
+  stage "Deps check：检查必要工具"
+  explain "这一步只读，会检查文档里的必要工具，以及 HY2 range 需要的 nftables/iproute2。"
+  local missing
+  missing="$(deps_missing | xargs || true)"
+  if [[ -z "$missing" ]]; then
+    ok "系统依赖已齐全。"
+  else
+    warn "缺少依赖：$missing"
+    advice "执行 sb-tune deps install 安装。"
+  fi
+
+  status "注意：sing-box 不在 DEPS 里，需单独执行 sb-tune singbox install；或者直接运行 sb-tune 走 bootstrap 引导。"
+}
+
+deps_install(){
+  need_root
+  stage "Deps install：安装必要工具"
+  explain "将执行 apt update，然后安装 curl/wget/jq/openssl/gettext-base/ufw/nftables 等部署依赖。"
+  expect "完成后 sb-genenv/sb-apply/sb-dns/sb-route/sb-doctor 需要的基础命令应可用。"
+  has apt || die "当前系统没有 apt，暂只支持 Debian/Ubuntu。"
+  run apt update
+  run apt install -y "${DEPS[@]}"
+  deps_check
+}
+
+deps_upgrade(){
+  need_root
+  stage "Deps upgrade：系统完整升级"
+  explain "将执行 apt update && apt -y full-upgrade。这个步骤可能升级内核/系统包，耗时较长。"
+  expect "完成后可能需要 reboot；之后用 sb-tune reboot-needed 检查。"
+  has apt || die "当前系统没有 apt，暂只支持 Debian/Ubuntu。"
+  run apt update
+  run apt -y full-upgrade
+  ok "full-upgrade 完成。"
+}
+
+swap_check(){
+  stage "Swap check：检查 swap"
+  explain "这一步只读。1G VPS 建议至少 1G swap，避免 apt 升级或装内核时 OOM。"
+  echo "swap_mb = $(swap_mb)"
+  if (( $(swap_mb) > 0 )); then
+    ok "已有 swap。"
+  else
+    warn "当前没有 swap。"
+    advice "1G 小机建议执行：sb-tune swap create 1G"
+  fi
+}
+
+size_to_mb(){
+  local s="${1:-1G}" n
+  s="${s//[[:space:]]/}"
+  s="${s^^}"
+
+  case "$s" in
+    *G)
+      n="${s%G}"
+      [[ "$n" =~ ^[0-9]+$ ]] || { echo 0; return 0; }
+      echo $(( n * 1024 ))
+      ;;
+    *M)
+      n="${s%M}"
+      [[ "$n" =~ ^[0-9]+$ ]] || { echo 0; return 0; }
+      echo "$n"
+      ;;
+    '')
+      echo 1024
+      ;;
+    *)
+      [[ "$s" =~ ^[0-9]+$ ]] || { echo 0; return 0; }
+      echo "$s"
+      ;;
+  esac
+}
+
+swap_create(){
+  need_root
+  local size="${1:-1G}" mb avail
+  mb="$(size_to_mb "$size")"
+  [[ "$mb" =~ ^[0-9]+$ ]] || die "非法 swap size: $size"
+  (( mb >= 256 && mb <= 4096 )) || die "swap size 建议范围 256M-4G，收到 ${size}"
+
+  stage "Swap create：创建 swap"
+  explain "目标是在 $SWAP_FILE 创建 ${size} swap，并写入 /etc/fstab。已有 swap 时会跳过。"
+  status "当前 swap=$(swap_mb)MB，根分区可用=$(disk_avail_gb)G"
+
+  if (( $(swap_mb) > 0 )); then
+    ok "已有 swap，跳过创建。"
+    return 0
+  fi
+
+  avail="$(disk_avail_gb)"
+  if (( avail > 0 && avail < 2 )); then
+    die "根分区可用空间 ${avail}G 太低，不建议创建 swap。"
+  fi
+
+  if [[ -e "$SWAP_FILE" ]]; then
+    die "$SWAP_FILE 已存在但系统没有启用 swap，请手动检查，避免误覆盖。"
+  fi
+
+  if has fallocate; then
+    run fallocate -l "$size" "$SWAP_FILE"
+  else
+    run dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$mb" status=progress
+  fi
+  run chmod 600 "$SWAP_FILE"
+  run mkswap "$SWAP_FILE"
+  run swapon "$SWAP_FILE"
+  awk -v f="$SWAP_FILE" '$1 == f {found=1} END{exit found?0:1}' /etc/fstab 2>/dev/null || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
+  ok "swap 已创建并启用：$(swap_mb)MB"
+}
+
+swap_off(){
+  need_root
+  stage "Swap off：关闭脚本创建的 swap"
+  explain "只处理 $SWAP_FILE，并从 /etc/fstab 移除对应行。"
+  if swapon --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
+    run swapoff "$SWAP_FILE"
+  fi
+  if [[ -f /etc/fstab ]]; then
+    sed -i.bak "\#^${SWAP_FILE}[[:space:]]#d" /etc/fstab
+  fi
+  [[ -e "$SWAP_FILE" ]] && rm -f "$SWAP_FILE"
+  ok "已关闭并删除 $SWAP_FILE。"
+}
+
+singbox_check(){
+  stage "sing-box check：检查 sing-box 安装状态"
+  explain "这一步只读。sing-box 安装后通常带 systemd service，正式 config 由 /etc/sing-box/config.json 读取。"
+  if has sing-box; then
+    ok "sing-box 命令存在。"
+    sing-box version 2>/dev/null | head -5 || true
+  else
+    warn "sing-box 未安装。"
+    advice "执行 sb-tune singbox install 安装。"
+  fi
+  if has systemctl; then
+    if systemctl list-unit-files sing-box.service >/dev/null 2>&1; then
+      ok "sing-box.service 存在。"
+      systemctl is-enabled sing-box 2>/dev/null || true
+      systemctl is-active sing-box 2>/dev/null || true
+    else
+      warn "未发现 sing-box.service。"
+    fi
+  fi
+  if [[ -e /etc/sing-box/config.json ]]; then
+    if [[ -L /etc/sing-box/config.json ]]; then
+      status "/etc/sing-box/config.json -> $(readlink /etc/sing-box/config.json)"
+    else
+      status "/etc/sing-box/config.json 存在，但不是软链。"
+    fi
+  else
+    status "/etc/sing-box/config.json 不存在。后续 sb-genenv 会创建项目软链。"
+  fi
+}
+
+singbox_install(){
+  need_root
+  stage "sing-box install：安装 sing-box"
+  explain "将使用 sing-box 官方安装脚本安装本体和 systemd service。安装后不主动启动服务，等 pi apply 生成配置后再启动。"
+  expect "完成后 sing-box version 可输出版本，systemctl 能看到 sing-box.service。"
+  has curl || die "缺 curl，请先 sb-tune deps install"
+  bash <(curl -fsSL https://sing-box.app/install.sh)
+  singbox_check
+  ok "sing-box 安装流程完成。"
+}
+
+write_journald(){
+  need_root
+  local p="${1:-balanced}" RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
+  eval "$(profile_values "$p")"
+  stage "journald：限制日志占用"
+  explain "小盘 VPS 必做。将写 $JOURNALD_FILE，限制 systemd journal 的磁盘和运行时占用。"
+  status "profile=$p SystemMaxUse=$JS SystemMaxFileSize=$JF RuntimeMaxUse=$JR"
+  expect "完成后 systemd-journald 会重启，日志占用上限受控。"
+  mkdir -p "$(dirname "$JOURNALD_FILE")"
+  cat > "$JOURNALD_FILE" <<EOF2
+[Journal]
+SystemMaxUse=$JS
+SystemMaxFileSize=$JF
+RuntimeMaxUse=$JR
+EOF2
+  has systemctl && systemctl restart systemd-journald || true
+  ok "已写 $JOURNALD_FILE 并重启 journald。"
 }
 
 write_sysctl(){
   need_root
-  local p="${1:-balanced}"; eval "$(profile_values "$p")"
+  local p="${1:-balanced}" RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
+  eval "$(profile_values "$p")"
+  stage "sysctl：写入网络调优"
+  explain "将写 $SYSCTL_FILE。它排序在 $SYSCTL_BASE 之后，因此重叠键会以 sb-tune 为准。"
+  status "profile=$p RMEM=$RMEM WMEM=$WMEM BACKLOG=$BACKLOG SYN=$SYN NOTSENT=$NOTSENT"
+  advice "1G 小鸡建议 tiny；高于 1.5G 且 HY2/UDP 流量多再考虑 hy2。"
+  expect "完成后 sysctl net.ipv4.tcp_congestion_control 应为 bbr，net.core.default_qdisc 应为 fq。"
   mem_warn "$p"
   overlap_warn
   cat > "$SYSCTL_FILE" <<EOF2
@@ -134,68 +563,359 @@ net.ipv4.ip_forward = 1
 fs.file-max = 1000000
 EOF2
   sysctl --system >/dev/null
-  log "OK: 已写 $SYSCTL_FILE 并生效 (profile=$p)"
+  ok "已写 $SYSCTL_FILE 并生效。"
+  status "congestion=$(current_cc) qdisc=$(current_qdisc)"
 }
 
-write_journald(){
-  need_root
-  local p="${1:-balanced}"; eval "$(profile_values "$p")"
-  mkdir -p "$(dirname "$JOURNALD_FILE")"
-  cat > "$JOURNALD_FILE" <<EOF2
-[Journal]
-SystemMaxUse=$JS
-SystemMaxFileSize=$JF
-RuntimeMaxUse=$JR
-EOF2
-  has systemctl && systemctl restart systemd-journald || true
-  log "OK: 已写 $JOURNALD_FILE 并重启 journald (profile=$p)"
+show_plan(){
+  local p="${1:-$(recommend_profile)}"
+  stage "Plan：展示计划但不改系统"
+  explain "这一步只读。用于确认 profile 将写入哪些值，以及是否会覆盖已有 99-net.conf。"
+  status "profile=$p"
+  show_check
+  echo "planned values: $(profile_values "$p")"
+  echo "will write: $SYSCTL_FILE + $JOURNALD_FILE"
+  echo "--- WARN 预检 ---"
+  mem_warn "$p"
+  overlap_warn
+}
+
+apply_tune(){
+  local p="${1:-$(recommend_profile)}"
+  stage "Apply tune：写 sysctl + journald"
+  explain "这一步只做系统调优，不安装 XanMod，不安装 sing-box。"
+  write_sysctl "$p"
+  write_journald "$p"
+  ok "tune apply 完成 profile=$p。"
+}
+
+cleanup_xanmod_source(){
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+    [[ -f "$f" ]] || continue
+    if grep -q 'deb\.xanmod\.org[[:space:]]\+releases' "$f" 2>/dev/null; then
+      warn "发现旧 XanMod releases 源：$f"
+      advice "旧 releases 路径容易 404；本脚本会写入按 VERSION_CODENAME 的源到 $XANMOD_LIST。"
+    fi
+  done
+}
+
+check_abi(){
+  stage "XanMod ABI check：检测 x86-64 psABI"
+  explain "这一步会下载 XanMod 的检测脚本并运行。若只支持 v2，不要硬装 v3。"
+  has wget || die "缺 wget，请先 sb-tune deps install"
+  local tmp out abi
+  tmp="$(mktemp)"
+  status "下载 PSABI 检测脚本：https://dl.xanmod.org/check_x86-64_psabi.sh"
+  wget -q https://dl.xanmod.org/check_x86-64_psabi.sh -O "$tmp" || { rm -f "$tmp"; die "无法下载 XanMod PSABI 检测脚本，可能是外部 URL 变化或网络不可达"; }
+  chmod +x "$tmp"
+  out="$($tmp || true)"
+  rm -f "$tmp"
+  printf '%s\n' "$out"
+  if grep -qi 'x86-64-v3' <<<"$out"; then
+    abi=v3
+  else
+    abi=v2
+  fi
+  ok "推荐 ABI=$abi"
 }
 
 install_xanmod(){
   need_root
   local abi="${1:-auto}" codename pkg tmp out
+  stage "XanMod：安装内核 + BBRv3"
+  explain "将添加 XanMod apt 源，自动或手动选择 x64v2/x64v3 内核包。安装后必须 reboot 才会进入新内核。"
+  expect "重启后 uname -r 应包含 xanmod；sysctl congestion=bbr + qdisc=fq 即可。"
   has apt || die "当前系统没有 apt，暂只支持 Debian/Ubuntu"
-  apt update
-  apt install -y curl wget gnupg2 ca-certificates lsb-release apt-transport-https
-  codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+  has wget || die "缺 wget，请先 sb-tune deps install"
+  has gpg || die "缺 gpg，请先 sb-tune deps install"
+
+  codename="$(os_codename)"
   [[ -n "$codename" ]] || die "无法识别 VERSION_CODENAME"
-  wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
-  echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $codename main" > /etc/apt/sources.list.d/xanmod-release.list
-  apt update
-  if [[ "$abi" == "auto" ]]; then
-    tmp="$(mktemp)"; wget -q https://dl.xanmod.org/check_x86-64_psabi.sh -O "$tmp"; chmod +x "$tmp"
-    out="$($tmp || true)"; rm -f "$tmp"
-    if grep -q 'x86-64-v3' <<<"$out"; then abi=v3; else abi=v2; fi
-    log "INFO: auto 检测 ABI=$abi"
+
+  cleanup_xanmod_source
+  run apt update
+  run apt install -y curl wget gnupg2 ca-certificates lsb-release apt-transport-https
+
+  status "下载 XanMod archive key：https://dl.xanmod.org/archive.key"
+  if ! wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o "$XANMOD_KEYRING.tmp"; then
+    rm -f "$XANMOD_KEYRING.tmp"
+    die "无法下载或导入 XanMod archive key，可能是外部 URL 变化或网络不可达"
   fi
-  case "$abi" in v2) pkg=linux-xanmod-x64v2;; v3) pkg=linux-xanmod-x64v3;; *) die "ABI 只支持 auto/v2/v3";; esac
-  apt install -y "$pkg"
-  log "OK: 已安装 $pkg。XanMod 主线 bbr 即 BBRv3。需 reboot 后 sb-tune check 验证。"
+  install -m 644 "$XANMOD_KEYRING.tmp" "$XANMOD_KEYRING"
+  rm -f "$XANMOD_KEYRING.tmp"
+  echo "deb [signed-by=$XANMOD_KEYRING] http://deb.xanmod.org $codename main" > "$XANMOD_LIST"
+  status "已写 XanMod 源：$XANMOD_LIST -> codename=$codename"
+  run apt update
+
+  if [[ "$abi" == "auto" ]]; then
+    tmp="$(mktemp)"
+    status "下载 PSABI 检测脚本：https://dl.xanmod.org/check_x86-64_psabi.sh"
+    wget -q https://dl.xanmod.org/check_x86-64_psabi.sh -O "$tmp" || { rm -f "$tmp"; die "无法下载 XanMod PSABI 检测脚本，可能是外部 URL 变化或网络不可达"; }
+    chmod +x "$tmp"
+    out="$($tmp || true)"
+    rm -f "$tmp"
+    printf '%s\n' "$out"
+    if grep -qi 'x86-64-v3' <<<"$out"; then abi=v3; else abi=v2; fi
+    status "auto 检测 ABI=$abi"
+  fi
+
+  case "$abi" in
+    v2) pkg=linux-xanmod-x64v2 ;;
+    v3) pkg=linux-xanmod-x64v3 ;;
+    *) die "ABI 只支持 auto/v2/v3" ;;
+  esac
+
+  run apt install -y "$pkg"
+  ok "已安装 $pkg。旧内核不会删除，保留 fallback。"
+  advice "现在需要 reboot。重启后执行：sb-tune check"
 }
 
-cmd="${1:-check}"; [[ $# -gt 0 ]] && shift || true
+reboot_needed(){
+  stage "Reboot needed：检查是否建议重启"
+  local need=0
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "/var/run/reboot-required 存在：系统建议重启。"
+    need=1
+  fi
+  if dpkg -l 'linux-xanmod-*' 2>/dev/null | awk '/^ii/{found=1} END{exit found?0:1}'; then
+    status "检测到已安装 XanMod 内核包。"
+    if [[ "$(uname -r)" != *xanmod* ]]; then
+      warn "当前运行内核不是 xanmod：$(uname -r)"
+      advice "安装 XanMod 后需要 reboot 才会进入新内核。"
+      need=1
+    else
+      ok "当前已运行 xanmod 内核：$(uname -r)"
+    fi
+  fi
+  if (( need == 0 )); then
+    ok "当前没有明确的重启信号。"
+  else
+    advice "建议在确认业务可中断后执行 reboot。"
+  fi
+}
+
+choose_profile_interactive(){
+  local rec ans
+  rec="$(recommend_profile)"
+  echo
+  echo "选择 profile："
+  echo "  1) tiny      - 1C/1G 小鸡，32M buffer，最稳"
+  echo "  2) balanced  - 2G-4G 常规 VPS，64M buffer"
+  echo "  3) hy2       - 偏 HY2/UDP，128M buffer；<1.5G 自动降 tiny"
+  read -r -p "请选择 [默认 $rec]: " ans || ans=""
+  case "$ans" in
+    1|tiny) echo tiny ;;
+    2|balanced) echo balanced ;;
+    3|hy2) echo hy2 ;;
+    "") echo "$rec" ;;
+    *) warn "未知选择 '$ans'，使用推荐 profile=$rec"; echo "$rec" ;;
+  esac
+}
+
+bootstrap(){
+  need_root
+  stage "交互式一键启动：sb-tune bootstrap"
+  explain "下面每一步都会说明状态/建议/期望，并由你确认是否执行。不会静默改系统。"
+
+  show_preflight
+
+  if ask_yn "执行 apt update + 安装必要依赖吗" Y; then
+    deps_install
+  else
+    warn "跳过依赖安装。后续某些步骤可能因为缺命令失败。"
+  fi
+
+  if ask_yn "执行 apt -y full-upgrade 吗（可能耗时/可能需要重启）" N; then
+    deps_upgrade
+  else
+    status "跳过 full-upgrade。"
+  fi
+
+  if (( $(swap_mb) == 0 && $(mem_mb) > 0 && $(mem_mb) < 1500 )); then
+    warn "检测到小内存且没有 swap。"
+    if ask_yn "创建 1G swap 吗" Y; then
+      swap_create 1G
+    fi
+  else
+    swap_check
+    if (( $(swap_mb) == 0 )) && ask_yn "仍然创建 1G swap 吗" N; then
+      swap_create 1G
+    fi
+  fi
+
+  if ! has sing-box; then
+    warn "sing-box 未安装。"
+    if ask_yn "安装 sing-box 吗" Y; then
+      singbox_install
+    fi
+  else
+    singbox_check
+  fi
+
+  local prof
+  prof="$(choose_profile_interactive)"
+  show_plan "$prof"
+
+  if ask_yn "写入 journald 限制吗" Y; then
+    write_journald "$prof"
+  fi
+
+  if ask_yn "写入 sysctl 网络调优吗" Y; then
+    write_sysctl "$prof"
+  fi
+
+  if [[ "$(uname -r)" != *xanmod* ]]; then
+    warn "当前不是 xanmod 内核。"
+    advice "需要 BBRv3 时安装 XanMod；安装后必须 reboot。"
+    if ask_yn "安装 XanMod/BBRv3 内核吗" N; then
+      install_xanmod auto
+    fi
+  else
+    ok "当前已是 xanmod 内核，跳过内核安装询问。"
+  fi
+
+  reboot_needed
+  stage "Bootstrap 完成"
+  expect "下一步：如果装了 XanMod 或系统提示 reboot，先重启；然后执行 sb-tune check。"
+  expect "部署工具链继续走：pi genenv upgrade -> pi apply。"
+}
+
+menu(){
+  while true; do
+    clear 2>/dev/null || true
+    cat <<MENU
+================ sb-tune interactive ================
+当前机器：mem=$(mem_mb)MB swap=$(swap_mb)MB disk_avail=$(disk_avail_gb)G kernel=$(uname -r)
+推荐 profile：$(recommend_profile)
+
+  1) 标准新机引导 bootstrap（逐步询问，推荐）
+  2) 只读体检 preflight
+  3) 只读检查 check
+  4) 查看推荐 recommend
+  5) 安装必要依赖 deps install
+  6) 系统完整升级 deps upgrade
+  7) swap 检查/创建
+  8) sing-box 检查/安装
+  9) journald 限制
+ 10) sysctl 网络调优
+ 11) apply = sysctl + journald
+ 12) XanMod/BBRv3 安装
+ 13) reboot-needed 检查
+ 14) plan 预览
+  0) 退出
+=====================================================
+MENU
+    read -r -p "请选择: " choice || choice=""
+    case "$choice" in
+      1) bootstrap; pause ;;
+      2) show_preflight; pause ;;
+      3) show_check; pause ;;
+      4) show_recommend; pause ;;
+      5) deps_install; pause ;;
+      6) deps_upgrade; pause ;;
+      7)
+        swap_check
+        if ask_yn "创建/补充 1G swap 吗" N; then swap_create 1G; fi
+        pause
+        ;;
+      8)
+        singbox_check
+        if ! has sing-box || ask_yn "重新执行 sing-box install 吗" N; then singbox_install; fi
+        pause
+        ;;
+      9)
+        p="$(choose_profile_interactive)"
+        write_journald "$p"
+        pause
+        ;;
+      10)
+        p="$(choose_profile_interactive)"
+        write_sysctl "$p"
+        pause
+        ;;
+      11)
+        p="$(choose_profile_interactive)"
+        apply_tune "$p"
+        pause
+        ;;
+      12)
+        echo "ABI: auto / v2 / v3"
+        abi="$(ask_value "选择 ABI" "auto")"
+        install_xanmod "$abi"
+        pause
+        ;;
+      13) reboot_needed; pause ;;
+      14)
+        p="$(choose_profile_interactive)"
+        show_plan "$p"
+        pause
+        ;;
+      0|q|quit|exit) exit 0 ;;
+      *) echo "未知选择"; sleep 1 ;;
+    esac
+  done
+}
+
+cmd="${1:-bootstrap}"
+[[ $# -gt 0 ]] && shift || true
+
 case "$cmd" in
   summary) summary ;;
   help|-h|--help) summary; echo; usage ;;
+  interactive|menu) menu ;;
+  bootstrap|start|wizard|first-run|first_run|standard|quickstart) bootstrap ;;
+
   check) show_check ;;
-  plan)
-    p="${1:-balanced}"
-    echo "profile=$p"; show_check
-    echo "planned values: $(profile_values "$p")"
-    echo "will write: $SYSCTL_FILE + $JOURNALD_FILE"
-    echo "--- 预检 WARN(仅提示，不改系统) ---"
-    mem_warn "$p"; overlap_warn
+  preflight) show_preflight ;;
+  recommend) show_recommend ;;
+  reboot-needed|reboot_needed) reboot_needed ;;
+
+  deps)
+    sub="${1:-check}"
+    case "$sub" in
+      check) deps_check ;;
+      install) deps_install ;;
+      upgrade|full-upgrade|full_upgrade) deps_upgrade ;;
+      *) usage >&2; die "未知 deps 子命令: $sub" ;;
+    esac
     ;;
-  sysctl)   write_sysctl   "${1:-balanced}" ;;
-  journald) write_journald "${1:-balanced}" ;;
-  apply)
-    p="${1:-balanced}"; write_sysctl "$p"; write_journald "$p"; log "OK: tune apply 完成 profile=$p"
+
+  swap)
+    sub="${1:-check}"; shift || true
+    case "$sub" in
+      check) swap_check ;;
+      create) swap_create "${1:-1G}" ;;
+      off|disable|rm|del) swap_off ;;
+      *) usage >&2; die "未知 swap 子命令: $sub" ;;
+    esac
     ;;
-  bbrv3)  install_xanmod "${1:-auto}" ;;
+
+  singbox|sing-box)
+    sub="${1:-check}"
+    case "$sub" in
+      check) singbox_check ;;
+      install) singbox_install ;;
+      version) has sing-box && sing-box version || die "sing-box 未安装" ;;
+      *) usage >&2; die "未知 singbox 子命令: $sub" ;;
+    esac
+    ;;
+
+  plan) show_plan "${1:-$(recommend_profile)}" ;;
+  sysctl) write_sysctl "${1:-$(recommend_profile)}" ;;
+  journald) write_journald "${1:-$(recommend_profile)}" ;;
+  apply) apply_tune "${1:-$(recommend_profile)}" ;;
+
+  bbrv3) install_xanmod "${1:-auto}" ;;
   kernel)
     sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
-    [[ "$sub" == "xanmod" ]] || die "用法: sb-tune kernel xanmod [auto|v2|v3]"
-    install_xanmod "${1:-auto}" ;;
-  "") usage >&2; die "缺子命令" ;;
-  *)  usage >&2; die "未知命令: $cmd" ;;
+    case "$sub" in
+      xanmod) install_xanmod "${1:-auto}" ;;
+      check-abi|abi) check_abi ;;
+      *) usage >&2; die "用法: sb-tune kernel xanmod [auto|v2|v3] 或 sb-tune kernel check-abi" ;;
+    esac
+    ;;
+
+  "") menu ;;
+  *) usage >&2; die "未知命令: $cmd" ;;
 esac
