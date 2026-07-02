@@ -33,8 +33,8 @@
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
-        "certificate_path": "/opt/sb-deploy/certs/cert.pem",
-        "key_path": "/opt/sb-deploy/certs/key.pem"
+        "certificate_path": "${SB_ROOT}/certs/cert.pem",
+        "key_path": "${SB_ROOT}/certs/key.pem"
       }
     },
     {

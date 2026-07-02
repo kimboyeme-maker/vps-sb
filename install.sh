@@ -1,58 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-mkdir -p "$SB_ROOT/bin" "$SB_ROOT/env" "$SB_ROOT/backups"
-install -m 755 "$SRC_DIR/bin/sb-profile" "$SB_ROOT/bin/sb-profile"
-install -m 755 "$SRC_DIR/bin/sb-dns" "$SB_ROOT/bin/sb-dns"
-install -m 755 "$SRC_DIR/bin/sb-doctor" "$SB_ROOT/bin/sb-doctor"
-install -m 755 "$SRC_DIR/bin/sb-backup" "$SB_ROOT/bin/sb-backup"
-install -m 755 "$SRC_DIR/bin/sb-route" "$SB_ROOT/bin/sb-route"
-install -m 755 "$SRC_DIR/bin/sb-tune" "$SB_ROOT/bin/sb-tune"
 
-# Optional PATH symlinks.
-if [[ -d /usr/local/bin && -w /usr/local/bin ]]; then
-  for x in sb-profile sb-dns sb-doctor sb-backup sb-route sb-tune; do
-    ln -sf "$SB_ROOT/bin/$x" "/usr/local/bin/$x"
-  done
-fi
+# sb-deploy 一键安装 / 更新（从 GitHub 拉取脚本）
+# 用法:
+#   curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- [ROOT] [--with-tune] [--ref BRANCH]
+# 例:
+#   ... | bash -s --                      # 装到默认 /opt/sb-deploy
+#   ... | bash -s -- /srv/sb --with-tune  # 装到 /srv/sb，并装可选 sb-tune
 
-APPLY="$SB_ROOT/bin/sb-apply"
-if [[ -f "$APPLY" ]]; then
-  python3 - "$APPLY" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-s = p.read_text()
-# Keep nftables local-port redirect semantics.
-s = s.replace('dnat to ":${HY2_RANGE_PORT}"', 'redirect to ":${HY2_RANGE_PORT}"')
-s = s.replace('HY2 range nftables dnat 对账', 'HY2 range nftables redirect 对账')
-s = s.replace('nftables HY2 range dnat 已应用', 'nftables HY2 range redirect 已应用')
-# Compile hooks before sing-box check.
-marker = 'dbg "语法校验（过了才落盘）"'
-hook = '''# sb-extension compile hook: dns/route\nif [[ -x "$SB_ROOT/bin/sb-dns" ]]; then\n  "$SB_ROOT/bin/sb-dns" compile "$TMP2"\nfi\nif [[ -x "$SB_ROOT/bin/sb-route" ]]; then\n  "$SB_ROOT/bin/sb-route" compile "$TMP2"\nfi\n\n'''
-if 'sb-extension compile hook: dns/route' not in s:
-    if marker not in s:
-        raise SystemExit('FAIL: cannot find sing-box check marker in sb-apply')
-    s = s.replace(marker, hook + marker)
-# Backup hook before temp cleanup, reached only on successful path.
-cleanup = 'rm -f "$TMP" "$TMP2" /tmp/sb-check.log'
-bhook = '''# sb-extension backup hook: apply-success only\nif [[ -x "$SB_ROOT/bin/sb-backup" ]]; then\n  "$SB_ROOT/bin/sb-backup" auto-apply-success >/dev/null || log "WARN: 自动备份失败"\nfi\n\n'''
-if 'sb-extension backup hook: apply-success only' not in s:
-    if cleanup not in s:
-        raise SystemExit('FAIL: cannot find cleanup marker in sb-apply')
-    s = s.replace(cleanup, bhook + cleanup)
-p.write_text(s)
-PY
-  chmod +x "$APPLY"
-  bash -n "$APPLY"
-  echo "OK: patched $APPLY"
-else
-  echo "WARN: $APPLY not found; installed commands only. Re-run install after sb-apply exists."
-fi
+REPO="kimboyeme-maker/vps_proxy"
+REF="main"
+ROOT="/opt/sb-deploy"
+WITH_TUNE=1
+CORE=(sb-genenv sb-user sb-apply sb-show sb-export sb-outbound sb-inbound sb-clear sb-backup sb-doctor sb-dns sb-route pi)
 
-for x in sb-profile sb-dns sb-doctor sb-backup sb-route sb-tune; do
-  bash -n "$SB_ROOT/bin/$x"
+log(){ printf '[install] %s\n' "$*" >&2; }
+die(){ printf '[install] FAIL: %s\n' "$*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-tune) WITH_TUNE=1 ;;
+    --ref) shift; REF="${1:-main}" ;;
+    -*) die "未知参数 $1" ;;
+    *) ROOT="$1" ;;
+  esac
+  shift
 done
 
-echo "OK: installed sb extension commands into $SB_ROOT/bin"
+[[ ${EUID:-$(id -u)} -eq 0 ]] || die "需要 root（要写 $ROOT 和 /usr/local/bin）"
+command -v curl >/dev/null || die "缺 curl"
+
+RAW="https://raw.githubusercontent.com/$REPO/$REF"
+log "安装到 $ROOT (repo=$REPO ref=$REF with-tune=$WITH_TUNE)"
+
+mkdir -p "$ROOT"/{bin,templates,env,certs,out}
+mkdir -p /etc/sing-box
+ln -sf "$ROOT/out/config.json" /etc/sing-box/config.json
+
+fetch(){ curl -fsSL --retry 3 "$RAW/$1" -o "$2" || die "下载失败: $1"; }
+
+for s in "${CORE[@]}"; do
+  fetch "bin/$s" "$ROOT/bin/$s"; chmod +x "$ROOT/bin/$s"
+  ln -sf "$ROOT/bin/$s" "/usr/local/bin/$s"
+done
+if [[ $WITH_TUNE -eq 1 ]]; then
+  fetch "bin/sb-tune" "$ROOT/bin/sb-tune"; chmod +x "$ROOT/bin/sb-tune"
+  ln -sf "$ROOT/bin/sb-tune" /usr/local/bin/sb-tune
+fi
+
+fetch "templates/config.json.tpl" "$ROOT/templates/config.json.tpl"
+printf 'env/\ncerts/\nout/\nbackups/\n' > "$ROOT/.gitignore"
+
+miss=""
+for d in jq envsubst openssl sing-box ufw; do command -v "$d" >/dev/null || miss="$miss $d"; done
+[[ -n "$miss" ]] && log "WARN: 缺依赖:$miss（sb-genenv/sb-apply 需要，请先按文档第 1、5 章装好）"
+
+log "OK: 已装 ${#CORE[@]} 核心脚本$([[ $WITH_TUNE -eq 1 ]] && echo ' + sb-tune')，软链到 /usr/local/bin"
+log "脚本自定位根目录（$ROOT），零 env 即用。下一步: pi genenv → pi user add ... → pi apply → pi export"

@@ -1,66 +1,121 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+
+SYSCTL_FILE=/etc/sysctl.d/99-sb-tune.conf
+SYSCTL_BASE=/etc/sysctl.d/99-net.conf
+JOURNALD_FILE=/etc/systemd/journald.conf.d/99-sb-tune.conf
+
 log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die(){ log "FAIL: $*"; exit 1; }
 has(){ command -v "$1" >/dev/null 2>&1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "该操作会改系统，需要 root"; }
+
 summary(){ cat <<'S'
 summary:
-  sb-tune 管系统层调优：BBR/BBRv3 检查、sysctl、journald、XanMod 内核安装规划。
-  默认 check/plan 不改系统；apply/bbrv3/kernel 会改系统。
+  sb-tune 是【可选】的一键系统调优：BBR/BBRv3 检查、sysctl、journald、XanMod 内核安装。
+
+  它不是部署工具链的必需品——手动精调仍以文档第 2/3/4 章为准。
+  sb-tune 只是把那些"能一键傻瓜化"的动作包起来，按机器给参数 + log 提示补偿。
+
+  安全边界：
+    check / plan  —— 只读，绝不改系统
+    sysctl/journald/apply/bbrv3/kernel —— 会改系统，需要 root
+
+  与第 4 章的关系：
+    sb-tune 写 /etc/sysctl.d/99-sb-tune.conf（排序在第 4 章 99-net.conf 之后 → 会覆盖重叠键）。
+    apply/sysctl 时会明确 WARN 列出被覆盖的键，绝不悄悄互盖。
+    profile 的 buffer 高于第 4 章对当前内存的保守值时也会 WARN。
 S
 }
+
 usage(){ cat <<'U'
 usage:
-  sb-tune summary
-  sb-tune help|-h|--help
   sb-tune check
-  sb-tune plan [tiny|balanced|hy2]
-  sb-tune apply [tiny|balanced|hy2]
-  sb-tune bbrv3 [auto|v2|v3]
-  sb-tune kernel xanmod [auto|v2|v3]
-  sb-tune journald [tiny|balanced|hy2]
+  sb-tune plan   [tiny|balanced|hy2]
+  sb-tune apply  [tiny|balanced|hy2]
   sb-tune sysctl [tiny|balanced|hy2]
+  sb-tune journald [tiny|balanced|hy2]
+  sb-tune bbrv3  [auto|v2|v3]
+  sb-tune kernel xanmod [auto|v2|v3]
+  sb-tune summary | help | -h | --help
 
 profiles:
-  tiny      1C/1G 小鸡，保守 buffer 和日志区
-  balanced 2G-4G 常规 VPS
-  hy2      偏 HY2/UDP，buffer 稍大
+  tiny      1C/1G 小鸡，保守 buffer（RMEM/WMEM=32M，与第 4 章 1G 取值一致）
+  balanced  2G-4G 常规 VPS（buffer=64M）
+  hy2       偏 HY2/UDP，buffer 稍大（128M；检测到 <1.5G 内存时自动降回 tiny）
+
+notes:
+  - 强烈建议先 sb-tune plan 看清要写什么、会覆盖第 4 章哪些键，再 apply
+  - apply 只写 sysctl + journald；装 XanMod 内核用 bbrv3/kernel，且需 reboot 后才生效
 U
 }
+
 mem_mb(){ awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
 disk_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$2); print $2}' || echo 0; }
+
 profile_values(){
-  local p="${1:-balanced}" m d
-  m="$(mem_mb)"; d="$(disk_gb)"
+  local p="${1:-balanced}" m; m="$(mem_mb)"
   case "$p" in
-    tiny)
-      echo "RMEM=33554432 WMEM=33554432 JOURNAL_SYSTEM=100M JOURNAL_FILE=20M JOURNAL_RUNTIME=50M BACKLOG=16384 SYN_BACKLOG=8192 NOTSENT=131072" ;;
-    balanced)
-      echo "RMEM=67108864 WMEM=67108864 JOURNAL_SYSTEM=200M JOURNAL_FILE=50M JOURNAL_RUNTIME=100M BACKLOG=32768 SYN_BACKLOG=16384 NOTSENT=262144" ;;
+    tiny)     echo "RMEM=33554432 WMEM=33554432 JS=100M JF=20M JR=50M BACKLOG=16384 SYN=8192 NOTSENT=131072" ;;
+    balanced) echo "RMEM=67108864 WMEM=67108864 JS=200M JF=50M JR=100M BACKLOG=32768 SYN=16384 NOTSENT=262144" ;;
     hy2)
       if (( m < 1500 )); then
-        echo "RMEM=33554432 WMEM=33554432 JOURNAL_SYSTEM=100M JOURNAL_FILE=20M JOURNAL_RUNTIME=50M BACKLOG=16384 SYN_BACKLOG=8192 NOTSENT=131072"
+        echo "RMEM=33554432 WMEM=33554432 JS=100M JF=20M JR=50M BACKLOG=16384 SYN=8192 NOTSENT=131072"
       else
-        echo "RMEM=134217728 WMEM=134217728 JOURNAL_SYSTEM=300M JOURNAL_FILE=80M JOURNAL_RUNTIME=150M BACKLOG=65536 SYN_BACKLOG=32768 NOTSENT=262144"
+        echo "RMEM=134217728 WMEM=134217728 JS=300M JF=80M JR=150M BACKLOG=65536 SYN=32768 NOTSENT=262144"
       fi ;;
-    *) die "未知 profile: $p" ;;
+    *) die "未知 profile: $p（tiny|balanced|hy2）" ;;
   esac
 }
-show_check(){
-  echo "kernel=$(uname -r)"
-  echo "mem_mb=$(mem_mb) disk_root_gb=$(disk_gb)"
-  echo "congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  echo "qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-  echo "bbr_module=$(modinfo tcp_bbr 2>/dev/null | awk -F: '/version/{print $2}' | xargs || true)"
-  if has systemctl; then systemctl is-active --quiet systemd-journald 2>/dev/null && echo "journald=active" || echo "journald=not-active"; fi
-  if has apt; then echo "apt=yes"; fi
+
+# 内存 vs profile buffer 的保守性检查
+mem_warn(){
+  local p="$1" m; m="$(mem_mb)"; eval "$(profile_values "$p")"
+  if (( m > 0 && m < 1500 && RMEM > 33554432 )); then
+    log "WARN: 检测到内存 ${m}MB，profile=$p 的 buffer $((RMEM/1024/1024))MB 高于第 4 章对 1G 机器的保守值(32MB)。小内存上大 buffer 可能挤占内存，确认清楚再 apply（或用 tiny）。"
+  fi
 }
+
+# 列出本文件会覆盖 99-net.conf 的哪些键
+overlap_warn(){
+  [[ -f "$SYSCTL_BASE" ]] || return 0
+  local keys=(net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max \
+    net.core.rmem_default net.core.wmem_default net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_fastopen \
+    net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat \
+    net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog net.ipv4.ip_forward fs.file-max)
+  local hit=()
+  local k
+  for k in "${keys[@]}"; do
+    grep -qE "^\s*${k//./\\.}\s*=" "$SYSCTL_BASE" 2>/dev/null && hit+=("$k")
+  done
+  if (( ${#hit[@]} > 0 )); then
+    log "WARN: 以下键在 $SYSCTL_BASE(第 4 章) 已定义，将被 $SYSCTL_FILE 覆盖(本文件排序在后):"
+    for k in "${hit[@]}"; do log "WARN:   $k"; done
+    log "WARN: 若想以第 4 章为准，请删除 $SYSCTL_FILE 或不要 apply。"
+  fi
+}
+
+show_check(){
+  echo "kernel        = $(uname -r)"
+  echo "mem_mb        = $(mem_mb)"
+  echo "disk_root_gb  = $(disk_gb)"
+  echo "congestion    = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  echo "qdisc         = $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+  echo "bbr_module    = $(modinfo tcp_bbr 2>/dev/null | awk -F: '/^version/{print $2}' | xargs || echo '?')"
+  echo "sysctl_base   = $([[ -f $SYSCTL_BASE ]] && echo "$SYSCTL_BASE (第4章)" || echo '<无>')"
+  echo "sysctl_tune   = $([[ -f $SYSCTL_FILE ]] && echo "$SYSCTL_FILE (已存在)" || echo '<未写>')"
+  if has systemctl; then systemctl is-active --quiet systemd-journald 2>/dev/null && echo "journald      = active" || echo "journald      = not-active"; fi
+}
+
 write_sysctl(){
-  local p="${1:-balanced}" vals
-  vals="$(profile_values "$p")"; eval "$vals"
-  cat > /etc/sysctl.d/99-sb-deploy.conf <<EOF2
-# sb-deploy network tuning profile=$p
+  need_root
+  local p="${1:-balanced}"; eval "$(profile_values "$p")"
+  mem_warn "$p"
+  overlap_warn
+  cat > "$SYSCTL_FILE" <<EOF2
+# sb-tune network tuning (profile=$p) — 排序在 99-net.conf 之后，覆盖其重叠键
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = $RMEM
@@ -74,29 +129,31 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = $NOTSENT
 net.core.netdev_max_backlog = $BACKLOG
-net.ipv4.tcp_max_syn_backlog = $SYN_BACKLOG
+net.ipv4.tcp_max_syn_backlog = $SYN
 net.ipv4.ip_forward = 1
 fs.file-max = 1000000
 EOF2
   sysctl --system >/dev/null
-  log "OK: sysctl applied profile=$p"
+  log "OK: 已写 $SYSCTL_FILE 并生效 (profile=$p)"
 }
+
 write_journald(){
-  local p="${1:-balanced}" vals
-  vals="$(profile_values "$p")"; eval "$vals"
-  mkdir -p /etc/systemd/journald.conf.d
-  cat > /etc/systemd/journald.conf.d/sb-deploy-size.conf <<EOF2
+  need_root
+  local p="${1:-balanced}"; eval "$(profile_values "$p")"
+  mkdir -p "$(dirname "$JOURNALD_FILE")"
+  cat > "$JOURNALD_FILE" <<EOF2
 [Journal]
-SystemMaxUse=$JOURNAL_SYSTEM
-SystemMaxFileSize=$JOURNAL_FILE
-RuntimeMaxUse=$JOURNAL_RUNTIME
+SystemMaxUse=$JS
+SystemMaxFileSize=$JF
+RuntimeMaxUse=$JR
 EOF2
-  if has systemctl; then systemctl restart systemd-journald || true; fi
-  log "OK: journald limits applied profile=$p"
+  has systemctl && systemctl restart systemd-journald || true
+  log "OK: 已写 $JOURNALD_FILE 并重启 journald (profile=$p)"
 }
+
 install_xanmod(){
-  local abi="${1:-auto}" codename pkg
-  [[ $EUID -eq 0 ]] || die "需要 root"
+  need_root
+  local abi="${1:-auto}" codename pkg tmp out
   has apt || die "当前系统没有 apt，暂只支持 Debian/Ubuntu"
   apt update
   apt install -y curl wget gnupg2 ca-certificates lsb-release apt-transport-https
@@ -108,26 +165,37 @@ install_xanmod(){
   if [[ "$abi" == "auto" ]]; then
     tmp="$(mktemp)"; wget -q https://dl.xanmod.org/check_x86-64_psabi.sh -O "$tmp"; chmod +x "$tmp"
     out="$($tmp || true)"; rm -f "$tmp"
-    if grep -q 'x86-64-v3 supported' <<<"$out"; then abi=v3; else abi=v2; fi
-    log "INFO: auto ABI=$abi"
+    if grep -q 'x86-64-v3' <<<"$out"; then abi=v3; else abi=v2; fi
+    log "INFO: auto 检测 ABI=$abi"
   fi
   case "$abi" in v2) pkg=linux-xanmod-x64v2;; v3) pkg=linux-xanmod-x64v3;; *) die "ABI 只支持 auto/v2/v3";; esac
   apt install -y "$pkg"
-  log "OK: 已安装 $pkg。需要 reboot 后才能验证 BBRv3。"
+  log "OK: 已安装 $pkg。XanMod 主线 bbr 即 BBRv3。需 reboot 后 sb-tune check 验证。"
 }
-cmd="${1:-check}"; shift || true
+
+cmd="${1:-check}"; [[ $# -gt 0 ]] && shift || true
 case "$cmd" in
   summary) summary ;;
   help|-h|--help) summary; echo; usage ;;
   check) show_check ;;
   plan)
-    p="${1:-balanced}"; echo "profile=$p"; show_check; echo "planned: $(profile_values "$p")"; echo "will write: /etc/sysctl.d/99-sb-deploy.conf and /etc/systemd/journald.conf.d/sb-deploy-size.conf" ;;
-  sysctl) write_sysctl "${1:-balanced}" ;;
+    p="${1:-balanced}"
+    echo "profile=$p"; show_check
+    echo "planned values: $(profile_values "$p")"
+    echo "will write: $SYSCTL_FILE + $JOURNALD_FILE"
+    echo "--- 预检 WARN(仅提示，不改系统) ---"
+    mem_warn "$p"; overlap_warn
+    ;;
+  sysctl)   write_sysctl   "${1:-balanced}" ;;
   journald) write_journald "${1:-balanced}" ;;
   apply)
-    p="${1:-balanced}"; write_sysctl "$p"; write_journald "$p"; log "OK: tune apply profile=$p" ;;
-  bbrv3) install_xanmod "${1:-auto}" ;;
+    p="${1:-balanced}"; write_sysctl "$p"; write_journald "$p"; log "OK: tune apply 完成 profile=$p"
+    ;;
+  bbrv3)  install_xanmod "${1:-auto}" ;;
   kernel)
-    sub="${1:-}"; shift || true; [[ "$sub" == "xanmod" ]] || die "用法: sb-tune kernel xanmod [auto|v2|v3]"; install_xanmod "${1:-auto}" ;;
-  *) die "未知命令: $cmd" ;;
+    sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
+    [[ "$sub" == "xanmod" ]] || die "用法: sb-tune kernel xanmod [auto|v2|v3]"
+    install_xanmod "${1:-auto}" ;;
+  "") usage >&2; die "缺子命令" ;;
+  *)  usage >&2; die "未知命令: $cmd" ;;
 esac

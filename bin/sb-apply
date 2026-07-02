@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SB_ROOT=/opt/sb-deploy
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 ENV_FILE="$SB_ROOT/env/node.env"
 USERS_FILE="$SB_ROOT/env/users.json"
 INBOUNDS_FILE="$SB_ROOT/env/inbounds.json"
@@ -16,6 +16,7 @@ usage() {
   cat <<'U'
 usage:
   sb-apply
+  sb-apply snapshot
   sb-apply help
   sb-apply -h
   sb-apply --help
@@ -33,10 +34,20 @@ summary:
     8. 自动生成 upstream route
     9. 自动校验 UPSTREAM_INBOUNDS
    10. 自动计算 HY2 range
-   11. sing-box check 通过后才落盘
-   12. 重启 sing-box
-   13. UFW 端口对账
-   14. HY2 range nftables dnat 对账
+   11. 自动合并 env/dns.json（DNS 策略，默认禁用）
+   12. 自动合并 env/routes.json（自定义分流规则，默认禁用）
+   13. sing-box check 通过后才落盘
+   14. 重启 sing-box
+   15. UFW 端口对账
+   16. HY2 range nftables dnat 对账
+
+  DNS / route overlay（均默认禁用，enabled=false 时对 config 零改动）：
+    - env/dns.json  ：{enabled, servers{tag→{type,server,path,...}}, rules[], final, strategy, route_default}
+                       由 sb-dns 编辑；sb-apply 负责拼装成 config.dns + route.default_domain_resolver
+    - env/routes.json：{enabled, position, rules[]}
+                       每条 rule 是 intent 形式 {match_type, match_value, outbound, auth_user?, inbound?}
+                       由 sb-route 编辑；position=before-upstream(默认) 时插在 auth_user upstream 之前（硬覆盖层）
+    - 编译一律在 sb-apply 内完成，各编辑器只写 env 文件，不自己 compile
 
 port policy:
   INBOUND_PORT_MIN=20000
@@ -50,20 +61,26 @@ notes:
   - 改了 node.env / users.json / outbounds.json / inbounds.json 后都跑 sb-apply
   - sing-box check 不通过时不会覆盖正式 config
   - HY2_RANGE_ENABLED=1 时需要系统有 nft 命令
+  - sb-apply snapshot：apply 全部成功后打一张快照（调 sb-backup），并只保留最近 10 张；平时 sb-apply 不打快照
 U
 }
 
+DO_SNAPSHOT=0
 case "${1:-}" in
   -h|--help|help)
     usage
     exit 0
     ;;
+  snapshot|snap)
+    DO_SNAPSHOT=1
+    ;;
+  "")
+    ;;
+  *)
+    usage >&2
+    die "未知参数: $1（只支持 snapshot）"
+    ;;
 esac
-
-[[ $# -eq 0 ]] || {
-  usage >&2
-  die "参数过多"
-}
 
 [[ -f "$ENV_FILE"   ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
 [[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，先跑 sb-genenv"
@@ -167,7 +184,7 @@ TMP="$(mktemp)"
 TMP2="$(mktemp)"
 
 dbg "envsubst 填标量"
-VARS='${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
 envsubst "$VARS" < "$TPL" > "$TMP"
 
 dbg "读取 inbound overlay"
@@ -289,12 +306,35 @@ if [[ -f "$SB_ROOT/out/outbounds.json" ]]; then
   ' "$SB_ROOT/out/outbounds.json")" || die "$SB_ROOT/out/outbounds.json 格式错误"
 fi
 
+dbg "读取 DNS / route overlay"
+
+DNS_JSON='{"enabled":false}'
+if [[ -f "$SB_ROOT/env/dns.json" ]]; then
+  DNS_JSON="$(jq -c '
+    if type != "object" then error("dns.json 必须是 object") else . end
+    | .enabled  = (.enabled  // false)
+    | .servers  = (.servers  // {})
+    | .rules    = (.rules    // [])
+  ' "$SB_ROOT/env/dns.json")" || die "$SB_ROOT/env/dns.json 格式错误"
+fi
+
+ROUTES_JSON='{"enabled":false,"rules":[]}'
+if [[ -f "$SB_ROOT/env/routes.json" ]]; then
+  ROUTES_JSON="$(jq -c '
+    if type != "object" then error("routes.json 必须是 object") else . end
+    | .enabled = (.enabled // false)
+    | .rules   = (.rules   // [])
+  ' "$SB_ROOT/env/routes.json")" || die "$SB_ROOT/env/routes.json 格式错误"
+fi
+
 dbg "jq 组装 inbounds / users / upstream / outbounds / rules"
 
 jq \
   --slurpfile users "$USERS_FILE" \
   --argjson inbound_patch "$INBOUND_PATCH_JSON" \
   --argjson custom_ob "$CUSTOM_OB_JSON" \
+  --argjson dns "$DNS_JSON" \
+  --argjson routes "$ROUTES_JSON" \
   --arg up_en  "${UPSTREAM_ENABLED:-0}" \
   --arg up_name "${UPSTREAM_NAME:-}" \
   --arg up_type "${UPSTREAM_TYPE:-socks}" \
@@ -343,6 +383,32 @@ jq \
     else
       .
     end;
+
+  # sb-route v1 只支持直接可映射字段；geosite/geoip 需 rule_set，未启用 → 直接报错
+  def route_field($t):
+    {
+      "domain":"domain","domain-suffix":"domain_suffix","domain-keyword":"domain_keyword",
+      "domain-regex":"domain_regex","ip-cidr":"ip_cidr"
+    }[$t]
+    // error("sb-route: 不支持的 match_type '" + ($t|tostring) + "'。v1 仅支持 domain/domain-suffix/domain-keyword/domain-regex/ip-cidr；geosite/geoip 需 rule_set(未启用)");
+
+  def compile_route_rules:
+    [ ($routes.rules // [])[] |
+      { (route_field(.match_type)): [ .match_value ], outbound: .outbound }
+      + (if ((.auth_user // []) | length) > 0 then {auth_user: .auth_user} else {} end)
+      + (if ((.inbound // []) | length) > 0 then {inbound: .inbound} else {} end)
+    ];
+
+  # DNS server 规范化成 sing-box 1.12+ typed server（servers 以 tag 为键的 object）
+  def compile_dns_servers:
+    [ ($dns.servers // {}) | to_entries[] | .key as $tag | .value as $v |
+      if ($v.type // "") == "local" then {type:"local", tag:$tag}
+      else {type:$v.type, tag:$tag, server:$v.server}
+        + (if ($v.server_port // null) != null then {server_port:$v.server_port} else {} end)
+        + (if (($v.type=="https") or ($v.type=="h3")) and (($v.path // "") != "") then {path:$v.path} else {} end)
+        + (if ($v.domain_resolver // "") != "" then {domain_resolver:$v.domain_resolver} else {} end)
+      end
+    ];
 
   ($users[0]) as $u
   | (csv_tags($up_inbounds)) as $route_inbounds
@@ -467,6 +533,11 @@ jq \
 
   | ($up_en=="1") as $on
   | ([ $u[] | select(.egress=="upstream") | .name ]) as $upnames
+  | ($routes.enabled == true and (($routes.rules // []) | length > 0)) as $r_on
+  | ($routes.position // "before-upstream") as $pos
+
+  # sb-route 硬覆盖层：position=before-upstream(默认) 时插在 auth_user upstream 之前
+  | (if $r_on and ($pos == "before-upstream") then .route.rules += compile_route_rules else . end)
 
   | if $on and ($upnames | length > 0) and ($route_inbounds | length > 0) then
       if $up_name != "" then
@@ -522,11 +593,25 @@ jq \
       .
     end
 
+  # sb-route 硬覆盖层：position=after-upstream(高级) 时插在 upstream 之后、final 之前
+  | (if $r_on and ($pos == "after-upstream") then .route.rules += compile_route_rules else . end)
+
   | .route.rules += [
       {
         outbound: "direct"
       }
     ]
+
+  # DNS 拼装（dns.json enabled 时；否则完全不加 .dns，行为不变）
+  # servers 规范化成 sing-box 1.12+ typed server：{type,tag,server,server_port?,path?,domain_resolver?}
+  | if ($dns.enabled == true) then
+      .dns = ({ servers: compile_dns_servers, rules: ($dns.rules // []) }
+        + (if (($dns.final // "") != "") then {final: $dns.final} else {} end)
+        + (if (($dns.strategy // "") != "") then {strategy: $dns.strategy} else {} end))
+      | if (($dns.route_default // "") != "") then .route.default_domain_resolver = $dns.route_default else . end
+    else
+      .
+    end
 ' "$TMP" > "$TMP2" || die "jq 组装失败"
 
 dbg "检查最终 inbound 端口策略"
@@ -798,6 +883,26 @@ ALLOWED="$(
 INBOUND_TAGS="$(jq -r '[.inbounds[]?.tag] | join(",")' "$OUT")"
 
 log "INFO: 部署完成 | users=${NUSERS} upstream=${UPSTAT} | inbounds=${INBOUND_TAGS:-<empty>} | tcp ${TCP_PORTS:-<none>} · udp ${UDP_PORTS:-<none>} | hy2_range=${HY2_RANGE_INFO:-off} | ufw: ${ALLOWED}| 下一步 sb-export"
+
+# 可选快照：sb-apply snapshot 时，apply 全部成功后打一张快照，并只保留最近 10 张
+if [[ "$DO_SNAPSHOT" == "1" ]]; then
+  SB_BACKUP_BIN=""
+  if command -v sb-backup >/dev/null 2>&1; then
+    SB_BACKUP_BIN="sb-backup"
+  elif [[ -x "$SB_ROOT/bin/sb-backup" ]]; then
+    SB_BACKUP_BIN="$SB_ROOT/bin/sb-backup"
+  fi
+  if [[ -n "$SB_BACKUP_BIN" ]]; then
+    if "$SB_BACKUP_BIN" create apply-snapshot >/dev/null; then
+      "$SB_BACKUP_BIN" prune 10 >/dev/null || log "WARN: 快照 prune 失败"
+      log "OK: 已创建 apply 快照，保留最近 10 张"
+    else
+      log "WARN: 快照创建失败（不影响本次 apply）"
+    fi
+  else
+    log "WARN: 未安装 sb-backup，跳过快照"
+  fi
+fi
 
 rm -f "$TMP" "$TMP2" /tmp/sb-check.log
 dbg "已清理临时文件"

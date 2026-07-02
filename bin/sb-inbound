@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SB_ROOT=/opt/sb-deploy
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 ENV_FILE="$SB_ROOT/env/node.env"
 PATCH_FILE="$SB_ROOT/env/inbounds.json"
 TPL="$SB_ROOT/templates/config.json.tpl"
@@ -232,7 +232,7 @@ render_base_config() {
   tmp="$(mktemp)"
 
   local VARS
-  VARS='${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+  VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
 
   envsubst "$VARS" < "$TPL" > "$tmp"
 
@@ -913,4 +913,3 @@ case "$cmd" in
     fail_usage "未知命令: '$cmd'"
     ;;
 esac
-EOF

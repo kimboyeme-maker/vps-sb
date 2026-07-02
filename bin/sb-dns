@@ -1,269 +1,187 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 F="$SB_ROOT/env/dns.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
 
+TYPES="local udp tcp tls https h3 quic"
+
 summary() {
   cat <<'S'
 summary:
-  sb-dns 管理服务端 DNS 策略。它不直接改 out/config.json，
-  只写 env/dns.json；最终由 sb-apply 调用 sb-dns compile 注入配置。
+  sb-dns 管理服务端出站 DNS 解析策略（写 env/dns.json，编译由 sb-apply 完成）。
 
-  命令概念贴近 sing-box DNS 文档：server / rule / final / strategy / route-default。
-  但 env/dns.json 保存的是稳定意图，不是官方 JSON 的 1:1 映射。
+  默认禁用、且只有一个 local server（用系统解析器），不内置任何 DoH。
+  高级用户可手动添加 typed server（sing-box 1.12+ 格式）。
+
+  重要（sing-box typed server 语义）：
+    - https/h3 用 server(主机) + path(默认 /dns-query)，不是整条 URL
+    - server 是域名(非 IP)时，必须指定 --resolver <tag> 来解析这个 DNS server 自己的域名
+      （否则 sing-box 会因为无法解析 DNS server 的域名而失败）
 S
 }
 
 usage() {
   cat <<'U'
 usage:
-  sb-dns summary
-  sb-dns help|-h|--help
-  sb-dns status
-  sb-dns show
-  sb-dns raw show
+  sb-dns enable | disable
+  sb-dns server add <tag> <type> <host|url> [--path P] [--resolver TAG] [--port N]
+  sb-dns server rm <tag>
+  sb-dns final <tag>
+  sb-dns strategy <prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only|">
+  sb-dns route-default <tag>
+  sb-dns list
+  sb-dns help | -h | --help
 
-  sb-dns enable
-  sb-dns off|disable
-
-  sb-dns profile off|us|jp|hk|sg|kr|cn-safe|custom
-  sb-dns strategy prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only
-  sb-dns final <server-tag>
-  sb-dns route-default <server-tag|off>
-
-  sb-dns server list
-  sb-dns server show <tag>
-  sb-dns server add <tag> <local|udp|tcp|tls|https|h3|quic> <address>
-  sb-dns server del <tag>
-
-  sb-dns rule list
-  sb-dns rule add domain <domain> <server-tag>
-  sb-dns rule add domain-suffix <suffix> <server-tag>
-  sb-dns rule add domain-keyword <keyword> <server-tag>
-  sb-dns rule add geosite <name> <server-tag>
-  sb-dns rule del <index>
-  sb-dns rule clear
-
-internal:
-  sb-dns compile <config-json-file>
+type:
+  local | udp | tcp | tls | https | h3 | quic
+  local 不需要 host；https/h3 可带 --path（默认 /dns-query）
 
 examples:
-  sb-dns profile jp
-  sb-dns strategy ipv4_only
-  sb-dns final cloudflare
-  sb-dns route-default cloudflare
-  sb-dns server add cloudflare https https://1.1.1.1/dns-query
-  sb-dns rule add domain-suffix openai.com cloudflare
-  sb-apply
+  sb-dns enable
+  sb-dns server add cf   https 1.1.1.1               # IP 型 DoH，无需 resolver
+  sb-dns server add cf   https https://1.1.1.1/dns-query   # URL 会自动拆成 server+path
+  sb-dns server add ali  https dns.alidns.com --resolver local   # 域名型，必须给 resolver
+  sb-dns final cf
+  sb-dns strategy prefer_ipv4
+  sb-dns route-default local
+
+notes:
+  - 改完跑 sb-apply 生效
+  - final / route-default 引用的 tag 必须已 server add
+  - server 是域名却没 --resolver 会直接报错，不静默接受
 U
 }
 
-for dep in jq; do command -v "$dep" >/dev/null || die "缺依赖 $dep"; done
+command -v jq >/dev/null || die "缺依赖 jq"
+mkdir -p "$SB_ROOT/env"
 
-mkdir -p "$(dirname "$F")"
-
-ensure() {
-  if [[ ! -f "$F" ]]; then
-    cat > "$F" <<'JSON'
-{
-  "version": 1,
-  "enabled": false,
-  "profile": "off",
-  "strategy": "ipv4_only",
-  "final": "cloudflare",
-  "route_default": "cloudflare",
-  "servers": {
-    "local": { "type": "local", "address": "" },
-    "cloudflare": { "type": "https", "address": "https://1.1.1.1/dns-query" },
-    "google": { "type": "https", "address": "https://8.8.8.8/dns-query" },
-    "quad9": { "type": "https", "address": "https://9.9.9.9/dns-query" },
-    "ali": { "type": "https", "address": "https://dns.alidns.com/dns-query" },
-    "dnspod": { "type": "https", "address": "https://doh.pub/dns-query" }
-  },
-  "rules": []
-}
-JSON
-    chmod 600 "$F"
-  fi
-
-  local tmp
-  tmp="$(mktemp)"
+ensure_file() {
+  [[ -f "$F" ]] || printf '{\n  "enabled": false,\n  "servers": { "local": { "type": "local" } },\n  "rules": [],\n  "final": "",\n  "strategy": "",\n  "route_default": ""\n}\n' > "$F"
+  local tmp; tmp="$(mktemp)"
   jq '
-    if type != "object" then error("dns.json 必须是 object") else . end
-    | .version = (.version // 1)
-    | .enabled = (.enabled // false)
-    | .profile = (.profile // "custom")
-    | .strategy = (.strategy // "ipv4_only")
-    | .final = (.final // "cloudflare")
-    | .route_default = (.route_default // .final // "cloudflare")
-    | .servers = (.servers // {})
-    | .rules = (.rules // [])
-    | if (.servers | type) != "object" then error("servers 必须是 object") else . end
-    | if (.rules | type) != "array" then error("rules 必须是 array") else . end
-  ' "$F" > "$tmp" || { rm -f "$tmp"; die "$F 格式错误"; }
-  install -m 600 "$tmp" "$F"
-  rm -f "$tmp"
+    (.enabled //= false) | (.servers //= {"local":{"type":"local"}})
+    | (.rules //= []) | (.final //= "") | (.strategy //= "") | (.route_default //= "")
+  ' "$F" > "$tmp" && install -m 600 "$tmp" "$F"; rm -f "$tmp"
 }
 
-write() { local tmp="$1"; install -m 600 "$tmp" "$F"; rm -f "$tmp"; }
-
-valid_strategy() {
-  case "$1" in prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) return 0;; *) return 1;; esac
+write_json() {
+  local tmp; tmp="$(mktemp)"; cat > "$tmp"
+  jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "内部错误：生成了非法 JSON"; }
+  install -m 600 "$tmp" "$F"; rm -f "$tmp"
 }
 
-valid_server_type() {
-  case "$1" in local|udp|tcp|tls|https|h3|quic) return 0;; *) return 1;; esac
+is_ip() {
+  local h="$1"
+  [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0   # v4
+  [[ "$h" == *:* ]] && return 0                                # v6（含冒号）
+  return 1
 }
 
-server_exists() { jq -e --arg tag "$1" '.servers[$tag] != null' "$F" >/dev/null; }
-require_server() { server_exists "$1" || die "DNS server 不存在: '$1'；先用 sb-dns server list 查看"; }
+cmd="${1:-}"; [[ $# -gt 0 ]] && shift || true
+case "$cmd" in
+  -h|--help|help) summary; echo; usage; exit 0 ;;
+  summary) summary; exit 0 ;;
+esac
 
-set_profile() {
-  local p="$1"
-  local tmp
-  tmp="$(mktemp)"
-  case "$p" in
-    off)
-      jq '.enabled=false | .profile="off"' "$F" > "$tmp" ;;
-    us)
-      jq '.enabled=false | .profile="us" | .strategy="ipv4_only" | .final="cloudflare" | .route_default="cloudflare"' "$F" > "$tmp" ;;
-    jp|hk|sg|kr)
-      jq --arg p "$p" '.enabled=true | .profile=$p | .strategy="ipv4_only" | .final="cloudflare" | .route_default="cloudflare"' "$F" > "$tmp" ;;
-    cn-safe)
-      jq '.enabled=true | .profile="cn-safe" | .strategy="ipv4_only" | .final="ali" | .route_default="ali"' "$F" > "$tmp" ;;
-    custom)
-      jq '.enabled=true | .profile="custom"' "$F" > "$tmp" ;;
-    *) rm -f "$tmp"; die "未知 profile: $p" ;;
-  esac
-  write "$tmp"
-}
-
-compile_config() {
-  local cfg="$1"
-  [[ -f "$cfg" ]] || die "compile 需要 config 文件，收到: $cfg"
-  ensure
-
-  local enabled
-  enabled="$(jq -r '.enabled' "$F")"
-  local tmp
-  tmp="$(mktemp)"
-
-  if [[ "$enabled" != "true" ]]; then
-    jq 'del(.dns) | if .route then .route |= del(.default_domain_resolver) else . end' "$cfg" > "$tmp"
-    install -m 600 "$tmp" "$cfg"
-    rm -f "$tmp"
-    return 0
-  fi
-
-  jq -e '
-    .servers as $s
-    | (.final // "") as $final
-    | (.route_default // "") as $rd
-    | if ($s | length) == 0 then error("dns.servers 为空") else . end
-    | if ($final != "" and ($s[$final] == null)) then error("dns.final 指向不存在的 server: " + $final) else . end
-    | if ($rd != "" and $rd != "off" and ($s[$rd] == null)) then error("route_default 指向不存在的 server: " + $rd) else . end
-  ' "$F" >/dev/null || die "$F 校验失败"
-
-  jq \
-    --slurpfile d "$F" '
-    ($d[0]) as $d
-    | def server_obj($k; $v):
-        ({type: ($v.type // "https"), tag: $k}
-         + (if (($v.type // "") == "local") then {} else {server: ($v.address // "")} end));
-    .dns = {
-      servers: (($d.servers // {}) | to_entries | map(server_obj(.key; .value))),
-      final: ($d.final // null),
-      strategy: ($d.strategy // "ipv4_only")
-    }
-    | if (($d.rules // []) | length) > 0 then
-        .dns.rules = ($d.rules | map(
-          . as $r
-          | {action: "route", server: $r.server}
-            + (if $r.kind == "domain" then {domain: [$r.value]}
-               elif $r.kind == "domain-suffix" then {domain_suffix: [$r.value]}
-               elif $r.kind == "domain-keyword" then {domain_keyword: [$r.value]}
-               elif $r.kind == "geosite" then {geosite: [$r.value]}
-               else empty end)
-        ))
-      else . end
-    | if (($d.route_default // "") != "" and ($d.route_default // "") != "off") then
-        .route = (.route // {})
-        | .route.default_domain_resolver = $d.route_default
-      else
-        if .route then .route |= del(.default_domain_resolver) else . end
-      end
-  ' "$cfg" > "$tmp" || { rm -f "$tmp"; die "DNS 编译失败"; }
-
-  install -m 600 "$tmp" "$cfg"
-  rm -f "$tmp"
-}
-
-cmd="${1:-}"; shift || true
-ensure
+ensure_file
 
 case "$cmd" in
-  summary) summary ;;
-  help|-h|--help|"") summary; echo; usage ;;
-  status)
-    jq -r '"enabled=\(.enabled) profile=\(.profile) strategy=\(.strategy) final=\(.final) route_default=\(.route_default) servers=\(.servers|length) rules=\(.rules|length)"' "$F" ;;
-  show) jq . "$F" ;;
-  raw)
-    [[ "${1:-}" == "show" ]] || die "用法: sb-dns raw show"
-    cat "$F" ;;
-  enable)
-    tmp="$(mktemp)"; jq '.enabled=true | if .profile=="off" then .profile="custom" else . end' "$F" > "$tmp"; write "$tmp"; log "OK: DNS enabled，跑 sb-apply 生效" ;;
-  off|disable)
-    tmp="$(mktemp)"; jq '.enabled=false | .profile="off"' "$F" > "$tmp"; write "$tmp"; log "OK: DNS disabled，跑 sb-apply 生效" ;;
-  profile)
-    p="${1:-}"; [[ -n "$p" ]] || die "用法: sb-dns profile off|us|jp|hk|sg|kr|cn-safe|custom"
-    set_profile "$p"; log "OK: DNS profile=$p，跑 sb-apply 生效" ;;
-  strategy)
-    s="${1:-}"; valid_strategy "$s" || die "strategy 只支持 prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only"
-    tmp="$(mktemp)"; jq --arg s "$s" '.strategy=$s' "$F" > "$tmp"; write "$tmp"; log "OK: DNS strategy=$s" ;;
-  final)
-    tag="${1:-}"; [[ -n "$tag" ]] || die "用法: sb-dns final <server-tag>"
-    require_server "$tag"; tmp="$(mktemp)"; jq --arg tag "$tag" '.final=$tag | .enabled=true | if .profile=="off" then .profile="custom" else . end' "$F" > "$tmp"; write "$tmp"; log "OK: DNS final=$tag" ;;
-  route-default)
-    tag="${1:-}"; [[ -n "$tag" ]] || die "用法: sb-dns route-default <server-tag|off>"
-    if [[ "$tag" != "off" ]]; then require_server "$tag"; fi
-    tmp="$(mktemp)"; jq --arg tag "$tag" '.route_default=$tag | if $tag != "off" then .enabled=true else . end' "$F" > "$tmp"; write "$tmp"; log "OK: route_default=$tag" ;;
+  enable)  jq '.enabled=true'  "$F" | write_json; log "OK: dns enabled。跑 sb-apply 生效。" ;;
+  disable) jq '.enabled=false' "$F" | write_json; log "OK: dns disabled。跑 sb-apply 生效。" ;;
+
   server)
-    sub="${1:-}"; shift || true
+    sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
     case "$sub" in
-      list) jq -r '.servers | to_entries[] | "\(.key)\t\(.value.type)\t\(.value.address // "")"' "$F" ;;
-      show) tag="${1:-}"; require_server "$tag"; jq --arg tag "$tag" '.servers[$tag]' "$F" ;;
       add)
-        tag="${1:-}"; typ="${2:-}"; addr="${3:-}"
-        [[ -n "$tag" && -n "$typ" ]] || die "用法: sb-dns server add <tag> <type> <address>"
-        [[ "$tag" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "非法 tag: $tag"
-        valid_server_type "$typ" || die "不支持的 DNS server type: $typ"
-        if [[ "$typ" != "local" && -z "$addr" ]]; then die "type=$typ 需要 address"; fi
-        tmp="$(mktemp)"; jq --arg tag "$tag" --arg typ "$typ" --arg addr "$addr" '.servers[$tag]={type:$typ,address:$addr}' "$F" > "$tmp"; write "$tmp"; log "OK: added DNS server $tag" ;;
-      del|rm)
-        tag="${1:-}"; require_server "$tag"
-        tmp="$(mktemp)"; jq --arg tag "$tag" 'del(.servers[$tag]) | if .final==$tag then .final="" else . end | if .route_default==$tag then .route_default="off" else . end | .rules |= map(select(.server != $tag))' "$F" > "$tmp"; write "$tmp"; log "OK: deleted DNS server $tag" ;;
-      *) die "用法: sb-dns server list|show|add|del" ;;
-    esac ;;
-  rule)
-    sub="${1:-}"; shift || true
-    case "$sub" in
-      list) jq -r '.rules | to_entries[] | "\(.key)\t\(.value.kind)\t\(.value.value)\t->\t\(.value.server)"' "$F" ;;
-      add)
-        kind="${1:-}"; val="${2:-}"; srv="${3:-}"
-        case "$kind" in domain|domain-suffix|domain-keyword|geosite) ;; *) die "kind 只支持 domain/domain-suffix/domain-keyword/geosite";; esac
-        [[ -n "$val" && -n "$srv" ]] || die "用法: sb-dns rule add <kind> <value> <server-tag>"
-        require_server "$srv"
-        tmp="$(mktemp)"; jq --arg k "$kind" --arg v "$val" --arg s "$srv" '.rules += [{kind:$k,value:$v,server:$s}] | .enabled=true | if .profile=="off" then .profile="custom" else . end' "$F" > "$tmp"; write "$tmp"; log "OK: added DNS rule $kind $val -> $srv" ;;
-      del|rm)
-        idx="${1:-}"; [[ "$idx" =~ ^[0-9]+$ ]] || die "用法: sb-dns rule del <index>"
-        tmp="$(mktemp)"; jq --argjson i "$idx" 'if .rules[$i] == null then error("rule index 不存在") else .rules |= del(.[$i]) end' "$F" > "$tmp" || { rm -f "$tmp"; die "rule index 不存在"; }; write "$tmp"; log "OK: deleted DNS rule #$idx" ;;
-      clear) tmp="$(mktemp)"; jq '.rules=[]' "$F" > "$tmp"; write "$tmp"; log "OK: cleared DNS rules" ;;
-      *) die "用法: sb-dns rule list|add|del|clear" ;;
-    esac ;;
-  compile) compile_config "${1:-}" ;;
-  *) die "未知命令: $cmd" ;;
+        tag="${1:-}"; type="${2:-}"; host="${3:-}"
+        [[ -n "$tag" && -n "$type" ]] || { usage >&2; die "server add 需要 <tag> <type> [host]"; }
+        grep -qw -- "$type" <<<"$TYPES" || die "不支持的 type '$type'。可选：$TYPES"
+        [[ $# -ge 2 ]] && shift 2 || shift $#
+        [[ "$type" != "local" && -n "$host" ]] && shift || true
+
+        path=""; resolver=""; port=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --path)     shift; path="${1:-}" ;;
+            --resolver) shift; resolver="${1:-}" ;;
+            --port)     shift; port="${1:-}" ;;
+            *) die "未知参数 '$1'" ;;
+          esac
+          shift || true
+        done
+
+        if [[ "$type" == "local" ]]; then
+          jq --arg t "$tag" '.servers[$t]={type:"local"}' "$F" | write_json
+          log "OK: server $tag=local。跑 sb-apply 生效。"; exit 0
+        fi
+
+        [[ -n "$host" ]] || die "type=$type 需要 host（主机名/IP，或 https:// URL）"
+
+        # URL 自动拆 host + path
+        if [[ "$host" == *"://"* ]]; then
+          rest="${host#*://}"
+          hostport="${rest%%/*}"
+          urlpath="/${rest#*/}"; [[ "$rest" == "$hostport" ]] && urlpath=""
+          host="${hostport%%:*}"; [[ "$hostport" == *:* ]] && port="${port:-${hostport##*:}}"
+          [[ -z "$path" && -n "$urlpath" ]] && path="$urlpath"
+        fi
+
+        # 域名型必须有 resolver
+        if ! is_ip "$host" && [[ -z "$resolver" ]]; then
+          die "server '$host' 是域名，必须 --resolver <tag> 指定解析它的 DNS server（否则 sing-box 无法解析该 DNS server 的域名）。IP 型则无需 resolver。"
+        fi
+        # https/h3 默认 path
+        if [[ "$type" == "https" || "$type" == "h3" ]] && [[ -z "$path" ]]; then path="/dns-query"; fi
+
+        jq --arg tag "$tag" --arg ty "$type" --arg sv "$host" --arg pa "$path" --arg rs "$resolver" --arg po "$port" '
+          .servers[$tag] = ({type:$ty, server:$sv}
+            + (if $po != "" then {server_port:($po|tonumber)} else {} end)
+            + (if (($ty=="https") or ($ty=="h3")) and ($pa != "") then {path:$pa} else {} end)
+            + (if $rs != "" then {domain_resolver:$rs} else {} end))
+        ' "$F" | write_json
+        log "OK: server $tag=$type $host$([[ -n "$path" ]] && echo " path=$path")$([[ -n "$resolver" ]] && echo " resolver=$resolver")。跑 sb-apply 生效。"
+        ;;
+      rm)
+        tag="${1:-}"; [[ -n "$tag" ]] || die "server rm 需要 <tag>"
+        jq -e --arg t "$tag" '.servers | has($t)' "$F" >/dev/null || die "无此 server: $tag"
+        jq --arg t "$tag" 'del(.servers[$t])' "$F" | write_json
+        log "OK: 已删 server $tag。跑 sb-apply 生效。"
+        ;;
+      *) usage >&2; die "server 子命令只支持 add | rm" ;;
+    esac
+    ;;
+
+  final)
+    tag="${1:-}"; [[ -n "$tag" ]] || die "final 需要 <tag>"
+    jq -e --arg t "$tag" '.servers | has($t)' "$F" >/dev/null || die "final 引用的 server 不存在: $tag（先 server add）"
+    jq --arg t "$tag" '.final=$t' "$F" | write_json; log "OK: final=$tag。跑 sb-apply 生效。"
+    ;;
+
+  strategy)
+    s="${1:-}"
+    case "$s" in prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only|"") ;; *) die "strategy 只能 prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only 或空";; esac
+    jq --arg s "$s" '.strategy=$s' "$F" | write_json; log "OK: strategy=${s:-<空>}。跑 sb-apply 生效。"
+    ;;
+
+  route-default)
+    tag="${1:-}"; [[ -n "$tag" ]] || die "route-default 需要 <tag>"
+    jq -e --arg t "$tag" '.servers | has($t)' "$F" >/dev/null || die "route-default 引用的 server 不存在: $tag"
+    jq --arg t "$tag" '.route_default=$t' "$F" | write_json; log "OK: route_default=$tag。跑 sb-apply 生效。"
+    ;;
+
+  list|show)
+    printf 'dns: enabled=%s final=%s strategy=%s route_default=%s\n' \
+      "$(jq -r '.enabled' "$F")" "$(jq -r '.final // "<空>"' "$F")" "$(jq -r '.strategy // "<空>"' "$F")" "$(jq -r '.route_default // "<空>"' "$F")"
+    jq -r '.servers | to_entries[] | "  \(.key): \(.value.type)" +
+      (if .value.server then " \(.value.server)" else "" end) +
+      (if .value.path then " path=\(.value.path)" else "" end) +
+      (if .value.domain_resolver then " resolver=\(.value.domain_resolver)" else "" end)' "$F"
+    ;;
+
+  "") usage >&2; die "缺子命令" ;;
+  *)  usage >&2; die "未知子命令 '$cmd'" ;;
 esac

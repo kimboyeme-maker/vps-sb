@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SB_ROOT=/opt/sb-deploy
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 F="$SB_ROOT/out/outbounds.json"
 ENV_FILE="$SB_ROOT/env/node.env"
 TPL="$SB_ROOT/templates/config.json.tpl"
@@ -130,7 +130,7 @@ available_inbounds_json() {
   tmp="$(mktemp)"
 
   local VARS
-  VARS='${VLESS_PORT} ${HY2_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+  VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
 
   envsubst "$VARS" < "$TPL" > "$tmp"
 
