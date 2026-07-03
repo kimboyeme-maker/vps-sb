@@ -1,29 +1,16 @@
-# sb-deploy
+# VPS Proxy Toolkit
 
-Self-hosted sing-box VPS proxy toolchain: small, **self-locating** `sb-*` scripts driven by a single compiler (`sb-apply`) and one unified entry (`pi`).
+A self-hosted sing-box VPS proxy toolkit for VLESS Reality, Hysteria2, SOCKS5, optional upstream landing nodes, DNS policy, custom routes, subscriptions, backups, and diagnostics.
 
-## Tools
+It is built around one rule: edit intent files through `pi ...`, then run `pi apply`. The generated `out/config.json` is compiled output and should not be hand-edited.
 
-Core (13, symlinked to PATH by the installer):
+Key points:
 
-| script                  | role                                                                                                                                                                                       |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sb-genenv`             | one-time init: `node.env` + `users.json` + Hy2 cert (idempotent)                                                                                                                           |
-| `sb-user`               | user management (add/del/list/set-egress); per-user uuid+password                                                                                                                          |
-| `sb-outbound`           | landing outbound (socks/http/ss) + upstream toggle                                                                                                                                         |
-| `sb-inbound`            | inbound CRUD (writes `env/inbounds.json`) + HY2 port hopping                                                                                                                               |
-| `sb-dns`                | _(optional)_ server-side egress DNS policy (`env/dns.json`; default off, **no built-in DoH**)                                                                                              |
-| `sb-route`              | _(optional)_ custom routing rules (`env/routes.json`; default off)                                                                                                                         |
-| `sb-apply`              | **the only compiler**: envsubst → jq (users/inbounds/outbounds/dns/route/upstream) → `sing-box check` → restart → ufw reconcile. `sb-apply snapshot` also snapshots and keeps the last 10. |
-| `sb-show` / `sb-export` | print share links / export subscriptions: raw URI `.sub` + Clash/Mihomo `.yaml`                                                                                                            |
-| `sb-backup`             | snapshot / rollback the whole deploy                                                                                                                                                       |
-| `sb-doctor`             | read-only diagnostics                                                                                                                                                                      |
-| `sb-clear`              | wipe `env/`+`certs/`+`out/` (debug)                                                                                                                                                        |
-| `pi`                    | unified entry: `pi <sub> …` → `sb-<sub> …`                                                                                                                                                 |
-
-Optional add-on: **`sb-tune`** — sysctl/journald/XanMod tuning (writes `/etc/sysctl.d/99-sb-tune.conf`; WARNs on keys that override your hand-tuned sysctl).
-
-> `sb-profile` is intentionally **not** included — deferred until it can be a real multi-module strategy source (profile.json + dns.json + node.env + doctor/export policy), not a metadata label.
+- `pi` is the single user-facing entry. It forwards to the underlying `sb-*` scripts.
+- `pi apply` is the only compiler: env/template + JSON intents -> checked sing-box config -> restart/firewall reconcile.
+- Inbound tags live in `env/inbounds.json`; editors do not use the template or stale `out/config.json` as tag source.
+- `.sub` exports are standard whole-file base64 subscriptions; `.yaml` exports are Clash/Mihomo compatible.
+- `pi tune` is included as the required interactive new-machine prep/tuning tool.
 
 ## Install
 
@@ -32,18 +19,240 @@ Scripts self-locate their root (via `readlink -f` on their own path), so you can
 ```bash
 # default
 
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s --
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
 
 # custom path
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s -- /srv/sb
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- /srv/sb
 
 ```
 
 The installer installs **only the toolchain**. Install system deps first: `sing-box`, `jq`, `gettext-base` (envsubst), `ufw`, `openssl`. Re-running the installer updates the scripts (idempotent; never touches `env/`).
 
-## Usage
+## Command Map
 
-Core flow is always: **`install → genenv → configure → apply → export`**. Paths, aliases, and upstreams below are examples — adapt to your topology.
+Core flow is always: **install -> `pi tune bootstrap` -> `pi genenv` -> configure -> `pi apply` -> `pi export`**.
+
+### `pi`
+
+Unified entry point. `pi <subcommand> ...` forwards arguments to the matching `sb-*` tool.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi list` | List available subcommands. | Read-only |
+| `pi help` | Show top-level help. | Read-only |
+
+### `pi tune`
+
+Required interactive VPS preparation and tuning: dependencies, sing-box, swap, sysctl/journald, XanMod/BBRv3.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi tune bootstrap` | Guided first-run setup. | System packages, swap, sing-box, sysctl, journald, optional kernel |
+| `pi tune check` | Read-only overall check. | Read-only |
+| `pi tune preflight` | Inspect CPU/RAM/disk/IP/kernel basics. | Read-only |
+| `pi tune recommend` | Recommend tuning profile. | Read-only |
+| `pi tune reboot-needed` | Check whether reboot is recommended. | Read-only |
+| `pi tune deps check` | Check required packages. | Read-only |
+| `pi tune deps install` | Install required packages. | System packages |
+| `pi tune deps upgrade` | Run package upgrade flow. | System packages |
+| `pi tune swap check` | Check swap state. | Read-only |
+| `pi tune swap create 1G` | Create swap file. | System swap |
+| `pi tune swap off` | Disable managed swap. | System swap |
+| `pi tune singbox check` | Check sing-box availability. | Read-only |
+| `pi tune singbox install` | Install sing-box. | System service/package |
+| `pi tune singbox version` | Print sing-box version. | Read-only |
+| `pi tune plan tiny` | Show sysctl/journald changes for a profile. | Read-only |
+| `pi tune apply tiny` | Apply sysctl and journald profile. | `/etc/sysctl.d`, journald |
+| `pi tune sysctl balanced` | Apply only sysctl profile. | `/etc/sysctl.d` |
+| `pi tune journald tiny` | Apply only journald limits. | journald config |
+| `pi tune bbrv3 auto` | Install/configure XanMod BBRv3 path. | Kernel/boot config |
+| `pi tune kernel check-abi` | Check CPU ABI for XanMod. | Read-only |
+
+### `pi genenv`
+
+Initialize or upgrade local env files: `node.env`, `users.json`, `inbounds.json`, Hy2 certs, symlink, and `.gitignore`.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi genenv` | Create missing env/cert files and defaults. | `env/`, `certs/`, symlink, `.gitignore` |
+| `pi genenv upgrade` | Same idempotent upgrade path; fills new defaults without overwriting secrets. | `env/node.env`, `env/inbounds.json` |
+| `pi genenv summary` | Show what genenv manages. | Read-only |
+
+### `pi user`
+
+Manage users and their egress mode. `direct` exits locally; `upstream` exits through enabled outbound.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi user list` | List accounts, egress, aliases, UUIDs. | Read-only |
+| `pi user add direct netflix` | Add direct user with alias. | `env/users.json` |
+| `pi user add upstream us-ai` | Add upstream user with alias. | `env/users.json` |
+| `pi user del <account\|alias>` | Delete user by account or alias. | `env/users.json` |
+| `pi user set-egress <account\|alias> direct` | Switch user to direct egress. | `env/users.json` |
+| `pi user set-egress <account\|alias> upstream` | Switch user to upstream egress. | `env/users.json` |
+
+### `pi inbound`
+
+Manage inbound registry and overlays. Tag truth source is `env/inbounds.json`, not the template or compiled config.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi inbound list` | Show base tags, clones, patches, deleted tags, port policy, HY2 range. | Read-only, normalizes `env/inbounds.json` |
+| `pi inbound show <tag>` | Show source/clone/patch/delete state for one inbound. | Read-only |
+| `pi inbound set vless-in listen_port 40443` | Set inbound field. | `env/inbounds.json` |
+| `pi inbound set vless-in tag edge-vless` | Rename inbound tag and sync references. | `env/inbounds.json`, `env/node.env`, `env/routes.json` |
+| `pi inbound set hy2-in up_mbps 80` | Set HY2 upstream bandwidth. | `env/inbounds.json` |
+| `pi inbound set hy2-in obfs.password <pass>` | Patch nested inbound field. | `env/inbounds.json` |
+| `pi inbound rm hy2-in obfs` | Delete field in final config. | `env/inbounds.json` |
+| `pi inbound reset hy2-in obfs` | Remove patch/delete intent for a field. | `env/inbounds.json` |
+| `pi inbound clone hy2-in hy2-41500 41500` | Clone inbound with optional listen port. | `env/inbounds.json` |
+| `pi inbound delete socks5-in` | Mark inbound deleted. | `env/inbounds.json` |
+| `pi inbound restore socks5-in` | Restore deleted inbound. | `env/inbounds.json` |
+| `pi inbound hy2 range 1000` | Enable HY2 UDP range around selected/default HY2 port. | `env/node.env` |
+| `pi inbound hy2 range show` | Show HY2 range calculation. | Read-only |
+| `pi inbound hy2 range off` | Disable HY2 range. | `env/node.env` |
+
+### `pi outbound`
+
+Manage landing outbounds, upstream settings, direct outbound patching, and upstream inbound scope.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi outbound list` | List custom outbounds. | Read-only, creates `out/outbounds.json` if missing |
+| `pi outbound show <name>` | Show one outbound. | Read-only |
+| `pi outbound add us socks <US_IP> 40080 <USER> <PASS>` | Add SOCKS5 outbound. | `out/outbounds.json` |
+| `pi outbound add web http <HOST> <PORT> [USER] [PASS]` | Add HTTP outbound. | `out/outbounds.json` |
+| `pi outbound add ss1 ss <HOST> <PORT> <METHOD> <PASSWORD>` | Add Shadowsocks outbound. | `out/outbounds.json` |
+| `pi outbound del <name>` | Delete outbound. | `out/outbounds.json` |
+| `pi outbound upstream show` | Show current upstream settings and available inbound tags. | Read-only |
+| `pi outbound upstream set name us` | Enable configured outbound as upstream and copy host/port/auth into env. | `env/node.env` |
+| `pi outbound upstream set enabled 0` | Disable upstream. | `env/node.env` |
+| `pi outbound upstream set inbounds vless-in,hy2-in` | Replace upstream inbound scope. | `env/node.env` |
+| `pi outbound upstream allow inbounds hy2-alt` | Append inbound to upstream scope. | `env/node.env` |
+| `pi outbound upstream del-inbounds hy2-alt` | Remove inbound from upstream scope. | `env/node.env` |
+| `pi outbound upstream clear inbounds` | Clear upstream inbound scope. | `env/node.env` |
+| `pi outbound upstream set domain_strategy ipv4_only` | Set upstream domain strategy. | `env/node.env` |
+| `pi outbound upstream set host <HOST>` | Configure temporary upstream host without named outbound. | `env/node.env` |
+| `pi outbound upstream set port <PORT>` | Configure temporary upstream port without named outbound. | `env/node.env` |
+| `pi outbound direct show` | Show patch for built-in `direct` outbound. | Read-only |
+| `pi outbound direct set resolver cloudflare prefer_ipv4` | Patch direct outbound `domain_resolver`. | `env/outbound-patch.json` |
+| `pi outbound direct set domain_strategy ipv4_only` | Patch direct outbound domain strategy. | `env/outbound-patch.json` |
+| `pi outbound direct rm resolver` | Remove direct outbound resolver patch. | `env/outbound-patch.json` |
+
+### `pi dns`
+
+Optional server-side egress DNS policy. Default is disabled and no built-in DoH is injected.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi dns status` | Show enabled/final/strategy summary. | Read-only, creates `env/dns.json` if missing |
+| `pi dns show` | Print DNS intent JSON. | Read-only |
+| `pi dns enable` | Enable DNS block compilation. | `env/dns.json` |
+| `pi dns disable` | Disable DNS block compilation. | `env/dns.json` |
+| `pi dns reset` | Reset DNS intent. | `env/dns.json` |
+| `pi dns server list` | List DNS servers. | Read-only |
+| `pi dns server add cloudflare https 1.1.1.1 443 /dns-query` | Add typed DNS server. | `env/dns.json` |
+| `pi dns server add local local` | Add local resolver. | `env/dns.json` |
+| `pi dns server show cloudflare` | Show DNS server. | Read-only |
+| `pi dns server del cloudflare` | Delete DNS server. | `env/dns.json` |
+| `pi dns final cloudflare` | Set DNS final server. | `env/dns.json` |
+| `pi dns final off` | Clear DNS final. | `env/dns.json` |
+| `pi dns strategy ipv4_only` | Set DNS strategy. | `env/dns.json` |
+| `pi dns strategy off` | Clear DNS strategy. | `env/dns.json` |
+| `pi dns route-default set server cloudflare` | Set `route.default_domain_resolver.server`. | `env/dns.json` |
+| `pi dns route-default set strategy ipv4_only` | Set route default resolver strategy. | `env/dns.json` |
+| `pi dns route-default rm server` | Remove route default server. | `env/dns.json` |
+| `pi dns route-default off` | Clear route default resolver object. | `env/dns.json` |
+
+### `pi route`
+
+Optional custom route rules. Use for scoped domain/IP overrides before or after upstream routing.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi route enable` | Enable custom route compilation. | `env/routes.json` |
+| `pi route disable` | Disable custom route compilation. | `env/routes.json` |
+| `pi route position before-upstream` | Place outbound rules before auth_user upstream rules. | `env/routes.json` |
+| `pi route position after-upstream` | Place outbound rules after auth_user upstream rules. | `env/routes.json` |
+| `pi route add domain-suffix openai.com direct --user res-ai` | Add user-scoped outbound override. | `env/routes.json` |
+| `pi route add domain-suffix netflix.com upstream --user hk` | Route scoped domain to upstream. | `env/routes.json` |
+| `pi route add ip-cidr 1.1.1.0/24 direct` | Add IP CIDR route. | `env/routes.json` |
+| `pi route add protocol dns action hijack-dns` | Add action rule. | `env/routes.json` |
+| `pi route list` | List route rules. | Read-only |
+| `pi route show` | Show route intent JSON. | Read-only |
+| `pi route rm <index>` | Remove route by list index. | `env/routes.json` |
+| `pi route reset` | Reset route intent. | `env/routes.json` |
+
+### `pi apply`
+
+The only compiler. It renders config, injects users/inbounds/outbounds/DNS/routes, runs `sing-box check`, restarts service, reconciles firewall and HY2 range.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi apply` | Compile and apply current intent files. | `out/config.json`, sing-box service, UFW, nftables |
+| `pi apply snapshot` | Apply and create a successful-apply backup snapshot. | `out/config.json`, sing-box service, backups |
+
+### `pi export`
+
+Export subscriptions from compiled `out/config.json`. Run `pi apply` first.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi export` | Export all protocols for all users. | `out/sub/` |
+| `pi export all` | Same as default all-protocol export. | `out/sub/` |
+| `pi export vless` | Export only VLESS nodes. | `out/sub/` |
+| `pi export hy2` | Export only Hysteria2 nodes. | `out/sub/` |
+| `pi export socks5` | Export only SOCKS5 nodes. | `out/sub/` |
+| `pi export all transit` | Export all protocols for one account/alias. | `out/sub/` |
+
+### `pi show`
+
+Print share links or JSON node objects from compiled config.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi show txt` | Print text share links. | Read-only |
+| `pi show txt all transit` | Print all protocol links for one user. | Read-only |
+| `pi show txt vless netflix` | Print VLESS links for one user. | Read-only |
+| `pi show node all transit` | Print JSON node objects for one user. | Read-only |
+
+### `pi doctor`
+
+Read-only diagnostics for service, ports, firewall, nftables, DNS, network, upstream, and exports.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi doctor quick` | Check service, ports, firewall. | Read-only |
+| `pi doctor all` | Run all diagnostic sections. | Read-only |
+| `pi doctor service` | Check sing-box service/config. | Read-only |
+| `pi doctor ports` | Check inbounds and listening ports. | Read-only |
+| `pi doctor firewall` | Show UFW state. | Read-only |
+| `pi doctor nft` | Show HY2 range nft table. | Read-only |
+| `pi doctor dns` | Show DNS state. | Read-only |
+| `pi doctor network` | Show network/public IP basics. | Read-only |
+| `pi doctor upstream` | Check upstream env/reachability. | Read-only |
+| `pi doctor export` | List subscription outputs. | Read-only |
+
+### `pi backup`
+
+Snapshot, inspect, diff, restore, and prune deploy state. Restore creates a pre-restore snapshot first.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi backup create` | Create manual backup. | `backups/` |
+| `pi backup list` | List backups. | Read-only |
+| `pi backup show <id>` | Show backup manifest and files. | Read-only |
+| `pi backup diff <id>` | Diff backup against current root. | Read-only |
+| `pi backup restore <id>` | Restore backup after taking pre-restore backup. | `env/`, `certs/`, `templates/`, `bin/`, `out/` |
+| `pi backup prune 20` | Keep newest 20 backups. | `backups/` |
+
+### `pi clear`
+
+Debug-only reset of generated runtime state.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi clear` | Wipe generated runtime state. | `env/`, `certs/`, `out/` |
 
 ## Export
 
@@ -61,119 +270,213 @@ pi export all AI
 pi export vless AI
 ```
 
-### For Japan VPS (transit / fast entry)
+## Deployment Examples
+
+`pi inbound` and `pi outbound upstream set inbounds ...` validate inbound tags from `env/inbounds.json`, not from the template or stale compiled config. After `pi genenv`, you can safely edit inbound tags/ports before the first `pi apply`.
+
+If JP/HK should relay to a US landing node, deploy the US node first, export the `transit` user's SOCKS5 parameters, then fill `<US_IP>`, `<US_TRANSIT_ACCOUNT>`, and `<US_TRANSIT_PASSWORD>` on the JP/HK node.
+
+### Japan Direct
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s --
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
 
+pi tune bootstrap
 pi genenv
-pi inbound set vless-in  listen_port <port>
-pi inbound set hy2-in    listen_port <port>
-pi inbound set socks5-in listen_port <port>
+pi inbound set vless-in  listen_port 40443
+pi inbound set hy2-in    listen_port 40500
+pi inbound set socks5-in listen_port 40080
 
-pi user add direct daily          # exits from JP local IP
-pi user add direct stream
-
-# optional: chain some users through the target landing node
-pi outbound add <TARGET_TAG> socks <TARGET_IP> <port> <username> <password>
-pi outbound inbound set vless-in,hy2-in
-pi outbound enable <TARGET_TAG>
-pi user set-egress stream upstream
+pi user add direct daily
+pi user add direct jp-video
 
 pi apply snapshot
+pi doctor quick
 pi export
 pi show txt
 ```
 
-### For HK VPS (China-friendly entry / Asia transit)
+### Hong Kong Direct
 
-HK VPS is usually a good low-latency entry for Mainland China and Asia users,
-but it is **not** a native US landing node. Do not expect it to behave like a US
-residential / US streaming / US AI landing IP.
+HK direct is for HK IP / Asia entry. Keep server-side DNS off by default unless you explicitly need it.
 
-Recommended usage:
+```bash
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
 
-- Use HK as a fast entry / transit node.
-- For US-only services, chain selected users to a US landing outbound.
-- Keep server-side DNS off by default unless you know why you need it.
-- If DNS is enabled, prefer IP-based resolvers and `ipv4_only` / `prefer_ipv4`.
-- Avoid making CN DNS the default resolver for overseas services.
-- Be conservative with IPv6; only export/use IPv6 when the VPS IPv6 route is actually good.
-
-````bash
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s --
-
+pi tune bootstrap
 pi genenv
-
-# Pick ports that fit your provider firewall / security group.
-pi inbound set vless-in listen_port <vless_port>
-pi inbound set hy2-in listen_port <hy2_port>
-pi inbound set socks5-in listen_port <socks5_port>
-
-# Normal HK direct user.
+pi inbound set vless-in  listen_port 40443
+pi inbound set hy2-in    listen_port 40500
+pi inbound set socks5-in listen_port 40080
 pi user add direct hk
 
-# User that enters from HK but lands in US through an upstream.
-pi user add direct us-ai
-pi outbound add us socks <us_landing_host> <us_landing_port> <user> <pass>
-pi outbound inbound set vless-in,hy2-in
-pi outbound enable us
-pi user set-egress us-ai upstream
-
-# Optional: enable DNS only if you need explicit server-side resolving.
-# Keep it simple: IP-based resolver, no domain DoH bootstrap.
 # pi dns enable
 # pi dns server add cloudflare https 1.1.1.1 443 /dns-query
 # pi dns final cloudflare
 # pi dns strategy ipv4_only
-# pi dns route-default cloudflare
+# pi dns route-default set server cloudflare
 
 # Optional HY2 UDP port hopping if your line benefits from it.
 # Also open the whole UDP range in your cloud security group.
 # pi inbound hy2 range 1000
 
 pi apply snapshot
-pi export
 pi doctor quick
+pi export
+```
 
-### For US VPS (landing / native US IP)
+### US West Direct
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps-sb/refs/heads/main/install.sh | bash -s -- /srv/sb
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- /srv/sb
 
+pi tune bootstrap
 pi genenv
-pi inbound set vless-in  listen_port <port>
-pi inbound set hy2-in    listen_port <port>
-pi inbound set socks5-in listen_port <port>
+pi inbound set vless-in  listen_port 40443
+pi inbound set hy2-in    listen_port 40500
+pi inbound set socks5-in listen_port 40080
 
-pi user add direct netflix        # native US IP (US streaming)
-# residential landing instead:
-#   pi outbound add res socks <RES_IP> <port> <u> <p>; pi outbound enable res; pi user set-egress netflix upstream
+pi user add direct netflix
+pi user add direct openai
+pi user add direct transit      # optional: for JP/HK relay back to this US node
 
-# optional HY2 UDP port hopping (China ISP QoS mitigation)
-pi inbound hy2 range 1000         # 40500 ± 500 -> [40000,41000]
-#   ★ also open 40000-41000/udp in your cloud security group
-
-# optional per-user domain override: user defaults upstream, force openai direct
-pi route enable
-pi route add domain-suffix openai.com    direct --user netflix
-pi route add domain-suffix anthropic.com direct --user netflix
-
-# optional tuning (preview first; WARNs if it overrides your ch.4 sysctl)
-sb-tune plan tiny && sb-tune apply tiny
+# pi inbound hy2 range 1000     # also open 40000-41000/udp
 
 pi apply snapshot
-pi export
 pi doctor quick
-````
+pi export
+pi show txt transit
+```
+
+### Japan Relay, US Landing
+
+```bash
+# First deploy a US landing node and get the transit SOCKS5 account.
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
+
+pi tune bootstrap
+pi genenv
+pi inbound set vless-in  listen_port 40443
+pi inbound set hy2-in    listen_port 40500
+pi inbound set socks5-in listen_port 40080
+
+pi user add direct jp
+pi user add upstream us-ai
+pi outbound add us socks <US_IP> 40080 <US_TRANSIT_ACCOUNT> <US_TRANSIT_PASSWORD>
+pi outbound upstream set inbounds vless-in,hy2-in
+pi outbound upstream set name us
+
+# Server-side DNS is recommended on JP/HK relay nodes.
+pi dns enable
+pi dns server add cloudflare https 1.1.1.1 443 /dns-query
+pi dns final cloudflare
+pi dns strategy prefer_ipv4
+pi dns route-default set server cloudflare
+pi dns route-default set strategy prefer_ipv4
+
+# Scoped route policy for the US-landing user.
+pi route enable
+pi route add protocol dns action hijack-dns --user us-ai
+pi route add network udp action hijack-dns port 53 --user us-ai
+pi route add domain-suffix openai.com    upstream --user us-ai
+pi route add domain-suffix anthropic.com upstream --user us-ai
+pi route add domain-suffix netflix.com   upstream --user us-ai
+
+pi apply snapshot
+pi doctor quick
+pi export
+pi show txt us-ai
+```
+
+### Hong Kong Relay, US Landing
+
+```bash
+# First deploy a US landing node and get the transit SOCKS5 account.
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
+
+pi tune bootstrap
+pi genenv
+pi inbound set vless-in  listen_port 40443
+pi inbound set hy2-in    listen_port 40500
+pi inbound set socks5-in listen_port 40080
+
+pi user add direct hk
+pi user add upstream us-ai
+pi outbound add us socks <US_IP> 40080 <US_TRANSIT_ACCOUNT> <US_TRANSIT_PASSWORD>
+pi outbound upstream set inbounds vless-in,hy2-in
+pi outbound upstream set name us
+
+# Server-side DNS is recommended on JP/HK relay nodes.
+pi dns enable
+pi dns server add cloudflare https 1.1.1.1 443 /dns-query
+pi dns final cloudflare
+pi dns strategy prefer_ipv4
+pi dns route-default set server cloudflare
+pi dns route-default set strategy prefer_ipv4
+
+# Scoped route policy for the US-landing user.
+pi route enable
+pi route add protocol dns action hijack-dns --user us-ai
+pi route add network udp action hijack-dns port 53 --user us-ai
+pi route add domain-suffix openai.com    upstream --user us-ai
+pi route add domain-suffix anthropic.com upstream --user us-ai
+pi route add domain-suffix netflix.com   upstream --user us-ai
+
+pi apply snapshot
+pi doctor quick
+pi export
+pi show txt us-ai
+```
+
+### US West Direct, US Landing
+
+This is the full US landing shape: direct US users, optional `transit` user for JP/HK relay, and optional residential SOCKS5 for selected users.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- /srv/sb
+
+pi tune bootstrap
+pi genenv
+pi inbound set vless-in  listen_port 40443
+pi inbound set hy2-in    listen_port 40500
+pi inbound set socks5-in listen_port 40080
+
+pi user add direct netflix
+pi user add direct openai
+pi user add direct transit
+
+pi user add upstream res-ai
+pi outbound add res socks <RES_IP> <RES_PORT> <RES_USER> <RES_PASS>
+pi outbound upstream set inbounds vless-in,hy2-in
+pi outbound upstream set name res
+
+# Optional: enable server-side DNS only if the residential upstream workflow needs it.
+# pi dns enable
+# pi dns server add cloudflare https 1.1.1.1 443 /dns-query
+# pi dns final cloudflare
+# pi dns strategy ipv4_only
+# pi dns route-default set server cloudflare
+# pi dns route-default set strategy ipv4_only
+
+pi route enable
+pi route add domain-suffix openai.com    direct --user res-ai
+pi route add domain-suffix anthropic.com direct --user res-ai
+
+# pi inbound hy2 range 1000
+
+pi apply snapshot
+pi doctor quick
+pi export
+pi show txt
+pi show txt transit
+```
 
 Subscriptions land in `<ROOT>/out/sub/`:
 
 - `<alias_or_account>_<proto>.sub`
-  - raw URI subscription
-  - one node per line
-  - each line starts with `vless://`, `hysteria2://`, or `socks5://`
-  - the whole `.sub` file is **not** base64-encoded
+  - standard base64 subscription
+  - base64-encodes a newline-separated URI list
+  - decoded lines start with `vless://`, `hysteria2://`, or `socks5://`
 
 - `<alias_or_account>_<proto>.yaml`
   - Clash/Mihomo YAML
@@ -188,11 +491,9 @@ Filename prefix priority:
 ## Design notes
 
 - **`sb-apply` is the single compiler.** Editors (`sb-inbound`/`sb-outbound`/`sb-dns`/`sb-route`) only write intent files under `env/`. No compile hooks, no patching of `sb-apply`.
+- **Inbound tags live in `env/inbounds.json`.** `sb-inbound` validates tags only from this registry; it never uses the template as a source. `pi inbound set vless-in tag edge-vless` renames the registry and syncs references in `node.env` / `routes.json`; `sb-apply` renders the template with those tags.
+- **Outbound upstream scope also uses the registry.** `pi outbound upstream set inbounds ...` validates against `env/inbounds.json`, not the template or a possibly stale compiled config.
 - **Route order:** `sniff → ip_is_private reject → sb-route (hard override) → auth_user upstream → final direct`. So `sb-route` overrides a user's default egress; `--user`/`--inbound` scope rules, global rules WARN on creation. `geosite`/`geoip` are rejected (need rule_set; deferred to a future `sb-ruleset`).
 - **DNS:** default has no DNS block. `sb-dns` is opt-in, no built-in DoH, uses sing-box 1.12+ typed servers (`server`+`path`, `domain_resolver` required for domain servers).
 - **HY2 port hopping** uses nftables **`dnat`** (not `redirect`) — correct for `::`-bound inbounds on Debian 13
-- **Backups are opt-in:** `pi apply snapshot` (or `sb-backup create`), never on a failed apply.
-
-```
-
-```
+- **Backups are opt-in:** `pi apply snapshot` (or `pi backup create`), never on a failed apply.

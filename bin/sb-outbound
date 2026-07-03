@@ -5,13 +5,12 @@ export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 F="$SB_ROOT/out/outbounds.json"
 PATCH_F="$SB_ROOT/env/outbound-patch.json"
 ENV_FILE="$SB_ROOT/env/node.env"
-TPL="$SB_ROOT/templates/config.json.tpl"
-OUT="$SB_ROOT/out/config.json"
+INBOUNDS_FILE="$SB_ROOT/env/inbounds.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
 
-for dep in jq envsubst; do
+for dep in jq awk; do
   command -v "$dep" >/dev/null || die "缺依赖 $dep"
 done
 
@@ -22,58 +21,61 @@ usage() {
   sb-outbound add <name> <type> <参数...>
   sb-outbound del <name>
   sb-outbound show <name>
-  sb-outbound enable <name>
-  sb-outbound disable
 
-  sb-outbound domain list
-  sb-outbound domain show <name>
-  sb-outbound domain set <name> [strategy]
-  sb-outbound domain del <name>
-  sb-outbound domain rm  <name>
+  sb-outbound upstream show
+  sb-outbound upstream set <key> <value>
+  sb-outbound upstream clear <key>
+  sb-outbound upstream allow inbounds <inbound[,inbound...]>
+  sb-outbound upstream del-inbounds <inbound[,inbound...]>
 
-  sb-outbound resolver list
-  sb-outbound resolver show <outbound-tag>
-  sb-outbound resolver set <outbound-tag> <dns-server-tag> [strategy]
-  sb-outbound resolver del <outbound-tag>
-  sb-outbound resolver rm  <outbound-tag>
-
-  sb-outbound inbound list
-  sb-outbound inbound allow <inbound[,inbound...]>
-  sb-outbound inbound set   <inbound[,inbound...]>
-  sb-outbound inbound del   <inbound[,inbound...]>
-  sb-outbound inbound rm    <inbound[,inbound...]>
-  sb-outbound inbound clear
+  sb-outbound direct show
+  sb-outbound direct set <key> <value>
+  sb-outbound direct rm  <key>
 
 类型-参数:
   socks <host> <port> [user] [pass]
   http  <host> <port> [user] [pass]
   ss    <host> <port> <method> <password>
 
-domain_strategy / resolver strategy:
+upstream key:
+  name <outbound-name>
+  enabled 0|1
+  inbounds <inbound[,inbound...]>
+  domain_strategy <strategy>
+  type socks|http
+  host <host>
+  port <port>
+  user <user>
+  pass <pass>
+
+direct key:
+  resolver <dns-server-tag> [strategy]
+  domain_strategy <strategy>
+
+strategy:
   prefer_ipv4
   prefer_ipv6
   ipv4_only
   ipv6_only
 
-resolver:
-  - 用来给已有 outbound 打 domain_resolver patch，包括模板内置 direct。
-  - patch 写入 env/outbound-patch.json，由 sb-apply 合并进最终 config。
-
 例:
   sb-outbound add isp1 socks proxy.example.com 1080 user pass
-  sb-outbound enable isp1
+  sb-outbound upstream set name isp1
+  sb-outbound upstream set inbounds vless-in,hy2-in
+  sb-outbound upstream set domain_strategy ipv4_only
+  sb-outbound upstream set enabled 0
 
-  sb-outbound inbound set vless-in
-  sb-outbound inbound allow hy2-in
-  sb-outbound inbound rm hy2-in
-
-  sb-outbound domain set isp1 ipv4_only
-
-  sb-outbound resolver set direct google prefer_ipv6
-  sb-outbound resolver show direct
-  sb-outbound resolver rm direct
+  sb-outbound direct set resolver google prefer_ipv6
+  sb-outbound direct set domain_strategy ipv4_only
+  sb-outbound direct rm resolver
 
   sb-apply
+
+兼容旧命令仍可解析，但新文档请使用 upstream/direct:
+  enable/disable -> upstream set name/enabled
+  inbound        -> upstream set/allow/del-inbounds/clear inbounds
+  domain         -> upstream set domain_strategy
+  resolver       -> direct set/rm resolver
 U
   exit 1
 }
@@ -157,31 +159,37 @@ write_patch_json() {
 }
 
 available_inbounds_json() {
-  if [[ -f "$OUT" ]] && jq -e '.inbounds | type == "array"' "$OUT" >/dev/null 2>&1; then
-    jq -c '[.inbounds[]?.tag | select(. != null and . != "")]' "$OUT"
-    return 0
-  fi
+  [[ -f "$INBOUNDS_FILE" ]] || die "无法读取可选 inbound：缺 $INBOUNDS_FILE，请先跑 sb-genenv upgrade"
 
-  [[ -f "$ENV_FILE" ]] || die "无法读取可选 inbound：缺 $ENV_FILE，先跑 sb-genenv"
-  [[ -f "$TPL" ]] || die "无法读取可选 inbound：缺 $TPL"
+  jq -c '
+    def valid_tag:
+      type == "string" and length > 0;
 
-  load_env
-
-  local tmp
-  tmp="$(mktemp)"
-
-  local VARS
-  VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
-
-  envsubst "$VARS" < "$TPL" > "$tmp"
-
-  if ! jq -e '.inbounds | type == "array"' "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"
-    die "无法从模板解析 .inbounds，请先确认 $TPL 是可渲染 JSON"
-  fi
-
-  jq -c '[.inbounds[]?.tag | select(. != null and . != "")]' "$tmp"
-  rm -f "$tmp"
+    if type != "object" then
+      error("inbounds.json 必须是 object")
+    else
+      .
+    end
+    | .base = (.base // {})
+    | .clones = (.clones // {})
+    | .delete_inbounds = (.delete_inbounds // [])
+    | if (.base | type) != "object" then error(".base 必须是 object") else . end
+    | if (.clones | type) != "object" then error(".clones 必须是 object") else . end
+    | if (.delete_inbounds | type) != "array" then error(".delete_inbounds 必须是 array") else . end
+    | (
+        [
+          .base.vless.tag?,
+          .base.hy2.tag?,
+          .base.socks5.tag?
+        ]
+        | map(select(valid_tag))
+      ) as $base
+    | ((.clones // {}) | keys) as $clones
+    | (.delete_inbounds | map(tostring)) as $deleted
+    | ($base + $clones)
+    | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+    | map(select(. as $x | ($deleted | index($x) | not)))
+  ' "$INBOUNDS_FILE" || die "$INBOUNDS_FILE 格式错误"
 }
 
 available_inbounds_text() {
@@ -246,6 +254,321 @@ write_json() {
   local tmp="$1"
   install -m 600 "$tmp" "$F"
   rm -f "$tmp"
+}
+
+csv_join_json() {
+  jq -r 'join(",")'
+}
+
+current_upstream_inbounds_json() {
+  local cur="${UPSTREAM_INBOUNDS:-}"
+  jq -nr --arg cur "$cur" '
+    $cur
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; ""))
+    | map(select(length > 0))
+  '
+}
+
+set_upstream_from_outbound() {
+  local name="$1"
+  local ob
+  local type
+  local server
+  local port
+  local user
+  local pass
+
+  [[ -n "$name" ]] || die "upstream set name 需要 <outbound-name>"
+  ob_exists "$name" || die "无此 outbound '$name'"
+
+  ob="$(get_ob "$name")"
+  type="$(jq -r '.type' <<<"$ob")"
+  server="$(jq -r '.server // ""' <<<"$ob")"
+  port="$(jq -r '.server_port // ""' <<<"$ob")"
+  user="$(jq -r '.username // ""' <<<"$ob")"
+  pass="$(jq -r '.password // ""' <<<"$ob")"
+
+  [[ -n "$server" && "$server" != "null" ]] || die "outbound '$name' 缺 server"
+  [[ -n "$port" && "$port" != "null" ]] || die "outbound '$name' 缺 server_port"
+
+  set_env "UPSTREAM_ENABLED" "1"
+  set_env "UPSTREAM_NAME" "$name"
+  set_env "UPSTREAM_TYPE" "$type"
+  set_env "UPSTREAM_HOST" "$server"
+  set_env "UPSTREAM_PORT" "$port"
+  set_env "UPSTREAM_USER" "$user"
+  set_env "UPSTREAM_PASS" "$pass"
+}
+
+set_upstream_inbounds() {
+  local set_json
+  local new
+
+  [[ $# -gt 0 ]] || die "upstream set inbounds 需要 <inbound[,inbound...]>"
+  set_json="$(inbound_args_json "$@")"
+  new="$(csv_join_json <<<"$set_json")"
+  set_env "UPSTREAM_INBOUNDS" "$new"
+  log "OK: UPSTREAM_INBOUNDS=${new:-<empty>}。跑 sb-apply 生效。"
+}
+
+allow_upstream_inbounds() {
+  local cur
+  local add_json
+  local new
+
+  [[ $# -gt 0 ]] || die "upstream allow inbounds 需要 <inbound[,inbound...]>"
+  load_env
+  cur="${UPSTREAM_INBOUNDS:-}"
+  add_json="$(inbound_args_json "$@")"
+
+  new="$(
+    jq -nr \
+      --arg cur "$cur" \
+      --argjson add "$add_json" '
+      def splitcsv($s):
+        $s
+        | split(",")
+        | map(gsub("^\\s+|\\s+$"; ""))
+        | map(select(length > 0));
+
+      (splitcsv($cur) + $add)
+      | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+      | join(",")
+    '
+  )"
+
+  set_env "UPSTREAM_INBOUNDS" "$new"
+  log "OK: UPSTREAM_INBOUNDS=${new:-<empty>}。跑 sb-apply 生效。"
+}
+
+del_upstream_inbounds() {
+  local cur
+  local del_json
+  local new
+
+  [[ $# -gt 0 ]] || die "upstream del inbounds 需要 <inbound[,inbound...]>"
+  load_env
+  cur="${UPSTREAM_INBOUNDS:-}"
+  del_json="$(inbound_args_json "$@")"
+
+  new="$(
+    jq -nr \
+      --arg cur "$cur" \
+      --argjson del "$del_json" '
+      def splitcsv($s):
+        $s
+        | split(",")
+        | map(gsub("^\\s+|\\s+$"; ""))
+        | map(select(length > 0));
+
+      splitcsv($cur)
+      | map(select(. as $x | ($del | index($x) | not)))
+      | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+      | join(",")
+    '
+  )"
+
+  set_env "UPSTREAM_INBOUNDS" "$new"
+  if [[ -z "$new" ]]; then
+    log "WARN: UPSTREAM_INBOUNDS 已为空；sb-apply 不会生成 upstream 路由规则。"
+  else
+    log "OK: UPSTREAM_INBOUNDS=$new。跑 sb-apply 生效。"
+  fi
+}
+
+set_upstream_key() {
+  local key="$1"
+  shift || true
+  local value="${1:-}"
+
+  [[ -n "$key" ]] || die "upstream set 需要 <key> <value>"
+  [[ $# -gt 0 ]] || die "upstream set $key 需要 <value>"
+
+  case "$key" in
+    enabled)
+      case "$value" in
+        1|true|on|yes) set_env "UPSTREAM_ENABLED" "1" ;;
+        0|false|off|no) set_env "UPSTREAM_ENABLED" "0" ;;
+        *) die "upstream enabled 只支持 1/0 true/false on/off yes/no，收到 '$value'" ;;
+      esac
+      log "OK: UPSTREAM_ENABLED=$value。跑 sb-apply 生效。"
+      ;;
+    name)
+      set_upstream_from_outbound "$value"
+      log "OK: 已启用 outbound '$value' 作为 UPSTREAM。跑 sb-apply 生效。"
+      ;;
+    inbounds|inbound)
+      set_upstream_inbounds "$@"
+      ;;
+    domain_strategy|strategy)
+      if [[ "$value" == "off" || "$value" == "clear" || "$value" == "none" ]]; then
+        set_env "UPSTREAM_DOMAIN_STRATEGY" ""
+      else
+        validate_domain_strategy "$value"
+        set_env "UPSTREAM_DOMAIN_STRATEGY" "$value"
+      fi
+      log "OK: UPSTREAM_DOMAIN_STRATEGY=${value}。跑 sb-apply 生效。"
+      ;;
+    type)
+      [[ "$value" == "socks" || "$value" == "http" ]] || die "UPSTREAM_TYPE 仅支持 socks/http，收到 '$value'"
+      set_env "UPSTREAM_NAME" ""
+      set_env "UPSTREAM_TYPE" "$value"
+      log "OK: UPSTREAM_TYPE=$value。跑 sb-apply 生效。"
+      ;;
+    host)
+      set_env "UPSTREAM_NAME" ""
+      set_env "UPSTREAM_HOST" "$value"
+      log "OK: UPSTREAM_HOST=$value。跑 sb-apply 生效。"
+      ;;
+    port)
+      [[ "$value" =~ ^[0-9]+$ ]] || die "UPSTREAM_PORT 必须是数字，收到 '$value'"
+      (( value >= 1 && value <= 65535 )) || die "UPSTREAM_PORT 范围必须是 1-65535，收到 '$value'"
+      set_env "UPSTREAM_NAME" ""
+      set_env "UPSTREAM_PORT" "$value"
+      log "OK: UPSTREAM_PORT=$value。跑 sb-apply 生效。"
+      ;;
+    user)
+      set_env "UPSTREAM_NAME" ""
+      set_env "UPSTREAM_USER" "$value"
+      log "OK: UPSTREAM_USER=$value。跑 sb-apply 生效。"
+      ;;
+    pass|password)
+      set_env "UPSTREAM_NAME" ""
+      set_env "UPSTREAM_PASS" "$value"
+      log "OK: UPSTREAM_PASS=<set>。跑 sb-apply 生效。"
+      ;;
+    *)
+      die "upstream set 不支持 key '$key'；可选：enabled/name/inbounds/domain_strategy/type/host/port/user/pass"
+      ;;
+  esac
+}
+
+clear_upstream_key() {
+  local key="$1"
+  [[ -n "$key" ]] || die "upstream clear 需要 <key>"
+
+  case "$key" in
+    inbounds|inbound)
+      set_env "UPSTREAM_INBOUNDS" ""
+      log "OK: UPSTREAM_INBOUNDS=<empty>。跑 sb-apply 生效。"
+      ;;
+    domain_strategy|strategy)
+      set_env "UPSTREAM_DOMAIN_STRATEGY" ""
+      log "OK: UPSTREAM_DOMAIN_STRATEGY=<empty>。跑 sb-apply 生效。"
+      ;;
+    name)
+      set_env "UPSTREAM_NAME" ""
+      log "OK: UPSTREAM_NAME=<empty>。跑 sb-apply 生效。"
+      ;;
+    user)
+      set_env "UPSTREAM_USER" ""
+      log "OK: UPSTREAM_USER=<empty>。跑 sb-apply 生效。"
+      ;;
+    pass|password)
+      set_env "UPSTREAM_PASS" ""
+      log "OK: UPSTREAM_PASS=<empty>。跑 sb-apply 生效。"
+      ;;
+    *)
+      die "upstream clear 不支持 key '$key'；可选：inbounds/domain_strategy/name/user/pass"
+      ;;
+  esac
+}
+
+show_upstream() {
+  load_env
+  echo "upstream:"
+  echo "  enabled=${UPSTREAM_ENABLED:-0}"
+  echo "  name=${UPSTREAM_NAME:-}"
+  echo "  inbounds=${UPSTREAM_INBOUNDS:-}"
+  echo "  domain_strategy=${UPSTREAM_DOMAIN_STRATEGY:-}"
+  echo "  type=${UPSTREAM_TYPE:-socks}"
+  echo "  host=${UPSTREAM_HOST:-}"
+  echo "  port=${UPSTREAM_PORT:-}"
+  echo "  user=${UPSTREAM_USER:-}"
+  echo
+  echo "available inbounds:"
+  available_inbounds_json | jq -r '.[] | "  " + .'
+}
+
+set_outbound_patch_key() {
+  local tag="$1"
+  local key="$2"
+  local value="$3"
+  local strategy="${4:-}"
+  local tmp
+
+  ensure_patch_file
+
+  case "$key" in
+    resolver|domain_resolver)
+      [[ -n "$value" ]] || die "$tag set resolver 需要 <dns-server-tag> [strategy]"
+      if [[ -n "$strategy" ]]; then
+        validate_domain_strategy "$strategy"
+      fi
+      tmp="$(mktemp)"
+      jq \
+        --arg tag "$tag" \
+        --arg server "$value" \
+        --arg strategy "$strategy" '
+        .version = (.version // 1)
+        | .patch = (.patch // {})
+        | .patch[$tag] = (.patch[$tag] // {})
+        | .patch[$tag].domain_resolver = ({server: $server}
+            + (if $strategy != "" then {strategy: $strategy} else {} end))
+      ' "$PATCH_F" > "$tmp"
+      write_patch_json "$tmp"
+      log "OK: 已设置 outbound '$tag' domain_resolver.server=$value${strategy:+ strategy=$strategy}。跑 sb-apply 应用。"
+      ;;
+    domain_strategy|strategy)
+      validate_domain_strategy "$value"
+      tmp="$(mktemp)"
+      jq \
+        --arg tag "$tag" \
+        --arg strategy "$value" '
+        .version = (.version // 1)
+        | .patch = (.patch // {})
+        | .patch[$tag] = (.patch[$tag] // {})
+        | .patch[$tag].domain_strategy = $strategy
+      ' "$PATCH_F" > "$tmp"
+      write_patch_json "$tmp"
+      log "OK: 已设置 outbound '$tag' domain_strategy=$value。跑 sb-apply 应用。"
+      ;;
+    *)
+      die "$tag set 不支持 key '$key'；可选：resolver/domain_strategy"
+      ;;
+  esac
+}
+
+rm_outbound_patch_key() {
+  local tag="$1"
+  local key="$2"
+  local field
+  local tmp
+
+  ensure_patch_file
+  [[ -n "$key" ]] || die "$tag rm 需要 <key>"
+
+  case "$key" in
+    resolver|domain_resolver) field="domain_resolver" ;;
+    domain_strategy|strategy) field="domain_strategy" ;;
+    *) die "$tag rm 不支持 key '$key'；可选：resolver/domain_strategy" ;;
+  esac
+
+  tmp="$(mktemp)"
+  jq --arg tag "$tag" --arg field "$field" '
+    .version = (.version // 1)
+    | .patch = (.patch // {})
+    | if (.patch[$tag] // null) == null then
+        .
+      else
+        del(.patch[$tag][$field])
+        | if ((.patch[$tag] // {}) | length) == 0 then del(.patch[$tag]) else . end
+      end
+  ' "$PATCH_F" > "$tmp"
+
+  write_patch_json "$tmp"
+  log "OK: 已删除 outbound '$tag' 的 $field patch。跑 sb-apply 应用。"
 }
 
 ensure_file
@@ -427,29 +750,13 @@ case "$cmd" in
         name="$(jq -r '.[0].tag // .[0].name' "$F")"
         log "INFO: 未指定 name，自动选择唯一 outbound: $name"
       else
-        die "存在多个 outbound，请明确指定：sb-outbound enable <name>"
+        die "存在多个 outbound，请明确指定：sb-outbound upstream set name <name>"
       fi
     fi
 
     ob_exists "$name" || die "无此 outbound '$name'"
 
-    ob="$(get_ob "$name")"
-    type="$(jq -r '.type' <<<"$ob")"
-    server="$(jq -r '.server // ""' <<<"$ob")"
-    port="$(jq -r '.server_port // ""' <<<"$ob")"
-    user="$(jq -r '.username // ""' <<<"$ob")"
-    pass="$(jq -r '.password // ""' <<<"$ob")"
-
-    [[ -n "$server" && "$server" != "null" ]] || die "outbound '$name' 缺 server"
-    [[ -n "$port" && "$port" != "null" ]] || die "outbound '$name' 缺 server_port"
-
-    set_env "UPSTREAM_ENABLED" "1"
-    set_env "UPSTREAM_NAME" "$name"
-    set_env "UPSTREAM_TYPE" "$type"
-    set_env "UPSTREAM_HOST" "$server"
-    set_env "UPSTREAM_PORT" "$port"
-    set_env "UPSTREAM_USER" "$user"
-    set_env "UPSTREAM_PASS" "$pass"
+    set_upstream_from_outbound "$name"
 
     log "OK: 已启用 outbound '$name' 作为 UPSTREAM。"
     log "INFO: egress=upstream 的用户会走 $name；跑 sb-apply 生效。"
@@ -461,6 +768,62 @@ case "$cmd" in
     set_env "UPSTREAM_ENABLED" "0"
 
     log "OK: 已禁用 UPSTREAM（UPSTREAM_ENABLED=0）。跑 sb-apply 生效。"
+    ;;
+
+  upstream)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      show|list)
+        show_upstream
+        ;;
+      set)
+        key="${1:-}"
+        shift || true
+        set_upstream_key "$key" "$@"
+        ;;
+      clear|rm|del)
+        clear_upstream_key "${1:-}"
+        ;;
+      allow)
+        key="${1:-}"
+        shift || true
+        [[ "$key" == "inbounds" || "$key" == "inbound" ]] || die "用法: sb-outbound upstream allow inbounds <tag[,tag...]>"
+        allow_upstream_inbounds "$@"
+        ;;
+      del-inbounds|rm-inbounds)
+        del_upstream_inbounds "$@"
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ;;
+
+  direct)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      show|list)
+        ensure_patch_file
+        jq '{tag:"direct", patch:(.patch.direct // {})}' "$PATCH_F"
+        ;;
+      set)
+        key="${1:-}"
+        value="${2:-}"
+        strategy="${3:-}"
+        [[ -n "$key" && -n "$value" ]] || die "用法: sb-outbound direct set <resolver|domain_strategy> <value> [strategy]"
+        set_outbound_patch_key "direct" "$key" "$value" "$strategy"
+        ;;
+      rm|del|clear)
+        rm_outbound_patch_key "direct" "${1:-}"
+        ;;
+      *)
+        usage
+        ;;
+    esac
     ;;
 
   domain)
@@ -681,7 +1044,7 @@ case "$cmd" in
         ;;
 
       allow)
-        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound inbound allow vless-in,hy2-in"
+        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound upstream allow inbounds vless-in,hy2-in"
         load_env
 
         cur="${UPSTREAM_INBOUNDS:-}"
@@ -708,7 +1071,7 @@ case "$cmd" in
         ;;
 
       set)
-        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound inbound set vless-in,hy2-in"
+        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound upstream set inbounds vless-in,hy2-in"
 
         set_json="$(inbound_args_json "$@")"
         new="$(jq -r 'join(",")' <<<"$set_json")"
@@ -718,7 +1081,7 @@ case "$cmd" in
         ;;
 
       del|rm)
-        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound inbound rm hy2-in"
+        [[ $# -gt 0 ]] || die "缺少 inbound 参数，例如: sb-outbound upstream del-inbounds hy2-in"
         load_env
 
         cur="${UPSTREAM_INBOUNDS:-}"

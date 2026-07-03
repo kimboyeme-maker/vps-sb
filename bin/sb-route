@@ -308,8 +308,17 @@ case "$cmd" in
       shift
     done
 
-    au_json="$(array_json_from_args "${users[@]}")"
-    in_json="$(array_json_from_args "${inbounds[@]}")"
+    if [[ ${#users[@]} -gt 0 ]]; then
+      au_json="$(array_json_from_args "${users[@]}")"
+    else
+      au_json='[]'
+    fi
+
+    if [[ ${#inbounds[@]} -gt 0 ]]; then
+      in_json="$(array_json_from_args "${inbounds[@]}")"
+    else
+      in_json='[]'
+    fi
 
     if [[ ${#users[@]} -eq 0 && ${#inbounds[@]} -eq 0 ]]; then
       log "WARN: 这是 global sb-route 规则，会影响所有用户。"
@@ -329,7 +338,11 @@ case "$cmd" in
         ]
       ' "$F" | write_json
 
-      log "OK: 已加 action 规则 [$mt $val -> action=$action]$([[ "$extra_json" != "{}" ]] && echo " extra=$extra_json")$([[ ${#users[@]} -gt 0 ]] && echo " user=${users[*]}")$([[ ${#inbounds[@]} -gt 0 ]] && echo " inbound=${inbounds[*]}")。跑 sb-apply 生效。"
+      user_text=""
+      inbound_text=""
+      [[ ${#users[@]} -gt 0 ]] && user_text=" user=${users[*]}"
+      [[ ${#inbounds[@]} -gt 0 ]] && inbound_text=" inbound=${inbounds[*]}"
+      log "OK: 已加 action 规则 [$mt $val -> action=$action]$([[ "$extra_json" != "{}" ]] && echo " extra=$extra_json")${user_text}${inbound_text}。跑 sb-apply 生效。"
     else
       validate_outbound_match_type "$mt"
       validate_match_value "$mt" "$val"
@@ -343,7 +356,11 @@ case "$cmd" in
         ]
       ' "$F" | write_json
 
-      log "OK: 已加 outbound 规则 [$mt $val -> $ob]$([[ ${#users[@]} -gt 0 ]] && echo " user=${users[*]}")$([[ ${#inbounds[@]} -gt 0 ]] && echo " inbound=${inbounds[*]}")。跑 sb-apply 生效。"
+      user_text=""
+      inbound_text=""
+      [[ ${#users[@]} -gt 0 ]] && user_text=" user=${users[*]}"
+      [[ ${#inbounds[@]} -gt 0 ]] && inbound_text=" inbound=${inbounds[*]}"
+      log "OK: 已加 outbound 规则 [$mt $val -> $ob]${user_text}${inbound_text}。跑 sb-apply 生效。"
     fi
     ;;
 

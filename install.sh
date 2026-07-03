@@ -3,7 +3,7 @@ set -euo pipefail
 
 # sb-deploy 一键安装 / 更新（从 GitHub 拉取脚本）
 # 用法:
-#   curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_sb/main/install.sh | bash -s -- [ROOT] [--with-tune] [--ref BRANCH]
+#   curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s -- [ROOT] [--ref BRANCH]
 # 例:
 #   ... | bash -s --                      # 装到默认 /opt/sb-deploy
 #   ... | bash -s -- /srv/sb              # 装到 /srv/sb
@@ -27,7 +27,6 @@ CORE=(
   sb-route
   sb-show
   sb-tune
-  sb-user
 )
 
 log(){ printf '[install] %s\n' "$*" >&2; }

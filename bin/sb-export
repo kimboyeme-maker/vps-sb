@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SB_ROOT="${SB_ROOT:-/opt/sb-deploy}"
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 OUT_DIR="$SB_ROOT/out"
 SUB_DIR="$OUT_DIR/sub"
 ENV_FILE="$SB_ROOT/env/node.env"
@@ -14,15 +14,16 @@ die() { log "FAIL: $*"; exit 1; }
 summary() {
   cat <<'S'
 summary:
-  sb-export 从最终 /opt/sb-deploy/out/config.json 读取实际生效的 inbound 和 users，
+  sb-export 从最终 out/config.json 读取实际生效的 inbound 和 users，
   为每个用户导出 2 个文件：
 
     <alias_or_account>_<protocol>.sub
     <alias_or_account>_<protocol>.yaml
 
   .sub:
-    明文 URI，每行以 vless:// / hysteria2:// / socks5:// 开头。
-    不再生成 *_uri.txt / *_base64.txt。
+    标准 base64 订阅：把所有节点的 vless:// / hysteria2:// / socks5:// 明文 URI
+    按行拼好后，对整份文件做 base64 -w0 编码。客户端当订阅链接导入即可。
+    想看明文用 sb-show txt。
 
   .yaml:
     Clash/Mihomo YAML proxies 列表。
@@ -55,8 +56,8 @@ name_or_alias:
   可选。按 users.json 里的 name 或 alias 过滤用户。
 
 output:
-  /opt/sb-deploy/out/sub/<alias_or_account>_<protocol>.sub
-  /opt/sb-deploy/out/sub/<alias_or_account>_<protocol>.yaml
+  <SB_ROOT>/out/sub/<alias_or_account>_<protocol>.sub
+  <SB_ROOT>/out/sub/<alias_or_account>_<protocol>.yaml
 
   prefix 优先级：
     alias 存在 -> alias
@@ -80,8 +81,8 @@ help:
   sb-export --help
 
 notes:
-  - .sub 是明文 URI，不是整文件 base64
-  - 如果某客户端需要 base64 订阅，可以手动：base64 -w0 xxx.sub > xxx.base64.txt
+  - .sub 是整文件 base64 标准订阅（protocol:// 明文列表整体 base64 编码）
+  - 想看明文 URI 用 sb-show txt
   - HY2 range 仅在 Clash/Mihomo YAML 中输出 ports/hop-interval
 U
 }
@@ -627,7 +628,7 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
     echo "# ${name} (${alias:-no-alias}) $(date -u +%FT%TZ)"
     echo "x-meta:"
     echo "  generated-by: sb-deploy"
-    echo "  format: raw-uri-sub-and-mihomo-yaml"
+    echo "  format: base64-sub-and-mihomo-yaml"
     echo "  protocol-filter: $(yaml_q "$proto")"
     echo "  node: $(yaml_q "$NODE_NAME")"
     echo "  user: $(yaml_q "$name")"
@@ -710,7 +711,8 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
     die ".sub 里没有 protocol:// 行，导出异常"
   fi
 
-  install -m 600 "$uris_tmp" "$sub_file"
+  base64 -w0 < "$uris_tmp" > "$sub_file"
+  chmod 600 "$sub_file"
   install -m 600 "$yaml_tmp" "$yaml_file"
 
   rm -f "$uris_tmp" "$yaml_tmp"

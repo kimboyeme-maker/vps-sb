@@ -4,6 +4,7 @@ set -euo pipefail
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 ENV_FILE="$SB_ROOT/env/node.env"
 USERS_FILE="$SB_ROOT/env/users.json"
+INBOUNDS_FILE="$SB_ROOT/env/inbounds.json"
 CERT_DIR="$SB_ROOT/certs"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -102,6 +103,10 @@ NODE_NAME_DEFAULT="SJC"
 VLESS_PORT_DEFAULT=40443
 HY2_PORT_DEFAULT=40500
 SOCKS5_PORT_DEFAULT=40080
+
+VLESS_TAG_DEFAULT="vless-in"
+HY2_TAG_DEFAULT="hy2-in"
+SOCKS5_TAG_DEFAULT="socks5-in"
 
 # 端口策略
 INBOUND_PORT_MIN_DEFAULT=20000
@@ -322,6 +327,63 @@ generate_user_if_missing() {
   log "OK: 已生成 $USERS_FILE"
 }
 
+ensure_inbounds_registry() {
+  local tmp
+
+  if [[ ! -f "$INBOUNDS_FILE" ]]; then
+    umask 077
+    cat > "$INBOUNDS_FILE" <<JSON
+{
+  "version": 2,
+  "base": {
+    "vless": { "tag": "${VLESS_TAG_DEFAULT}" },
+    "hy2": { "tag": "${HY2_TAG_DEFAULT}" },
+    "socks5": { "tag": "${SOCKS5_TAG_DEFAULT}" }
+  },
+  "patch": {},
+  "delete_fields": {},
+  "delete_inbounds": [],
+  "clones": {}
+}
+JSON
+    chmod 600 "$INBOUNDS_FILE"
+    log "OK: 已生成 $INBOUNDS_FILE"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+
+  jq \
+    --arg vless "$VLESS_TAG_DEFAULT" \
+    --arg hy2 "$HY2_TAG_DEFAULT" \
+    --arg socks5 "$SOCKS5_TAG_DEFAULT" '
+    if type != "object" then error("inbounds.json 必须是 object") else . end
+    | .version = 2
+    | .base = (.base // {})
+    | .base.vless = (.base.vless // {})
+    | .base.hy2 = (.base.hy2 // {})
+    | .base.socks5 = (.base.socks5 // {})
+    | .base.vless.tag = (.base.vless.tag // $vless)
+    | .base.hy2.tag = (.base.hy2.tag // $hy2)
+    | .base.socks5.tag = (.base.socks5.tag // $socks5)
+    | .patch = (.patch // {})
+    | .delete_fields = (.delete_fields // {})
+    | .delete_inbounds = (.delete_inbounds // [])
+    | .clones = (.clones // {})
+    | if (.base | type) != "object" then error(".base 必须是 object") else . end
+    | if (.patch | type) != "object" then error(".patch 必须是 object") else . end
+    | if (.delete_fields | type) != "object" then error(".delete_fields 必须是 object") else . end
+    | if (.delete_inbounds | type) != "array" then error(".delete_inbounds 必须是 array") else . end
+    | if (.clones | type) != "object" then error(".clones 必须是 object") else . end
+  ' "$INBOUNDS_FILE" > "$tmp" || {
+    rm -f "$tmp"
+    die "$INBOUNDS_FILE 格式错误"
+  }
+
+  install -m 600 "$tmp" "$INBOUNDS_FILE"
+  rm -f "$tmp"
+}
+
 generate_cert_if_missing() {
   if [[ -f "$CERT_DIR/cert.pem" && -f "$CERT_DIR/key.pem" ]]; then
     log "SKIP: Hy2 证书已存在，不覆盖。"
@@ -391,6 +453,7 @@ else
 fi
 
 generate_user_if_missing
+ensure_inbounds_registry
 generate_cert_if_missing
 ensure_singbox_config_symlink
 ensure_gitignore

@@ -3,7 +3,7 @@
   "inbounds": [
     {
       "type": "vless",
-      "tag": "vless-in",
+      "tag": "${VLESS_TAG}",
       "listen": "::",
       "listen_port": ${VLESS_PORT},
       "users": [],
@@ -20,7 +20,7 @@
     },
     {
       "type": "hysteria2",
-      "tag": "hy2-in",
+      "tag": "${HY2_TAG}",
       "listen": "::",
       "listen_port": ${HY2_PORT},
       "up_mbps": ${HY2_UP_MBPS},
@@ -39,7 +39,7 @@
     },
     {
       "type": "socks",
-      "tag": "socks5-in",
+      "tag": "${SOCKS5_TAG}",
       "listen": "0.0.0.0",
       "listen_port": ${SOCKS5_PORT},
       "users": []

@@ -170,10 +170,14 @@ env_value() {
 require_env_nonempty() {
   local key="$1"
   local desc="$2"
+  local fix="${3:-manual}"
   local value
 
   if ! env_key_exists "$key"; then
-    die "node.env 缺必需参数 ${key}（${desc}）。sb-apply 不会自动补这个值；请先跑 sb-genenv upgrade 或手动补齐 ${key}=..."
+    if [[ "$fix" == "upgrade" ]]; then
+      die "node.env 缺必需参数 ${key}（${desc}）。请先跑 sb-genenv upgrade，或手动补齐 ${key}=..."
+    fi
+    die "node.env 缺必需参数 ${key}（${desc}）。请在 $ENV_FILE 中手动补齐 ${key}=...；如果密钥/端口已丢失，也可以先备份 env/users.json 后删除 $ENV_FILE 并重新跑 sb-genenv。"
   fi
 
   value="$(env_value "$key")"
@@ -184,9 +188,10 @@ require_env_nonempty() {
 
 require_env_port() {
   local key="$1"
+  local fix="${2:-manual}"
   local value
 
-  require_env_nonempty "$key" "模板 listen_port 必需参数，必须是 1-65535 的数字"
+  require_env_nonempty "$key" "模板 listen_port 必需参数，必须是 1-65535 的数字" "$fix"
   value="$(env_value "$key")"
   validate_port "$key" "$value"
 }
@@ -194,9 +199,10 @@ require_env_port() {
 require_env_uint() {
   local key="$1"
   local desc="$2"
+  local fix="${3:-manual}"
   local value
 
-  require_env_nonempty "$key" "$desc"
+  require_env_nonempty "$key" "$desc" "$fix"
   value="$(env_value "$key")"
   [[ "$value" =~ ^[0-9]+$ ]] || die "node.env 参数 ${key} 必须是数字，收到 '$value'"
 }
@@ -206,7 +212,7 @@ validate_envsubst_inputs() {
 
   require_env_port "VLESS_PORT"
   require_env_port "HY2_PORT"
-  require_env_port "SOCKS5_PORT"
+  require_env_port "SOCKS5_PORT" "upgrade"
 
   require_env_uint "HY2_UP_MBPS" "HY2 上行带宽参数"
   require_env_uint "HY2_DOWN_MBPS" "HY2 下行带宽参数"
@@ -252,35 +258,45 @@ if [[ "${HY2_RANGE_ENABLED:-0}" == "1" ]]; then
   validate_offset "$HY2_RANGE_OFFSET"
 fi
 
-TMP="$(mktemp)"
-TMP2="$(mktemp)"
-
-dbg "envsubst 填标量"
-VARS='${SB_ROOT} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
-envsubst "$VARS" < "$TPL" > "$TMP"
-
-if ! jq -e '.inbounds | type == "array"' "$TMP" >/dev/null 2>&1; then
-  die "模板经 envsubst 渲染后不是合法 sing-box JSON，或缺 .inbounds[]。请检查 $TPL 以及 node.env 中参与模板渲染的必需参数。临时渲染文件：$TMP"
-fi
-
 dbg "读取 inbound overlay"
 
-INBOUND_PATCH_JSON='{"version":1,"patch":{},"delete_fields":{},"delete_inbounds":[],"clones":{}}'
+INBOUND_PATCH_JSON='{"version":2,"base":{"vless":{"tag":"vless-in"},"hy2":{"tag":"hy2-in"},"socks5":{"tag":"socks5-in"}},"patch":{},"delete_fields":{},"delete_inbounds":[],"clones":{}}'
 
 if [[ -f "$INBOUNDS_FILE" ]]; then
   INBOUND_PATCH_JSON="$(
     jq -c '
+      def valid_tag($tag):
+        ($tag | type) == "string"
+        and ($tag | length) > 0
+        and ($tag | test("^[A-Za-z0-9_.:-]+$"));
+
       if type != "object" then
         error("inbounds.json 必须是 object")
       else
         .
       end
-      | .version = (.version // 1)
+      | .version = (.version // 2)
+      | .base = (.base // {})
+      | .base.vless = (.base.vless // {})
+      | .base.hy2 = (.base.hy2 // {})
+      | .base.socks5 = (.base.socks5 // {})
+      | .base.vless.tag = (.base.vless.tag // "vless-in")
+      | .base.hy2.tag = (.base.hy2.tag // "hy2-in")
+      | .base.socks5.tag = (.base.socks5.tag // "socks5-in")
       | .patch = (.patch // {})
       | .delete_fields = (.delete_fields // {})
       | .delete_inbounds = (.delete_inbounds // [])
       | .clones = (.clones // {})
 
+      | if (.base | type) != "object" then error(".base 必须是 object") else . end
+      | if (valid_tag(.base.vless.tag) | not) then error(".base.vless.tag 非法") else . end
+      | if (valid_tag(.base.hy2.tag) | not) then error(".base.hy2.tag 非法") else . end
+      | if (valid_tag(.base.socks5.tag) | not) then error(".base.socks5.tag 非法") else . end
+      | if ([.base.vless.tag, .base.hy2.tag, .base.socks5.tag] | length) != ([.base.vless.tag, .base.hy2.tag, .base.socks5.tag] | unique | length) then
+          error(".base.*.tag 存在重复")
+        else
+          .
+        end
       | if (.patch | type) != "object" then error(".patch 必须是 object") else . end
       | if (.delete_fields | type) != "object" then error(".delete_fields 必须是 object") else . end
       | if (.delete_inbounds | type) != "array" then error(".delete_inbounds 必须是 array") else . end
@@ -319,6 +335,21 @@ if [[ -f "$INBOUNDS_FILE" ]]; then
         )
     ' "$INBOUNDS_FILE"
   )" || die "$INBOUNDS_FILE 格式错误"
+fi
+
+VLESS_TAG="$(jq -r '.base.vless.tag' <<<"$INBOUND_PATCH_JSON")"
+HY2_TAG="$(jq -r '.base.hy2.tag' <<<"$INBOUND_PATCH_JSON")"
+SOCKS5_TAG="$(jq -r '.base.socks5.tag' <<<"$INBOUND_PATCH_JSON")"
+
+TMP="$(mktemp)"
+TMP2="$(mktemp)"
+
+dbg "envsubst 填标量"
+VARS='${SB_ROOT} ${VLESS_TAG} ${HY2_TAG} ${SOCKS5_TAG} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
+envsubst "$VARS" < "$TPL" > "$TMP"
+
+if ! jq -e '.inbounds | type == "array"' "$TMP" >/dev/null 2>&1; then
+  die "模板经 envsubst 渲染后不是合法 sing-box JSON，或缺 .inbounds[]。请检查 $TPL 以及 node.env 中参与模板渲染的必需参数。临时渲染文件：$TMP"
 fi
 
 dbg "读取自定义 outbounds"

@@ -242,12 +242,12 @@ set_route_default_key() {
     server)
       require_server "$value"
       jq --arg v "$value" '.route_default = (.route_default // {}) | .route_default.server = $v' "$F" | write_json
-      log "OK: route_default.server=$value。跑 sb-apply 生效。"
+      log "OK: route_default.server=${value}。跑 sb-apply 生效。"
       ;;
     strategy)
       validate_strategy "$value"
       jq --arg v "$value" '.route_default = (.route_default // {}) | .route_default.strategy = $v' "$F" | write_json
-      log "OK: route_default.strategy=$value。跑 sb-apply 生效。"
+      log "OK: route_default.strategy=${value}。跑 sb-apply 生效。"
       ;;
     *)
       die "route-default 仅支持 key: server / strategy，收到 '$key'"
@@ -367,7 +367,7 @@ JSON
           .servers[$tag] = $v
         ' "$F" | write_json
 
-        log "OK: DNS server '$tag' 已设置为 type=$type。跑 sb-apply 生效。"
+        log "OK: DNS server '$tag' 已设置为 type=${type}。跑 sb-apply 生效。"
         ;;
 
       show)
@@ -421,7 +421,7 @@ JSON
       *)
         require_server "$sub"
         jq --arg tag "$sub" '.final = $tag' "$F" | write_json
-        log "OK: dns.final=$sub。跑 sb-apply 生效。"
+        log "OK: dns.final=${sub}。跑 sb-apply 生效。"
         ;;
     esac
     ;;
@@ -443,7 +443,7 @@ JSON
       *)
         validate_strategy "$sub"
         jq --arg strategy "$sub" '.strategy = $strategy' "$F" | write_json
-        log "OK: dns.strategy=$sub。跑 sb-apply 生效。"
+        log "OK: dns.strategy=${sub}。跑 sb-apply 生效。"
         ;;
     esac
     ;;

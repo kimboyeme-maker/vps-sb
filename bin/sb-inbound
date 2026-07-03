@@ -4,7 +4,7 @@ set -euo pipefail
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 ENV_FILE="$SB_ROOT/env/node.env"
 PATCH_FILE="$SB_ROOT/env/inbounds.json"
-CONFIG="$SB_ROOT/out/config.json"
+ROUTES_FILE="$SB_ROOT/env/routes.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -18,9 +18,9 @@ summary:
   真正生效由 sb-apply 统一完成。
 
   truth source:
-    - sb-inbound 只把 env/inbounds.json 当作 overlay/intent 存储。
-    - 当前真实存在的 inbound 以 out/config.json 为准。
-    - sb-inbound 不再读取模板、不再 envsubst 模板；模板只属于 sb-apply 编译阶段。
+    - sb-inbound 把 env/inbounds.json 当作 inbound registry + overlay/intent 存储。
+    - tag 合法值只来自 env/inbounds.json。
+    - 未 apply 时，用 env/inbounds.json + node.env 合成受控的最小 inbound 基线；不读取模板。
 
   端口策略:
     INBOUND_PORT_MIN=20000
@@ -68,6 +68,7 @@ examples:
   sb-inbound set vless-in listen_port 40443
   sb-inbound set hy2-in listen_port 40500
   sb-inbound set socks5-in listen_port 40080
+  sb-inbound set vless-in tag edge-vless
 
   sb-inbound set hy2-in up_mbps 80
   sb-inbound set hy2-in down_mbps 300
@@ -101,7 +102,6 @@ value parse:
 blocked keys:
   users
   users.*
-  tag
   type
 
 notes:
@@ -110,6 +110,7 @@ notes:
   - listen_port 低于 INBOUND_PORT_SUGGEST_MIN 会 WARN
   - rm/del 表示最终 config 删除字段
   - reset 表示取消该字段的 overlay 修改；最终是否回到默认由 sb-apply 编译结果决定
+  - set <tag> tag <new-tag> 会重命名 inbound tag，并同步 inbounds.json/node.env/routes.json 引用
   - clone 适合做 vless/hy2 多端口备用 inbound
   - hy2 range 最终 nftables/ufw 由 sb-apply 对账
 U
@@ -190,7 +191,12 @@ ensure_patch() {
   if [[ ! -f "$PATCH_FILE" ]]; then
     cat > "$PATCH_FILE" <<'JSON'
 {
-  "version": 1,
+  "version": 2,
+  "base": {
+    "vless": { "tag": "vless-in" },
+    "hy2": { "tag": "hy2-in" },
+    "socks5": { "tag": "socks5-in" }
+  },
   "patch": {},
   "delete_fields": {},
   "delete_inbounds": [],
@@ -204,16 +210,37 @@ JSON
   tmp="$(mktemp)"
 
   jq '
+    def valid_tag($tag):
+      ($tag | type) == "string"
+      and ($tag | length) > 0
+      and ($tag | test("^[A-Za-z0-9_.:-]+$"));
+
     if type != "object" then
       error("inbounds.json 必须是 object")
     else
       .
     end
-    | .version = (.version // 1)
+    | .version = 2
+    | .base = (.base // {})
+    | .base.vless = (.base.vless // {})
+    | .base.hy2 = (.base.hy2 // {})
+    | .base.socks5 = (.base.socks5 // {})
+    | .base.vless.tag = (.base.vless.tag // "vless-in")
+    | .base.hy2.tag = (.base.hy2.tag // "hy2-in")
+    | .base.socks5.tag = (.base.socks5.tag // "socks5-in")
     | .patch = (.patch // {})
     | .delete_fields = (.delete_fields // {})
     | .delete_inbounds = (.delete_inbounds // [])
     | .clones = (.clones // {})
+    | if (.base | type) != "object" then error(".base 必须是 object") else . end
+    | if (valid_tag(.base.vless.tag) | not) then error(".base.vless.tag 非法") else . end
+    | if (valid_tag(.base.hy2.tag) | not) then error(".base.hy2.tag 非法") else . end
+    | if (valid_tag(.base.socks5.tag) | not) then error(".base.socks5.tag 非法") else . end
+    | if ([.base.vless.tag, .base.hy2.tag, .base.socks5.tag] | length) != ([.base.vless.tag, .base.hy2.tag, .base.socks5.tag] | unique | length) then
+        error(".base.*.tag 存在重复")
+      else
+        .
+      end
     | if (.patch | type) != "object" then error(".patch 必须是 object") else . end
     | if (.delete_fields | type) != "object" then error(".delete_fields 必须是 object") else . end
     | if (.delete_inbounds | type) != "array" then error(".delete_inbounds 必须是 array") else . end
@@ -227,20 +254,68 @@ JSON
   rm -f "$tmp"
 }
 
-ensure_config() {
-  [[ -f "$CONFIG" ]] || die "缺 $CONFIG。sb-inbound 以最终 out/config.json 为 truth source，请先跑 sb-apply 生成当前配置。"
+registry_config() {
+  local vless_tag
+  local hy2_tag
+  local socks5_tag
 
-  jq -e '.inbounds | type == "array"' "$CONFIG" >/dev/null 2>&1 || \
-    die "$CONFIG 不是有效 sing-box config，缺 .inbounds[]"
+  ensure_env
+  ensure_patch
+
+  load_env
+
+  vless_tag="$(jq -r '.base.vless.tag' "$PATCH_FILE")"
+  hy2_tag="$(jq -r '.base.hy2.tag' "$PATCH_FILE")"
+  socks5_tag="$(jq -r '.base.socks5.tag' "$PATCH_FILE")"
+
+  jq -cn \
+    --arg vless_tag "$vless_tag" \
+    --arg hy2_tag "$hy2_tag" \
+    --arg socks5_tag "$socks5_tag" \
+    --arg vless_port "${VLESS_PORT:-}" \
+    --arg hy2_port "${HY2_PORT:-}" \
+    --arg socks5_port "${SOCKS5_PORT:-}" '
+    def port($x):
+      if ($x | test("^[0-9]+$")) then ($x | tonumber) else null end;
+
+    {
+      inbounds: [
+        {type: "vless", tag: $vless_tag, listen_port: port($vless_port)},
+        {type: "hysteria2", tag: $hy2_tag, listen_port: port($hy2_port)},
+        {type: "socks", tag: $socks5_tag, listen_port: port($socks5_port)}
+      ]
+    }
+  '
+}
+
+config_source_label() {
+  echo "registry"
+}
+
+ensure_config() {
+  registry_config | jq -e '.inbounds | type == "array"' >/dev/null 2>&1 || \
+    die "无法从 $PATCH_FILE + $ENV_FILE 合成 inbound 基线"
 }
 
 current_config() {
   ensure_config
-  cat "$CONFIG"
+  registry_config
 }
 
 current_tags_json() {
   current_config | jq -c '[.inbounds[]?.tag | select(. != null and . != "")]'
+}
+
+base_tags_json() {
+  ensure_patch
+  jq -c '
+    [
+      .base.vless.tag?,
+      .base.hy2.tag?,
+      .base.socks5.tag?
+    ]
+    | map(select(. != null and . != ""))
+  ' "$PATCH_FILE"
 }
 
 clone_tags_json() {
@@ -254,19 +329,19 @@ deleted_tags_json() {
 }
 
 known_tags_json() {
-  local base
+  local registry
   local clones
   local deleted
 
-  base="$(current_tags_json)"
+  registry="$(base_tags_json)"
   clones="$(clone_tags_json)"
   deleted="$(deleted_tags_json)"
 
   jq -cn \
-    --argjson base "$base" \
+    --argjson registry "$registry" \
     --argjson clones "$clones" \
     --argjson deleted "$deleted" '
-    ($base + $clones)
+    ($registry + $clones)
     | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
     | map(select(. as $x | ($deleted | index($x) | not)))
   '
@@ -311,7 +386,7 @@ require_current_tag() {
 
   if ! current_tags_json | jq -e --arg t "$tag" 'index($t) != null' >/dev/null; then
     options="$(current_tags_json | jq -r 'join(", ")')"
-    die "clone 来源必须是当前 out/config.json 里真实存在的 inbound: '$tag'；可选值：${options:-<none>}"
+    die "clone 来源必须是当前 inbound 基线里存在的 inbound: '$tag'；可选值：${options:-<none>}"
   fi
 }
 
@@ -341,8 +416,8 @@ validate_key() {
   [[ -n "$key" ]] || die "key 不能为空"
 
   case "$key" in
-    users|users.*|tag|type)
-      die "禁止修改 key: '$key'；users 由 users.json 注入，tag/type 只能通过 clone/delete 管理"
+    users|users.*|type)
+      die "禁止修改 key: '$key'；users 由 users.json 注入，type 只能通过 clone/delete 管理"
       ;;
   esac
 
@@ -365,6 +440,136 @@ write_patch_tmp() {
   local tmp="$1"
   install -m 600 "$tmp" "$PATCH_FILE"
   rm -f "$tmp"
+}
+
+rename_csv_env_key() {
+  local key="$1"
+  local old="$2"
+  local new="$3"
+  local cur
+  local next
+
+  load_env
+  cur="${!key:-}"
+  [[ -n "$cur" ]] || return 0
+
+  next="$(
+    jq -nr --arg cur "$cur" --arg old "$old" --arg new "$new" '
+      $cur
+      | split(",")
+      | map(gsub("^\\s+|\\s+$"; ""))
+      | map(select(length > 0))
+      | map(if . == $old then $new else . end)
+      | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+      | join(",")
+    '
+  )"
+
+  [[ "$next" == "$cur" ]] || set_env "$key" "$next"
+}
+
+rename_route_refs() {
+  local old="$1"
+  local new="$2"
+  local tmp
+
+  [[ -f "$ROUTES_FILE" ]] || return 0
+
+  tmp="$(mktemp)"
+  jq --arg old "$old" --arg new "$new" '
+    if type != "object" then error("routes.json 必须是 object") else . end
+    | .rules = (
+        (.rules // [])
+        | map(
+            if (.inbound? | type) == "array" then
+              .inbound = (
+                .inbound
+                | map(if . == $old then $new else . end)
+                | unique
+              )
+            elif (.inbound? == $old) then
+              .inbound = $new
+            else
+              .
+            end
+          )
+      )
+  ' "$ROUTES_FILE" > "$tmp" || {
+    rm -f "$tmp"
+    die "$ROUTES_FILE 格式错误，无法同步 inbound tag 重命名"
+  }
+
+  install -m 600 "$tmp" "$ROUTES_FILE"
+  rm -f "$tmp"
+}
+
+rename_inbound_tag() {
+  local old="$1"
+  local new="$2"
+  local hy2_range_tag
+  local tmp
+
+  require_tag "$old"
+  require_not_deleted "$old"
+  validate_tag_syntax "$new"
+
+  if [[ "$old" == "$new" ]]; then
+    log "SKIP: inbound tag 未变化：$old"
+    return 0
+  fi
+
+  if tag_exists "$new"; then
+    die "inbound tag '$new' 已存在；不能把 '$old' 重命名为重复 tag"
+  fi
+
+  tmp="$(mktemp)"
+  jq --arg old "$old" --arg new "$new" '
+    def rename_key($obj; $old; $new):
+      if ($obj | has($old)) then
+        ($obj | .[$new] = .[$old] | del(.[$old]))
+      else
+        $obj
+      end;
+
+    .base = (
+      (.base // {})
+      | with_entries(
+          .value = (
+            if ((.value.tag // "") == $old) then
+              (.value | .tag = $new)
+            else
+              .value
+            end
+          )
+        )
+    )
+    | .patch = rename_key((.patch // {}); $old; $new)
+    | .delete_fields = rename_key((.delete_fields // {}); $old; $new)
+    | .delete_inbounds = ((.delete_inbounds // []) | map(if . == $old then $new else . end) | unique)
+    | .clones = rename_key((.clones // {}); $old; $new)
+    | .clones = (
+        .clones
+        | with_entries(
+            .value = (
+              if ((.value.from // "") == $old) then
+                (.value | .from = $new)
+              else
+                .value
+              end
+            )
+          )
+      )
+  ' "$PATCH_FILE" > "$tmp"
+
+  write_patch_tmp "$tmp"
+
+  load_env
+  hy2_range_tag="${HY2_RANGE_TAG:-}"
+  if [[ "$hy2_range_tag" == "$old" ]]; then
+    set_env "HY2_RANGE_TAG" "$new"
+  fi
+  rename_csv_env_key "UPSTREAM_INBOUNDS" "$old" "$new"
+  rename_route_refs "$old" "$new"
 }
 
 current_upstream_inbounds_has() {
@@ -457,11 +662,13 @@ effective_listen_port() {
     return 0
   fi
 
-  current_config | jq -r --arg t "$tag" '
+  port="$(current_config | jq -r --arg t "$tag" '
     .inbounds[]?
     | select(.tag == $t)
     | .listen_port // empty
-  ' | head -n 1
+  ' | head -n 1)"
+
+  echo "$port"
 }
 
 validate_port_policy_values() {
@@ -580,7 +787,7 @@ case "$cmd" in
     ;;
 
   list)
-    echo "current applied inbounds:"
+    echo "base inbounds ($(config_source_label)):"
     current_config | jq -r '
       .inbounds[]?
       | "  " + (.tag // "-")
@@ -652,7 +859,7 @@ case "$cmd" in
     [[ -n "$tag" ]] || fail_usage "缺少 tag，例如: sb-inbound show hy2-in"
     require_tag "$tag"
 
-    echo "current:"
+    echo "source:"
     current_config | jq --arg t "$tag" '
       .inbounds[]?
       | select(.tag == $t)
@@ -686,6 +893,13 @@ case "$cmd" in
 
     require_tag "$tag"
     require_not_deleted "$tag"
+
+    if [[ "$key" == "tag" ]]; then
+      rename_inbound_tag "$tag" "$value"
+      log "OK: 已重命名 inbound '$tag' -> '$value'，并同步 inbounds.json/node.env/routes.json 引用。跑 sb-apply 生效。"
+      exit 0
+    fi
+
     validate_key "$key"
     validate_set_value_by_key "$key" "$value"
 
@@ -708,7 +922,7 @@ case "$cmd" in
     ' "$PATCH_FILE" > "$tmp"
 
     write_patch_tmp "$tmp"
-    log "OK: 已设置 inbound '$tag' $key=$value。跑 sb-apply 生效。"
+    log "OK: 已设置 inbound '$tag' ${key}=${value}。跑 sb-apply 生效。"
     ;;
 
   rm|del)
@@ -772,7 +986,7 @@ case "$cmd" in
     ' "$PATCH_FILE" > "$tmp"
 
     write_patch_tmp "$tmp"
-    log "OK: 已 reset inbound '$tag' 的字段 '$key'，恢复模板默认。跑 sb-apply 生效。"
+    log "OK: 已 reset inbound '$tag' 的字段 '$key'，恢复默认编译结果。跑 sb-apply 生效。"
     ;;
 
   delete)
@@ -782,7 +996,7 @@ case "$cmd" in
     require_tag "$tag"
 
     if current_upstream_inbounds_has "$tag"; then
-      die "$tag 正被 UPSTREAM_INBOUNDS 引用，先执行: sb-outbound inbound rm $tag"
+      die "$tag 正被 UPSTREAM_INBOUNDS 引用，先执行: sb-outbound upstream del-inbounds $tag"
     fi
 
     tmp="$(mktemp)"
