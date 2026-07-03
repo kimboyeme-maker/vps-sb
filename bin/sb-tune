@@ -127,7 +127,7 @@ ask_yn(){
     case "$ans" in
       Y|y|yes|YES|Yes) return 0 ;;
       N|n|no|NO|No) return 1 ;;
-      *) echo "请输入 y 或 n" ;;
+      *) echo "请输入 y 或 n" >&2 ;;
     esac
   done
 }
@@ -200,10 +200,17 @@ profile_values(){
   esac
 }
 
+# 安全地把 profile_values 的输出 eval 进当前作用域；profile 非法时干净退出，不留未定义变量
+load_profile_values(){
+  local p="$1" _pv
+  _pv="$(profile_values "$p")" || exit 1
+  eval "$_pv"
+}
+
 mem_warn(){
   local p="$1" m RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
   m="$(mem_mb)"
-  eval "$(profile_values "$p")"
+  load_profile_values "$p"
   if (( m > 0 && m < 1500 && RMEM > 33554432 )); then
     warn "检测到内存 ${m}MB，profile=$p 的 buffer $((RMEM/1024/1024))MB 高于 1G 小机保守值 32MB。"
     advice "小内存 VPS 建议用 tiny，除非你明确知道 HY2/UDP 需要更大 buffer。"
@@ -516,7 +523,7 @@ singbox_install(){
 write_journald(){
   need_root
   local p="${1:-balanced}" RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
-  eval "$(profile_values "$p")"
+  load_profile_values "$p"
   stage "journald：限制日志占用"
   explain "小盘 VPS 必做。将写 $JOURNALD_FILE，限制 systemd journal 的磁盘和运行时占用。"
   status "profile=$p SystemMaxUse=$JS SystemMaxFileSize=$JF RuntimeMaxUse=$JR"
@@ -535,7 +542,7 @@ EOF2
 write_sysctl(){
   need_root
   local p="${1:-balanced}" RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
-  eval "$(profile_values "$p")"
+  load_profile_values "$p"
   stage "sysctl：写入网络调优"
   explain "将写 $SYSCTL_FILE。它排序在 $SYSCTL_BASE 之后，因此重叠键会以 sb-tune 为准。"
   status "profile=$p RMEM=$RMEM WMEM=$WMEM BACKLOG=$BACKLOG SYN=$SYN NOTSENT=$NOTSENT"
@@ -695,15 +702,22 @@ reboot_needed(){
   fi
 }
 
+# 菜单与提示只写到 stderr；只有最终 profile 名写到 stdout，供 $(...) 干净捕获。
 choose_profile_interactive(){
   local rec ans
   rec="$(recommend_profile)"
-  echo
-  echo "选择 profile："
-  echo "  1) tiny      - 1C/1G 小鸡，32M buffer，最稳"
-  echo "  2) balanced  - 2G-4G 常规 VPS，64M buffer"
-  echo "  3) hy2       - 偏 HY2/UDP，128M buffer；<1.5G 自动降 tiny"
-  read -r -p "请选择 [默认 $rec]: " ans || ans=""
+  {
+    echo
+    echo "选择 profile（各自写入的值）："
+    echo "  1) tiny      1C/1G 小鸡，最稳"
+    echo "               socket buffer RMEM/WMEM=32M；journald 100M/20M/50M"
+    echo "  2) balanced  2G-4G 常规 VPS"
+    echo "               socket buffer=64M；journald 200M/50M/100M"
+    echo "  3) hy2       偏 HY2/UDP 大流量"
+    echo "               socket buffer=128M；journald 300M/80M/150M；<1.5G 内存自动降回 tiny"
+    echo "  三者都写：qdisc=fq + bbr、tcp_fastopen=3、mtu_probing、notsent_lowat、file-max=1000000（详见 plan）"
+  } >&2
+  read -r -p "请选择 [1/2/3，默认 $rec]: " ans || ans=""
   case "$ans" in
     1|tiny) echo tiny ;;
     2|balanced) echo balanced ;;
@@ -778,7 +792,7 @@ bootstrap(){
   reboot_needed
   stage "Bootstrap 完成"
   expect "下一步：如果装了 XanMod 或系统提示 reboot，先重启；然后执行 sb-tune check。"
-  expect "部署工具链继续走：pi genenv upgrade -> pi apply。"
+  expect "部署工具链继续走：pi genenv -> pi apply。"
 }
 
 menu(){
