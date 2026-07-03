@@ -340,6 +340,8 @@ fi
 VLESS_TAG="$(jq -r '.base.vless.tag' <<<"$INBOUND_PATCH_JSON")"
 HY2_TAG="$(jq -r '.base.hy2.tag' <<<"$INBOUND_PATCH_JSON")"
 SOCKS5_TAG="$(jq -r '.base.socks5.tag' <<<"$INBOUND_PATCH_JSON")"
+export VLESS_TAG HY2_TAG SOCKS5_TAG
+dbg "inbound base tags: vless=$VLESS_TAG hy2=$HY2_TAG socks5=$SOCKS5_TAG"
 
 TMP="$(mktemp)"
 TMP2="$(mktemp)"
