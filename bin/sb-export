@@ -32,7 +32,7 @@ summary:
     - 文件名前缀优先 alias；alias 为空再用 account/name；都为空则省略前缀
     - VLESS Reality/Vision 会导出 tls:true / flow / reality-opts
     - HY2 会导出 obfs + obfs-password
-    - HY2 range 会导出到 YAML 的 ports / hop-interval
+    - HY2 range 会导出到 URI 的 mport 以及 YAML 的 ports / hop-interval
     - upstream/direct 是服务端路由结果，只写到节点名和 x-meta，不伪装成客户端协议字段
 
   正确顺序：
@@ -83,7 +83,7 @@ help:
 notes:
   - .sub 是整文件 base64 标准订阅（protocol:// 明文列表整体 base64 编码）
   - 想看明文 URI 用 sb-show txt
-  - HY2 range 仅在 Clash/Mihomo YAML 中输出 ports/hop-interval
+  - HY2 range 在 .sub URI 中输出 mport=<range>，在 Clash/Mihomo YAML 中输出 ports/hop-interval
 U
 }
 
@@ -406,7 +406,8 @@ hy2_uri() {
   local sni="$7"
   local obfs_type="$8"
   local obfs_pass="$9"
-  local outbound="${10}"
+  local ports="${10}"
+  local outbound="${11}"
   local frag
   local q
 
@@ -423,6 +424,10 @@ hy2_uri() {
     if [[ -n "$obfs_pass" ]]; then
       q="${q}&obfs-password=$(urlencode "$obfs_pass")"
     fi
+  fi
+
+  if [[ -n "$ports" ]]; then
+    q="${q}&mport=$(urlencode "$ports")"
   fi
 
   printf 'hysteria2://%s@%s:%s?%s#%s\n' \
@@ -676,11 +681,11 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
         down="$(row_get "$row_json" down)"
         ports="$(hy2_range_ports "$tag" "$port")"
 
-        hy2_uri "$SERVER_IP" "$port" "$hy2_pw" "$disp" "$tag" v4 "$hy2_sni" "$obfs_type" "$obfs_pass" "$outbound" >> "$uris_tmp"
+        hy2_uri "$SERVER_IP" "$port" "$hy2_pw" "$disp" "$tag" v4 "$hy2_sni" "$obfs_type" "$obfs_pass" "$ports" "$outbound" >> "$uris_tmp"
         emit_hy2_yaml "$SERVER_IP" "$port" "$hy2_pw" "$disp" "$tag" v4 "$hy2_sni" "$obfs_type" "$obfs_pass" "$up" "$down" "$ports" "$outbound" >> "$yaml_tmp"
 
         if [[ -n "${SERVER_IP6:-}" ]]; then
-          hy2_uri "$SERVER_IP6" "$port" "$hy2_pw" "$disp" "$tag" v6 "$hy2_sni" "$obfs_type" "$obfs_pass" "$outbound" >> "$uris_tmp"
+          hy2_uri "$SERVER_IP6" "$port" "$hy2_pw" "$disp" "$tag" v6 "$hy2_sni" "$obfs_type" "$obfs_pass" "$ports" "$outbound" >> "$uris_tmp"
           emit_hy2_yaml "$SERVER_IP6" "$port" "$hy2_pw" "$disp" "$tag" v6 "$hy2_sni" "$obfs_type" "$obfs_pass" "$up" "$down" "$ports" "$outbound" >> "$yaml_tmp"
         fi
         ;;

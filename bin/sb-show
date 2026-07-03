@@ -81,8 +81,8 @@ notes:
   - protocol 传错会提示当前可选值
   - 当前可选协议来自 out/config.json 里的 inbounds
   - txt 模式只输出明文 URI 行，不输出标题、注释、分隔符
-  - HY2 range 会在 info/node 输出里显示 ports；txt 仍只输出主监听端口 URI
-  - URI 分享链接仍使用 HY2 主监听端口；Clash YAML 的 ports 由 sb-export 输出
+  - HY2 range 会在 info/node 输出里显示 ports；txt URI 会带 mport=<range>
+  - URI authority 仍保留 HY2 主监听端口作兼容字段；端口跳跃范围由 mport 表达
 U
 }
 
@@ -372,7 +372,10 @@ hy2_uri() {
     fi
   fi
 
-  # 注意：URI 保持主端口，ports 只在 txt/node/YAML 中显示，避免非标准 mport 兼容问题。
+  if [[ -n "$ports" ]]; then
+    q="${q}&mport=$(urlencode "$ports")"
+  fi
+
   printf 'hysteria2://%s@%s:%s?%s#%s\n' \
     "$(urlencode "$pw")" \
     "$(uri_host "$host")" \

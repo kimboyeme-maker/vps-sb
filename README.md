@@ -254,22 +254,6 @@ Debug-only reset of generated runtime state.
 | --- | --- | --- |
 | `pi clear` | Wipe generated runtime state. | `env/`, `certs/`, `out/` |
 
-## Export
-
-`sb-export` reads the final compiled config from `<ROOT>/out/config.json`.
-Always run `pi apply` before exporting.
-
-```bash
-pi export
-pi export all
-pi export vless
-pi export hy2
-pi export socks5
-
-pi export all AI
-pi export vless AI
-```
-
 ## Deployment Examples
 
 `pi inbound` and `pi outbound upstream set inbounds ...` validate inbound tags from `env/inbounds.json`, not from the template or stale compiled config. After `pi genenv`, you can safely edit inbound tags/ports before the first `pi apply`.
@@ -286,6 +270,7 @@ pi genenv
 pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
+# Optional: pi inbound hy2 range <number> enables HY2 port hopping.
 
 pi user add direct daily
 pi user add direct jp-video
@@ -308,6 +293,7 @@ pi genenv
 pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
+# Optional: pi inbound hy2 range <number> enables HY2 port hopping.
 pi user add direct hk
 
 # pi dns enable
@@ -315,10 +301,6 @@ pi user add direct hk
 # pi dns final cloudflare
 # pi dns strategy ipv4_only
 # pi dns route-default set server cloudflare
-
-# Optional HY2 UDP port hopping if your line benefits from it.
-# Also open the whole UDP range in your cloud security group.
-# pi inbound hy2 range 1000
 
 pi apply snapshot
 pi doctor quick
@@ -335,12 +317,11 @@ pi genenv
 pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
+# Optional: pi inbound hy2 range <number> enables HY2 port hopping.
 
 pi user add direct netflix
 pi user add direct openai
 pi user add direct transit      # optional: for JP/HK relay back to this US node
-
-# pi inbound hy2 range 1000     # also open 40000-41000/udp
 
 pi apply snapshot
 pi doctor quick
@@ -359,6 +340,7 @@ pi genenv
 pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
+# Optional: pi inbound hy2 range <number> enables HY2 port hopping.
 
 pi user add direct jp
 pi user add upstream us-ai
@@ -399,6 +381,7 @@ pi genenv
 pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
+# Optional: pi inbound hy2 range <number> enables HY2 port hopping.
 
 pi user add direct hk
 pi user add upstream us-ai
@@ -440,6 +423,7 @@ pi genenv
 pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
+# Optional: pi inbound hy2 range <number> enables HY2 port hopping.
 
 pi user add direct netflix
 pi user add direct openai
@@ -461,8 +445,6 @@ pi outbound upstream set name res
 pi route enable
 pi route add domain-suffix openai.com    direct --user res-ai
 pi route add domain-suffix anthropic.com direct --user res-ai
-
-# pi inbound hy2 range 1000
 
 pi apply snapshot
 pi doctor quick
