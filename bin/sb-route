@@ -3,6 +3,7 @@ set -euo pipefail
 
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 F="$SB_ROOT/env/routes.json"
+USERS_FILE="$SB_ROOT/env/users.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -70,7 +71,7 @@ Action:
   reject
 
 scope（可重复、可混用两种写法）:
-  --user <name|alias>     或  auth_user=<name>
+  --user <account|alias>  或  auth_user=<account|alias>
   --inbound <tag>         或  inbound=<tag>
   不带任何 scope = global 规则（影响所有用户，创建时 WARN）
 
@@ -216,6 +217,47 @@ array_json_from_args() {
   fi
 }
 
+users_text() {
+  if [[ ! -f "$USERS_FILE" ]]; then
+    printf '<missing users.json>'
+    return 0
+  fi
+
+  jq -r '
+    [
+      .[]
+      | ((.name // "") + (if (.alias // "") != "" then "(" + .alias + ")" else "" end))
+    ]
+    | join(", ")
+  ' "$USERS_FILE" 2>/dev/null || printf '<invalid users.json>'
+}
+
+resolve_user_scope() {
+  local key="$1"
+  local found
+
+  [[ -n "$key" ]] || die "user scope 不能为空"
+  [[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，无法解析 --user/account/alias，请先跑 sb-genenv"
+
+  found="$(
+    jq -r --arg k "$key" '
+      [
+        .[]
+        | select((.name // "") == $k or (.alias // "") == $k)
+        | (.name // "")
+      ]
+      | unique
+      | if length == 1 then .[0]
+        elif length == 0 then empty
+        else error("ambiguous user scope")
+        end
+    ' "$USERS_FILE"
+  )" || die "解析 user scope '$key' 失败；可选值：$(users_text)"
+
+  [[ -n "$found" ]] || die "无此用户 scope: '$key'；请使用 pi user list 第一列 account 或 alias。可选值：$(users_text)"
+  printf '%s' "$found"
+}
+
 cmd="${1:-}"
 [[ $# -gt 0 ]] && shift || true
 
@@ -281,7 +323,7 @@ case "$cmd" in
         --user)
           shift
           [[ $# -gt 0 ]] || die "--user 缺参数"
-          users+=("$1")
+          users+=("$(resolve_user_scope "$1")")
           ;;
         --inbound)
           shift
@@ -289,7 +331,7 @@ case "$cmd" in
           inbounds+=("$1")
           ;;
         auth_user=*)
-          users+=("${1#auth_user=}")
+          users+=("$(resolve_user_scope "${1#auth_user=}")")
           ;;
         inbound=*)
           inbounds+=("${1#inbound=}")

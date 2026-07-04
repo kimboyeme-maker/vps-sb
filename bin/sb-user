@@ -11,7 +11,7 @@ usage() { cat >&2 <<U
   sb-user list
   sb-user add  [direct|upstream] [alias]   # 账号(hex4)/密码(hex16)自动生成
   sb-user del  <account|alias>                   # 删用户（别名 rm / remove）
-  sb-user set-egress <account> <direct|upstream>
+  sb-user set-egress <account|alias> <direct|upstream>
 
 egress 含义（决定该用户的出口）:
   direct   = 从本机 SJC 直接出网，对端看到本机美国原生 IP（吃 xTom 三网回程）

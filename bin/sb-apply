@@ -45,7 +45,7 @@ summary:
 
   DNS / route overlay（均默认禁用，enabled=false 时对 config 零改动）：
     - env/outbound-patch.json：{patch:{tag→patchObject}}
-                       由 sb-outbound resolver 编辑；sb-apply 负责 deepmerge 到最终 outbounds，例如 direct.domain_resolver
+                       由 sb-outbound direct 编辑；sb-apply 负责 deepmerge 到最终 outbounds，例如 direct.domain_resolver
     - env/dns.json  ：{enabled, servers{tag→{type,server,path,...}}, rules[], final, strategy, route_default}
                        由 sb-dns 编辑；sb-apply 负责拼装成 config.dns + route.default_domain_resolver
     - env/routes.json：{enabled, position, rules[]}

@@ -21,6 +21,8 @@ usage() {
   sb-outbound add <name> <type> <参数...>
   sb-outbound del <name>
   sb-outbound show <name>
+  sb-outbound set <name> <key> <value>
+  sb-outbound reset <name> <key>
 
   sb-outbound upstream show
   sb-outbound upstream set <key> <value>
@@ -52,6 +54,9 @@ direct key:
   resolver <dns-server-tag> [strategy]
   domain_strategy <strategy>
 
+named outbound key:
+  domain_strategy <strategy>
+
 strategy:
   prefer_ipv4
   prefer_ipv6
@@ -60,6 +65,7 @@ strategy:
 
 例:
   sb-outbound add isp1 socks proxy.example.com 1080 user pass
+  sb-outbound set isp1 domain_strategy ipv4_only
   sb-outbound upstream set name isp1
   sb-outbound upstream set inbounds vless-in,hy2-in
   sb-outbound upstream set domain_strategy ipv4_only
@@ -71,11 +77,10 @@ strategy:
 
   sb-apply
 
-兼容旧命令仍可解析，但新文档请使用 upstream/direct:
-  enable/disable -> upstream set name/enabled
-  inbound        -> upstream set/allow/del-inbounds/clear inbounds
-  domain         -> upstream set domain_strategy
-  resolver       -> direct set/rm resolver
+兼容旧命令仍可解析，但不再推荐：
+  enable / disable / inbound / domain / resolver
+新用法统一使用 upstream/direct，避免把 outbound 的旧 domain/resolver patch
+和当前 upstream/direct patch 混在一起。
 U
   exit 1
 }
@@ -540,6 +545,93 @@ set_outbound_patch_key() {
   esac
 }
 
+set_named_outbound_key() {
+  local name="$1"
+  local key="$2"
+  local value="$3"
+  local tmp
+
+  [[ -n "$name" ]] || die "outbound set 需要 <name> <key> <value>"
+  [[ -n "$key" ]] || die "outbound set $name 需要 <key> <value>"
+  [[ -n "$value" ]] || die "outbound set $name $key 需要 <value>"
+
+  ob_exists "$name" || die "无此 outbound '$name'"
+
+  case "$key" in
+    domain_strategy|strategy)
+      validate_domain_strategy "$value"
+      tmp="$(mktemp)"
+      jq --arg n "$name" --arg ds "$value" '
+        def norm:
+          map(
+            if (has("tag") | not) and has("name") then
+              . + {tag: .name}
+            else
+              .
+            end
+            | del(.name)
+          );
+
+        norm
+        | map(
+            if .tag == $n then
+              . + {domain_strategy: $ds}
+            else
+              .
+            end
+          )
+      ' "$F" > "$tmp"
+      write_json "$tmp"
+      log "OK: 已设置 outbound '$name' domain_strategy=${value}。pi outbound list 最后一列会显示该值；跑 sb-apply 应用。"
+      ;;
+    *)
+      die "outbound set $name 不支持 key '$key'；可选：domain_strategy"
+      ;;
+  esac
+}
+
+reset_named_outbound_key() {
+  local name="$1"
+  local key="$2"
+  local tmp
+
+  [[ -n "$name" ]] || die "outbound reset 需要 <name> <key>"
+  [[ -n "$key" ]] || die "outbound reset $name 需要 <key>"
+
+  ob_exists "$name" || die "无此 outbound '$name'"
+
+  case "$key" in
+    domain_strategy|strategy)
+      tmp="$(mktemp)"
+      jq --arg n "$name" '
+        def norm:
+          map(
+            if (has("tag") | not) and has("name") then
+              . + {tag: .name}
+            else
+              .
+            end
+            | del(.name)
+          );
+
+        norm
+        | map(
+            if .tag == $n then
+              del(.domain_strategy)
+            else
+              .
+            end
+          )
+      ' "$F" > "$tmp"
+      write_json "$tmp"
+      log "OK: 已删除 outbound '$name' 的 domain_strategy。pi outbound list 最后一列会回到 '-'；跑 sb-apply 应用。"
+      ;;
+    *)
+      die "outbound reset $name 不支持 key '$key'；可选：domain_strategy"
+      ;;
+  esac
+}
+
 rm_outbound_patch_key() {
   local tag="$1"
   local key="$2"
@@ -734,6 +826,14 @@ case "$cmd" in
 
     ob_exists "$name" || die "无此 outbound '$name'"
     get_ob "$name" | jq '.'
+    ;;
+
+  set)
+    set_named_outbound_key "${1:-}" "${2:-}" "${3:-}"
+    ;;
+
+  reset)
+    reset_named_outbound_key "${1:-}" "${2:-}"
     ;;
 
   enable)
