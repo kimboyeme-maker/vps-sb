@@ -8,8 +8,33 @@ CONFIG="$SB_ROOT/out/config.json"
 CERT_META_FILE="$SB_ROOT/env/cert.json"
 DNS_FILE="$SB_ROOT/env/dns.json"
 
+# geoip 探测源，按顺序依次尝试；仅在 NODE_COUNTRY 缺失时用作兜底
+GEOIP_SOURCES=(
+  "https://ipapi.co/country/"
+  "http://ip-api.com/line/?fields=countryCode"
+  "https://ifconfig.co/country-iso"
+)
+
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
+
+# 依次尝试 GEOIP_SOURCES 探测本机所在国家二字码（小写），全部失败返回空；无 curl 时静默跳过
+detect_country() {
+  command -v curl >/dev/null 2>&1 || { printf ''; return 0; }
+
+  local src
+  local c
+
+  for src in "${GEOIP_SOURCES[@]}"; do
+    c="$(curl -fsS4 --max-time 6 "$src" 2>/dev/null || true)"
+    if [[ "$c" =~ ^[A-Za-z]{2}$ ]]; then
+      printf '%s' "${c,,}"
+      return 0
+    fi
+  done
+
+  printf ''
+}
 
 summary() {
   cat <<'S'
@@ -186,6 +211,11 @@ if [[ -n "$filter_tag" && "$proto" != "all" ]]; then
 fi
 
 NODE_NAME="${NODE_NAME:-NODE}"
+NODE_COUNTRY="${NODE_COUNTRY:-}"
+if [[ -z "$NODE_COUNTRY" ]]; then
+  NODE_COUNTRY="$(detect_country)"
+  [[ -z "$NODE_COUNTRY" ]] && NODE_COUNTRY="unknown"
+fi
 SERVER_IP="${SERVER_IP:-}"
 SERVER_IP6="${SERVER_IP6:-}"
 REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
@@ -212,6 +242,54 @@ addr_list() {
   [[ -n "${SERVER_IP6:-}" ]] && printf '%s\t%s\n' "$SERVER_IP6" "v6"
   [[ -n "$MANAGED_DOMAIN" ]] && printf '%s\t%s\n' "$MANAGED_DOMAIN" "domain"
   return 0
+}
+
+# 本次输出范围内，各协议出现的 inbound 数量（用于判断节点名用协议名还是 tag 消歧）
+PROTO_COUNTS_JSON="$(
+  jq -r --arg proto "$proto" --arg tag "$filter_tag" '
+    def protocol:
+      if .type == "vless" then "vless"
+      elif .type == "hysteria2" then "hy2"
+      elif .type == "socks" then "socks5"
+      else empty end;
+    [
+      .inbounds[]? | protocol as $p
+      | select($p != "")
+      | select($proto == "all" or $proto == $p)
+      | select($tag == "" or (.tag // "") == $tag)
+      | $p
+    ] | group_by(.) | map({key: .[0], value: length}) | from_entries
+  ' "$CONFIG"
+)"
+
+# 同协议只有一个 inbound 时用协议名，出现多个 inbound 时改用 tag 消歧
+tag_or_type_label() {
+  local proto_key="$1"
+  local tag="$2"
+  local count
+  count="$(jq -r --arg p "$proto_key" '.[$p] // 0' <<<"$PROTO_COUNTS_JSON")"
+  if [[ "$count" -gt 1 ]]; then
+    printf '%s' "$tag"
+  else
+    printf '%s' "$proto_key"
+  fi
+}
+
+# 无域名：v4 裸名，v6 加 -v6；有域名：域名裸名，v4/v6 都加后缀
+addr_suffix() {
+  local addr_label="$1"
+  if [[ -z "$MANAGED_DOMAIN" ]]; then
+    case "$addr_label" in
+      v6) printf -- '-v6' ;;
+      *) printf '' ;;
+    esac
+  else
+    case "$addr_label" in
+      v4) printf -- '-v4' ;;
+      v6) printf -- '-v6' ;;
+      *) printf '' ;;
+    esac
+  fi
 }
 
 [[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
@@ -360,33 +438,23 @@ user_rows() {
   ' "$USERS_FILE"
 }
 
-node_name() {
-  local disp="$1"
-  local tag="$2"
-  local label="$3"
-  local ipver="$4"
-  printf '%s-%s-%s-%s-%s' "$NODE_NAME" "$disp" "$tag" "$label" "$ipver"
-}
-
 vless_uri() {
   local host="$1"
   local port="$2"
   local uuid="$3"
-  local disp="$4"
-  local tag="$5"
-  local ipver="$6"
-  local sni="$7"
-  local short_id="$8"
+  local name="$4"
+  local sni="$5"
+  local short_id="$6"
   local frag
   local q
 
-  [[ -n "$port" && "$port" != "null" ]] || die "vless inbound '$tag' 缺 listen_port"
-  [[ -n "$uuid" ]] || die "vless 用户 '$disp' 缺 uuid"
+  [[ -n "$port" && "$port" != "null" ]] || die "vless inbound 缺 listen_port"
+  [[ -n "$uuid" ]] || die "vless 用户缺 uuid"
 
   [[ -z "$sni" ]] && sni="$REALITY_SNI"
   [[ -z "$short_id" ]] && short_id="$REALITY_SHORT_ID"
 
-  frag="$(urlencode "$(node_name "$disp" "$tag" "Reality" "$ipver")")"
+  frag="$(urlencode "$name")"
   q="encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(urlencode "$sni")&fp=$(urlencode "$REALITY_FINGERPRINT")&pbk=$(urlencode "$REALITY_PUBLIC_KEY")&sid=$(urlencode "$short_id")&type=tcp"
 
   printf 'vless://%s@%s:%s?%s#%s\n' \
@@ -401,25 +469,24 @@ hy2_uri() {
   local host="$1"
   local port="$2"
   local pw="$3"
-  local disp="$4"
-  local tag="$5"
-  local ipver="$6"
-  local sni="$7"
-  local obfs_type="$8"
-  local obfs_pass="$9"
-  local ports="${10}"
+  local name="$4"
+  local addr_label="$5"
+  local sni="$6"
+  local obfs_type="$7"
+  local obfs_pass="$8"
+  local ports="$9"
   local frag
   local q
 
-  [[ -n "$port" && "$port" != "null" ]] || die "hy2 inbound '$tag' 缺 listen_port"
-  [[ -n "$pw" ]] || die "hy2 用户 '$disp' 缺 password"
+  [[ -n "$port" && "$port" != "null" ]] || die "hy2 inbound 缺 listen_port"
+  [[ -n "$pw" ]] || die "hy2 用户缺 password"
 
   [[ -z "$sni" ]] && sni="$HY2_SNI"
 
   local insecure=1
-  [[ "$ipver" == "domain" ]] && insecure=0
+  [[ "$addr_label" == "domain" ]] && insecure=0
 
-  frag="$(urlencode "$(node_name "$disp" "$tag" "Hy2" "$ipver")")"
+  frag="$(urlencode "$name")"
   q="sni=$(urlencode "$sni")&insecure=${insecure}&alpn=h3"
 
   if [[ -n "$obfs_type" && "$obfs_type" != "plain" && "$obfs_type" != "none" ]]; then
@@ -447,16 +514,14 @@ socks5_uri() {
   local port="$2"
   local user="$3"
   local pw="$4"
-  local disp="$5"
-  local tag="$6"
-  local ipver="$7"
+  local name="$5"
   local frag
 
-  [[ -n "$port" && "$port" != "null" ]] || die "socks inbound '$tag' 缺 listen_port"
+  [[ -n "$port" && "$port" != "null" ]] || die "socks inbound 缺 listen_port"
   [[ -n "$user" ]] || die "socks 用户名为空"
   [[ -n "$pw" ]] || die "socks 用户 '$user' 缺 password"
 
-  frag="$(urlencode "$(node_name "$disp" "$tag" "Socks5" "$ipver")")"
+  frag="$(urlencode "$name")"
 
   printf 'socks5://%s:%s@%s:%s#%s\n' \
     "$(urlencode "$user")" \
@@ -499,18 +564,21 @@ case "$mode" in
           *) continue ;;
         esac
 
+        proto_label="$(tag_or_type_label "$p" "$tag")"
+
         echo "# ── ${disp} · ${p} · ${tag} ──"
-        while IFS=$'\t' read -r host label; do
+        while IFS=$'\t' read -r host addr_label; do
           [[ -n "$host" ]] || continue
+          nodename="${NODE_COUNTRY}-${proto_label}$(addr_suffix "$addr_label")"
           case "$p" in
             vless)
-              vless_uri "$host" "$port" "$uuid" "$disp" "$tag" "$label" "$sni" "$short_id"
+              vless_uri "$host" "$port" "$uuid" "$nodename" "$sni" "$short_id"
               ;;
             hy2)
-              hy2_uri "$host" "$port" "$pw" "$disp" "$tag" "$label" "$sni" "$obfs_type" "$obfs_pass" "$ports"
+              hy2_uri "$host" "$port" "$pw" "$nodename" "$addr_label" "$sni" "$obfs_type" "$obfs_pass" "$ports"
               ;;
             socks5)
-              socks5_uri "$host" "$port" "$name" "$pw" "$disp" "$tag" "$label"
+              socks5_uri "$host" "$port" "$name" "$pw" "$nodename"
               ;;
           esac
         done < <(addr_list)

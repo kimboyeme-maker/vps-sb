@@ -3,6 +3,7 @@ set -euo pipefail
 
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 F="$SB_ROOT/env/dns.json"
+ENV_FILE="$SB_ROOT/env/node.env"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -66,6 +67,10 @@ usage:
   sb-dns strategy off|clear|del|rm
   sb-dns strategy show
 
+  sb-dns country <code>
+  sb-dns country off|clear|del|rm
+  sb-dns country show
+
   sb-dns route-default show
   sb-dns route-default set <key> <value>
   sb-dns route-default rm|del <key> [value]
@@ -103,6 +108,8 @@ notes:
   - sb-apply 会把它编译成最终 config.route.default_domain_resolver
   - enable/server/final/strategy/route-default 改完跑 sb-apply 生效
   - domain 只是域名登记，供证书/后续规则使用，单独修改不需要 sb-apply
+  - country 写 env/node.env 的 NODE_COUNTRY，仅用于订阅节点命名（<country>-<proto>），
+    genenv 已自动 geoip 探测，这里只是手动覆盖；不需要 sb-apply
 U
 }
 
@@ -146,6 +153,34 @@ write_json() {
   cat > "$tmp"
   jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "内部错误：生成了非法 JSON"; }
   install -m 600 "$tmp" "$F"
+  rm -f "$tmp"
+}
+
+set_node_env() {
+  local key="$1"
+  local value="$2"
+  local qvalue
+  local tmp
+
+  [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
+
+  qvalue="$(printf '%q' "$value")"
+  tmp="$(mktemp)"
+
+  awk -v k="$key" -v v="$qvalue" '
+    BEGIN { done=0 }
+    $0 ~ "^" k "=" {
+      print k "=" v
+      done=1
+      next
+    }
+    { print }
+    END {
+      if (!done) print k "=" v
+    }
+  ' "$ENV_FILE" > "$tmp"
+
+  install -m 600 "$tmp" "$ENV_FILE"
   rm -f "$tmp"
 }
 
@@ -546,6 +581,29 @@ JSON
         validate_strategy "$sub"
         jq --arg strategy "$sub" '.strategy = $strategy' "$F" | write_json
         log "OK: dns.strategy=${sub}。跑 sb-apply 生效。"
+        ;;
+    esac
+    ;;
+
+  country)
+    sub="${1:-}"
+    case "$sub" in
+      "")
+        usage >&2
+        die "country 需要 <code> 或 off/show"
+        ;;
+      show)
+        [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
+        grep '^NODE_COUNTRY=' "$ENV_FILE" || echo "NODE_COUNTRY=unknown"
+        ;;
+      off|clear|del|rm|delete|none)
+        set_node_env "NODE_COUNTRY" "unknown"
+        log "OK: NODE_COUNTRY 已重置为 unknown"
+        ;;
+      *)
+        [[ "$sub" =~ ^[A-Za-z]{2}$ ]] || die "country 必须是 2 位字母国家码，如 jp/us/hk，收到 '$sub'"
+        set_node_env "NODE_COUNTRY" "${sub,,}"
+        log "OK: NODE_COUNTRY=${sub,,}"
         ;;
     esac
     ;;

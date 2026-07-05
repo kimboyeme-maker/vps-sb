@@ -77,6 +77,15 @@ Required interactive VPS preparation and tuning: dependencies, certbot/certifica
 
 Initialize or upgrade local env files: `node.env`, `users.json`, `inbounds.json`, Hy2 certs, symlink, and `.gitignore`.
 
+`genenv` also fills `NODE_COUNTRY` (used for subscription node naming) by
+trying a chain of geoip lookups against the server's own egress IP; if all
+sources fail it falls back to `unknown`. It never overwrites an existing
+`NODE_COUNTRY` value — use `pi dns country <code>` to set or correct it
+manually. `pi show`/`pi export` also retry the same geoip lookup on the fly
+whenever `NODE_COUNTRY` is missing entirely (e.g. `env/node.env` predates
+this feature); once genenv or `pi dns country` has written a value —
+including `unknown` — it's trusted as-is and never re-queried.
+
 | Command | Description | Affects |
 | --- | --- | --- |
 | `pi genenv` | Create missing env/cert files and defaults. | `env/`, `certs/`, symlink, `.gitignore` |
@@ -179,6 +188,12 @@ Optional server-side egress DNS policy. Default is disabled and no built-in DoH 
 | `pi dns route-default set strategy ipv4_only` | Set route default resolver strategy. | `env/dns.json` |
 | `pi dns route-default rm server` | Remove route default server. | `env/dns.json` |
 | `pi dns route-default off` | Clear route default resolver object. | `env/dns.json` |
+| `pi dns country jp` | Set `NODE_COUNTRY` used for subscription node naming. | `env/node.env` |
+| `pi dns country show` | Show current `NODE_COUNTRY`. | Read-only |
+| `pi dns country off` | Reset `NODE_COUNTRY` to `unknown`. | `env/node.env` |
+
+`pi dns country` writes `env/node.env` directly (not `env/dns.json`); no
+`pi apply` needed, it only affects `pi show`/`pi export` node naming.
 
 ### `pi route`
 
@@ -220,9 +235,20 @@ When `env/cert.json` or `env/dns.json.domains` records a managed domain,
 to `pi show node ...` and includes the same `domain` field.
 
 Every node is also emitted with a `domain`-addressed variant alongside the
-`v4`/`v6` IP variants (node name suffix `-domain`), so subscriptions carry
-`server: <domain>` entries in addition to the IP ones. With no managed domain
-present, only the IP variants are produced.
+`v4`/`v6` IP variants, so subscriptions carry `server: <domain>` entries in
+addition to the IP ones. With no managed domain present, only the IP variants
+are produced. Hysteria2 domain nodes use the real issued certificate, so they
+get strict TLS verification (`insecure=0` / `skip-cert-verify: false`); the
+IP nodes keep `insecure=1` since certificate SANs don't cover raw IPs.
+
+Node names follow `<NODE_COUNTRY>-<proto-or-tag>[-v4|-v6]`, e.g. `jp-vless`,
+`jp-vless-v4`/`jp-vless-v6`/`jp-vless` (bare = domain) when a domain exists.
+If a protocol has more than one inbound (e.g. `hy2-in` and `hy2-alt`), the
+inbound tag replaces the protocol name to disambiguate: `jp-hy2-in`,
+`jp-hy2-alt`. When a user's traffic is routed through a named upstream
+outbound instead of `direct`, the outbound name is inserted: `jp-us-vless`.
+`NODE_COUNTRY` is set in `env/node.env`; see `pi genenv` and `pi dns country`
+below.
 
 | Command | Description | Affects |
 | --- | --- | --- |
@@ -246,8 +272,11 @@ object and each node. HY2 `sni` comes from the compiled inbound
 when no explicit SNI is set.
 
 `pi show txt` groups links under a `# ── <user> · <proto> · <tag> ──` section
-header, and — when a managed domain exists — emits a third `-domain` link per
-inbound (address = domain) next to the `-v4`/`-v6` links.
+header, and — when a managed domain exists — emits a third domain-addressed
+link per inbound next to the `v4`/`v6` ones. Node naming follows the same
+`<NODE_COUNTRY>-<proto-or-tag>[-v4|-v6]` scheme described under `pi export`
+above (`pi show` has no per-user outbound routing, so it never adds an
+upstream/ISP name segment).
 
 | Command | Description | Affects |
 | --- | --- | --- |
