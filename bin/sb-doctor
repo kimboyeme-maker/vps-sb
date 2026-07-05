@@ -5,6 +5,7 @@ ENV_FILE="$SB_ROOT/env/node.env"
 CONFIG="$SB_ROOT/out/config.json"
 CERT_META_FILE="$SB_ROOT/env/cert.json"
 CERT_DIR="$SB_ROOT/certs"
+CERT_RENEW_DEPLOY_HOOK=/etc/letsencrypt/renewal-hooks/deploy/sb-singbox-reload.sh
 log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 ok(){ printf 'OK   %s\n' "$*"; }
 warn(){ printf 'WARN %s\n' "$*"; }
@@ -36,9 +37,23 @@ section(){ echo; echo "== $1 =="; }
 service_check(){ section service; if has systemctl; then systemctl is-active --quiet sing-box && ok "sing-box active" || warn "sing-box not active"; systemctl status sing-box --no-pager 2>/dev/null | head -20 || true; else warn "no systemctl"; fi; [[ -L /etc/sing-box/config.json ]] && ok "/etc/sing-box/config.json is symlink" || warn "/etc/sing-box/config.json not symlink"; [[ -f "$CONFIG" ]] && ok "$CONFIG exists" || fail "$CONFIG missing"; if has sing-box && [[ -f "$CONFIG" ]]; then sing-box check -c "$CONFIG" >/tmp/sb-doctor-check.log 2>&1 && ok "sing-box check passed" || { fail "sing-box check failed"; tail -40 /tmp/sb-doctor-check.log; }; fi; }
 ports_check(){ section ports; if [[ -f "$CONFIG" ]] && has jq; then jq -r '.inbounds[]? | "\(.tag)\t\(.type)\t\(.listen // "-"):\(.listen_port // "-")"' "$CONFIG"; fi; if has ss; then ss -tunlp | grep -E 'sing-box|:40443|:40500|:40080' || warn "ss 未看到常见端口或 sing-box"; else warn "no ss"; fi; }
 firewall_check(){ section firewall; has ufw && ufw status verbose || warn "no ufw"; }
+cert_days_left(){
+  local cert="$1"
+  local end
+  local end_epoch
+  local now
+
+  has openssl || return 0
+  end="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true)"
+  [[ -n "$end" ]] || return 0
+  end_epoch="$(date -d "$end" +%s 2>/dev/null || true)"
+  [[ -n "$end_epoch" ]] || return 0
+  now="$(date +%s)"
+  echo $(( (end_epoch - now) / 86400 ))
+}
 cert_check(){
   section cert
-  local domain fullchain privkey
+  local domain email fullchain privkey live_cert cert_fp live_fp days_left
 
   if has certbot; then
     ok "certbot: $(command -v certbot)"
@@ -58,15 +73,39 @@ cert_check(){
     warn "no certbot renewal timer/cron found"
   fi
 
+  if [[ -x "$CERT_RENEW_DEPLOY_HOOK" ]]; then
+    ok "certbot deploy hook exists: $CERT_RENEW_DEPLOY_HOOK"
+  else
+    warn "certbot deploy hook missing: $CERT_RENEW_DEPLOY_HOOK"
+    echo "建议: 运行 pi tune cert 重新安装 deploy hook，续期后才会自动 reload sing-box。"
+  fi
+
+  if has ufw; then
+    if ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW'; then
+      ok "ufw keeps 80/tcp for HTTP-01 renewal"
+    else
+      warn "ufw may not allow 80/tcp; HTTP-01 issue/renew can fail"
+      echo "建议: pi apply 会在 env/cert.json 存在或 dns domains 非空时保留 80/tcp；也可手动 ufw allow 80/tcp。"
+    fi
+  fi
+
   if [[ -f "$CERT_META_FILE" ]] && has jq; then
     jq '.' "$CERT_META_FILE"
     domain="$(jq -r '.domain // ""' "$CERT_META_FILE" 2>/dev/null || true)"
+    email="$(jq -r '.email // ""' "$CERT_META_FILE" 2>/dev/null || true)"
   elif [[ -f "$CERT_META_FILE" ]]; then
     cat "$CERT_META_FILE"
     domain=""
+    email=""
   else
     warn "cert meta missing: $CERT_META_FILE"
     domain=""
+    email=""
+  fi
+
+  if [[ -n "$email" ]]; then
+    ok "certbot account email recorded: $email"
+    echo "说明: Let's Encrypt 会向该邮箱发送证书过期/续期失败相关通知。"
   fi
 
   fullchain="$CERT_DIR/cert.pem"
@@ -75,6 +114,18 @@ cert_check(){
   if [[ -e "$fullchain" ]]; then
     [[ -L "$fullchain" ]] && ok "$fullchain -> $(readlink "$fullchain")" || warn "$fullchain exists but is not symlink"
     openssl x509 -in "$fullchain" -noout -subject -issuer -dates 2>/dev/null || warn "cannot parse $fullchain"
+    if has openssl; then
+      cert_fp="$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)"
+      [[ -n "$cert_fp" ]] && echo "cert sha256 fingerprint: $cert_fp"
+      days_left="$(cert_days_left "$fullchain")"
+      if [[ -n "$days_left" ]]; then
+        if (( days_left < 15 )); then
+          warn "certificate expires in ${days_left} days"
+        else
+          ok "certificate expires in ${days_left} days"
+        fi
+      fi
+    fi
   else
     warn "$fullchain missing"
   fi
@@ -85,9 +136,16 @@ cert_check(){
     warn "$privkey missing"
   fi
 
-  if [[ -n "$domain" && -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]]; then
+  live_cert="/etc/letsencrypt/live/$domain/fullchain.pem"
+  if [[ -n "$domain" && -f "$live_cert" ]]; then
     ok "letsencrypt live cert exists for $domain"
-    openssl x509 -in "/etc/letsencrypt/live/$domain/fullchain.pem" -noout -subject -issuer -dates 2>/dev/null || true
+    openssl x509 -in "$live_cert" -noout -subject -issuer -dates 2>/dev/null || true
+    if has openssl && [[ -e "$fullchain" ]]; then
+      live_fp="$(openssl x509 -in "$live_cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)"
+      if [[ -n "${cert_fp:-}" && -n "$live_fp" ]]; then
+        [[ "$cert_fp" == "$live_fp" ]] && ok "toolkit cert symlink matches live cert" || warn "toolkit cert differs from live cert; relink with pi tune cert"
+      fi
+    fi
   elif [[ -n "$domain" ]]; then
     warn "letsencrypt live cert missing for $domain"
   fi
@@ -96,10 +154,26 @@ cert_check(){
     echo "configured TLS certificate paths:"
     jq -r '
       .inbounds[]?
-      | select((.tls.certificate_path? // "") != "" or (.tls.key_path? // "") != "")
-      | "\(.tag // "-")\tcert=\(.tls.certificate_path // "-")\tkey=\(.tls.key_path // "-")"
+      | select((.tls.certificate_path? // "") != "" or (.tls.key_path? // "") != "" or (.tls.server_name? // "") != "")
+      | "\(.tag // "-")\ttype=\(.type // "-")\tsni=\(.tls.server_name // "-")\tcert=\(.tls.certificate_path // "-")\tkey=\(.tls.key_path // "-")"
     ' "$CONFIG" || true
+
+    if [[ -n "$domain" ]]; then
+      if jq -e --arg d "$domain" '
+        any(.inbounds[]?; .type == "hysteria2" and ((.tls.server_name // "") == $d))
+      ' "$CONFIG" >/dev/null; then
+        ok "HY2 tls.server_name matches cert domain: $domain"
+      else
+        warn "HY2 tls.server_name does not match cert domain: $domain"
+        echo "建议: pi inbound set hy2 tls.server_name $domain && pi apply && pi export"
+      fi
+    fi
   fi
+
+  echo "客户端建议:"
+  echo "  - 同域名续期成功：通常不需要修改客户端订阅。"
+  echo "  - 域名/SNI 变化：重新执行 pi apply && pi export，并更新 HY2 订阅。"
+  echo "  - VLESS Reality 的 public_key/short_id 与 TLS 证书无关；除非重新生成 Reality 密钥，否则不应变化。"
 }
 nft_check(){ section nft; if has nft; then nft list table inet sb_hy2_range 2>/dev/null || warn "no nft table inet sb_hy2_range"; else warn "no nft"; fi; }
 dns_check(){ section dns; if has sb-dns; then sb-dns status || true; fi; [[ -f "$CONFIG" ]] && has jq && jq '.dns // "<no dns block>", .route.default_domain_resolver? // "<no route.default_domain_resolver>"' "$CONFIG" || true; if has resolvectl; then resolvectl dns 2>/dev/null || true; fi; cat /etc/resolv.conf 2>/dev/null | sed -n '1,8p' || true; }
