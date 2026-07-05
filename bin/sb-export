@@ -7,6 +7,8 @@ SUB_DIR="$OUT_DIR/sub"
 ENV_FILE="$SB_ROOT/env/node.env"
 USERS_FILE="$SB_ROOT/env/users.json"
 CONFIG="$SB_ROOT/out/config.json"
+CERT_META_FILE="$SB_ROOT/env/cert.json"
+DNS_FILE="$SB_ROOT/env/dns.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -156,6 +158,14 @@ HY2_RANGE_OFFSET="${HY2_RANGE_OFFSET:-}"
 HY2_RANGE_HOP_INTERVAL="${HY2_RANGE_HOP_INTERVAL:-30}"
 UPSTREAM_ENABLED="${UPSTREAM_ENABLED:-0}"
 UPSTREAM_NAME="${UPSTREAM_NAME:-}"
+MANAGED_DOMAIN=""
+
+if [[ -f "$CERT_META_FILE" ]]; then
+  MANAGED_DOMAIN="$(jq -r '(.domain // "") | tostring | ascii_downcase' "$CERT_META_FILE" 2>/dev/null || true)"
+fi
+if [[ -z "$MANAGED_DOMAIN" && -f "$DNS_FILE" ]]; then
+  MANAGED_DOMAIN="$(jq -r '(.domains // [])[0] // "" | tostring | ascii_downcase' "$DNS_FILE" 2>/dev/null || true)"
+fi
 
 [[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY_PUBLIC_KEY 为空，请检查 $ENV_FILE"
@@ -712,6 +722,7 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
     echo "  protocol-filter: $(yaml_q "$proto")"
     echo "  inbound-tag-filter: $(yaml_q "${filter_tag:-}")"
     echo "  node: $(yaml_q "$NODE_NAME")"
+    echo "  domain: $(yaml_q "${MANAGED_DOMAIN:-}")"
     echo "  user: $(yaml_q "$name")"
     echo "  alias: $(yaml_q "${alias:-}")"
     echo "  user-egress: $(yaml_q "${egress:-direct}")"

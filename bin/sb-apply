@@ -453,6 +453,11 @@ if [[ -f "$DNS_FILE" ]]; then
   ' "$DNS_FILE")" || die "$DNS_FILE 格式错误"
 fi
 
+CERT_DOMAIN=""
+if [[ -f "$CERT_META_FILE" ]]; then
+  CERT_DOMAIN="$(jq -r '(.domain // "") | tostring | ascii_downcase' "$CERT_META_FILE" 2>/dev/null || true)"
+fi
+
 ROUTES_JSON='{"enabled":false,"rules":[]}'
 if [[ -f "$SB_ROOT/env/routes.json" ]]; then
   ROUTES_JSON="$(jq -c '
@@ -481,7 +486,15 @@ jq \
   --arg up_ds "${UPSTREAM_DOMAIN_STRATEGY:-}" \
   --arg up_inbounds "${UPSTREAM_INBOUNDS:-}" \
   --arg hy2_obfs "${HY2_OBFS:-salamander}" \
-  --arg hy2_obfs_pass "${HY2_OBFS_PASS:-}" '
+  --arg hy2_obfs_pass "${HY2_OBFS_PASS:-}" \
+  --arg cert_domain "$CERT_DOMAIN" '
+  def set_hy2_cert_domain($domain):
+    if (.type == "hysteria2") and ($domain != "") and ((.tls.server_name // "") == "") then
+      .tls = ((.tls // {}) + {server_name: $domain})
+    else
+      .
+    end;
+
   def csv_tags($s):
     $s
     | split(",")
@@ -660,6 +673,8 @@ jq \
         .
       end
     )
+
+  | .inbounds |= map(set_hy2_cert_domain($cert_domain))
 
   | reduce (($inbound_patch.patch // {}) | to_entries[]) as $p (.;
       if (.inbounds | any(.tag == $p.key)) then

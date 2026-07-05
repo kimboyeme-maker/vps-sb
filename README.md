@@ -214,6 +214,10 @@ If `env/cert.json` exists or `env/dns.json.domains` is non-empty, `pi apply` kee
 
 Export subscriptions from compiled `out/config.json`. Run `pi apply` first.
 
+When `env/cert.json` or `env/dns.json.domains` records a managed domain,
+`pi export` writes it to YAML `x-meta.domain`; `pi export node ...` delegates
+to `pi show node ...` and includes the same `domain` field.
+
 | Command | Description | Affects |
 | --- | --- | --- |
 | `pi export` | Export all protocols for all users. | `out/sub/` |
@@ -229,6 +233,11 @@ Export subscriptions from compiled `out/config.json`. Run `pi apply` first.
 ### `pi show`
 
 Print share links or JSON node objects from compiled config.
+
+When a managed domain exists, `pi show node ...` includes `domain` on the user
+object and each node. HY2 `sni` comes from the compiled inbound
+`tls.server_name`, with the managed certificate domain filled by `pi apply`
+when no explicit SNI is set.
 
 | Command | Description | Affects |
 | --- | --- | --- |

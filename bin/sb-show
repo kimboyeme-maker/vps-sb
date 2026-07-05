@@ -5,6 +5,8 @@ export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 ENV_FILE="$SB_ROOT/env/node.env"
 USERS_FILE="$SB_ROOT/env/users.json"
 CONFIG="$SB_ROOT/out/config.json"
+CERT_META_FILE="$SB_ROOT/env/cert.json"
+DNS_FILE="$SB_ROOT/env/dns.json"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -195,6 +197,14 @@ HY2_RANGE_ENABLED="${HY2_RANGE_ENABLED:-0}"
 HY2_RANGE_TAG="${HY2_RANGE_TAG:-}"
 HY2_RANGE_OFFSET="${HY2_RANGE_OFFSET:-}"
 HY2_RANGE_HOP_INTERVAL="${HY2_RANGE_HOP_INTERVAL:-30}"
+MANAGED_DOMAIN=""
+
+if [[ -f "$CERT_META_FILE" ]]; then
+  MANAGED_DOMAIN="$(jq -r '(.domain // "") | tostring | ascii_downcase' "$CERT_META_FILE" 2>/dev/null || true)"
+fi
+if [[ -z "$MANAGED_DOMAIN" && -f "$DNS_FILE" ]]; then
+  MANAGED_DOMAIN="$(jq -r '(.domains // [])[0] // "" | tostring | ascii_downcase' "$DNS_FILE" 2>/dev/null || true)"
+fi
 
 [[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY_PUBLIC_KEY 为空，请检查 $ENV_FILE"
@@ -499,6 +509,7 @@ case "$mode" in
 
   info)
     echo "Server v4: ${SERVER_IP}  v6: ${SERVER_IP6:-<none>}"
+    echo "Domain: ${MANAGED_DOMAIN:-<none>}"
     echo "Protocols: ${AVAIL_PROTO_TEXT}"
     echo "HY2 range: enabled=${HY2_RANGE_ENABLED:-0} tag=${HY2_RANGE_TAG:-<none>} offset=${HY2_RANGE_OFFSET:-<none>} hop=${HY2_RANGE_HOP_INTERVAL}"
     echo
@@ -587,12 +598,16 @@ case "$mode" in
       --arg sid "$REALITY_SHORT_ID" \
       --arg default_rsni "$REALITY_SNI" \
       --arg default_hy2_sni "$HY2_SNI" \
+      --arg domain "$MANAGED_DOMAIN" \
       --slurpfile inb "$INB_TMP" '
+      def domain_field:
+        if $domain == "" then {} else {domain: $domain} end;
+
       [
         .[]
         | select($filter == "" or (.name // "") == $filter or (.alias // "") == $filter)
         | . as $u
-        | {
+        | ({
             name: ($u.name // ""),
             alias: ($u.alias // ""),
             egress: ($u.egress // "direct"),
@@ -601,7 +616,7 @@ case "$mode" in
             nodes: [
               $inb[0][]
               | if .protocol == "vless" then
-                  {
+                  ({
                     protocol: "vless",
                     tag,
                     type: "vless",
@@ -613,9 +628,9 @@ case "$mode" in
                     sni: (if .sni == "" then $default_rsni else .sni end),
                     pbk: $pbk,
                     sid: (if .reality_short_id == "" then $sid else .reality_short_id end)
-                  }
+                  } + domain_field)
                 elif .protocol == "hy2" then
-                  {
+                  ({
                     protocol: "hy2",
                     tag,
                     type: "hysteria2",
@@ -635,9 +650,9 @@ case "$mode" in
                     ),
                     up_mbps,
                     down_mbps
-                  }
+                  } + domain_field)
                 elif .protocol == "socks5" then
-                  {
+                  ({
                     protocol: "socks5",
                     tag,
                     type: "socks5",
@@ -646,12 +661,12 @@ case "$mode" in
                     port,
                     username: $u.name,
                     password: $u.password
-                  }
+                  } + domain_field)
                 else
                   empty
                 end
             ]
-          }
+          } + domain_field)
       ]
     ' "$USERS_FILE"
     ;;
