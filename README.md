@@ -43,18 +43,22 @@ Unified entry point. `pi <subcommand> ...` forwards arguments to the matching `s
 
 ### `pi tune`
 
-Required interactive VPS preparation and tuning: dependencies, sing-box, swap, sysctl/journald, XanMod/BBRv3.
+Required interactive VPS preparation and tuning: dependencies, certbot/certificates, sing-box, swap, sysctl/journald, XanMod/BBRv3.
 
 | Command | Description | Affects |
 | --- | --- | --- |
-| `pi tune bootstrap` | Guided first-run setup. | System packages, swap, sing-box, sysctl, journald, optional kernel |
+| `pi tune bootstrap` | Guided first-run setup; asks whether to install certbot and request a domain certificate. | System packages, certs, swap, sing-box, sysctl, journald, optional kernel |
 | `pi tune check` | Read-only overall check. | Read-only |
 | `pi tune preflight` | Inspect CPU/RAM/disk/IP/kernel basics. | Read-only |
 | `pi tune recommend` | Recommend tuning profile. | Read-only |
 | `pi tune reboot-needed` | Check whether reboot is recommended. | Read-only |
 | `pi tune deps check` | Check required packages. | Read-only |
-| `pi tune deps install` | Install required packages. | System packages |
+| `pi tune deps install` | Install required base packages. | System packages |
 | `pi tune deps upgrade` | Run package upgrade flow. | System packages |
+| `pi tune cert` | Interactive certbot certificate wizard; links `certs/cert.pem` and `certs/key.pem`. HY2 already uses these template defaults, so no inbound patch is written unless paths diverge. | sing-box service, certbot, `/etc/letsencrypt`, certbot deploy hook, `env/cert.json`, `certs/`, optional `pi apply` |
+| `pi tune cert check` | Check certbot, renewal task, deploy hook, cert links, and configured TLS paths. | Read-only |
+| `pi tune cert install` | Install certbot only. | System packages |
+| `pi tune cert renew-test` | Manually run `certbot renew --dry-run`; this temporarily stops sing-box. | sing-box service, certbot staging |
 | `pi tune swap check` | Check swap state. | Read-only |
 | `pi tune swap create 1G` | Create swap file. | System swap |
 | `pi tune swap off` | Disable managed swap. | System swap |
@@ -99,10 +103,13 @@ Manage inbound registry and overlays. Tag truth source is `env/inbounds.json`, n
 | --- | --- | --- |
 | `pi inbound list` | Show base tags, clones, patches, deleted tags, port policy, HY2 range. | Read-only, normalizes `env/inbounds.json` |
 | `pi inbound show <tag>` | Show source/clone/patch/delete state for one inbound. | Read-only |
-| `pi inbound set vless-in listen_port 40443` | Set inbound field. | `env/inbounds.json` |
+| `pi inbound set vless-in listen_port 40443` | Set inbound field by exact tag. | `env/inbounds.json` |
 | `pi inbound set vless-in tag edge-vless` | Rename inbound tag and sync references. | `env/inbounds.json`, `env/node.env`, `env/routes.json` |
 | `pi inbound set hy2-in up_mbps 80` | Set HY2 upstream bandwidth. | `env/inbounds.json` |
 | `pi inbound set hy2-in obfs.password <pass>` | Patch nested inbound field. | `env/inbounds.json` |
+| `pi inbound set hy2 obfs.type salamander` | Patch shared HY2 field by type selector. Type supports `vless`, `hy2`, `hysteria2`, `socks`, `socks5`; do not use multi-match type selectors for `listen_port`. | `env/inbounds.json` |
+| `pi inbound set hy2 tls.certificate_path /srv/sb/certs/cert.pem` | Use the toolkit cert symlink for HY2 TLS. | `env/inbounds.json` |
+| `pi inbound set hy2 tls.key_path /srv/sb/certs/key.pem` | Use the toolkit key symlink for HY2 TLS. | `env/inbounds.json` |
 | `pi inbound rm hy2-in obfs` | Delete field in final config. | `env/inbounds.json` |
 | `pi inbound reset hy2-in obfs` | Remove patch/delete intent for a field. | `env/inbounds.json` |
 | `pi inbound clone hy2-in hy2-41500 41500` | Clone inbound with optional listen port. | `env/inbounds.json` |
@@ -157,6 +164,12 @@ Optional server-side egress DNS policy. Default is disabled and no built-in DoH 
 | `pi dns server add local local` | Add local resolver. | `env/dns.json` |
 | `pi dns server show cloudflare` | Show DNS server. | Read-only |
 | `pi dns server del cloudflare` | Delete DNS server. | `env/dns.json` |
+| `pi dns domain list` | List managed domains stored in DNS overlay. | Read-only |
+| `pi dns domain add example.com www.example.com` | Add managed domains for certificate/domain bookkeeping; no `pi apply` needed by itself. | `env/dns.json` |
+| `pi dns domain show example.com` | Check whether a managed domain exists. | Read-only |
+| `pi dns domain rm example.com www.example.com` | Remove one or more managed domains; no `pi apply` needed by itself. | `env/dns.json` |
+| `pi dns domain del example.com www.example.com` | Alias of `pi dns domain rm`. | `env/dns.json` |
+| `pi dns domain clear` | Clear managed domains. | `env/dns.json` |
 | `pi dns final cloudflare` | Set DNS final server. | `env/dns.json` |
 | `pi dns final off` | Clear DNS final. | `env/dns.json` |
 | `pi dns strategy ipv4_only` | Set DNS strategy. | `env/dns.json` |
@@ -195,6 +208,8 @@ The only compiler. It renders config, injects users/inbounds/outbounds/DNS/route
 | `pi apply` | Compile and apply current intent files. | `out/config.json`, sing-box service, UFW, nftables |
 | `pi apply snapshot` | Apply and create a successful-apply backup snapshot. | `out/config.json`, sing-box service, backups |
 
+If `env/cert.json` exists or `env/dns.json.domains` is non-empty, `pi apply` keeps `80/tcp` in UFW so certbot HTTP renewal is not reclaimed by firewall cleanup.
+
 ### `pi export`
 
 Export subscriptions from compiled `out/config.json`. Run `pi apply` first.
@@ -221,15 +236,17 @@ Print share links or JSON node objects from compiled config.
 
 ### `pi doctor`
 
-Read-only diagnostics for service, ports, firewall, nftables, DNS, network, upstream, and exports.
+Read-only diagnostics for service, ports, firewall, certificates, nftables, DNS, network, upstream, and exports. `pi detect ...` is an alias of `pi doctor ...`.
 
 | Command | Description | Affects |
 | --- | --- | --- |
-| `pi doctor quick` | Check service, ports, firewall. | Read-only |
+| `pi doctor quick` | Check service, ports, firewall, and certificates. | Read-only |
 | `pi doctor all` | Run all diagnostic sections. | Read-only |
+| `pi detect quick` | Alias of `pi doctor quick`. | Read-only |
 | `pi doctor service` | Check sing-box service/config. | Read-only |
 | `pi doctor ports` | Check inbounds and listening ports. | Read-only |
 | `pi doctor firewall` | Show UFW state. | Read-only |
+| `pi doctor cert` | Check certbot, renewal timer/cron, cert symlinks, and TLS paths. | Read-only |
 | `pi doctor nft` | Show HY2 range nft table. | Read-only |
 | `pi doctor dns` | Show DNS state. | Read-only |
 | `pi doctor network` | Show network/public IP basics. | Read-only |
