@@ -95,7 +95,7 @@ set_env() {
   local qvalue
   local tmp
 
-  [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+  [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
 
   qvalue="$(shell_quote "$value")"
   tmp="$(mktemp)"
@@ -118,7 +118,7 @@ set_env() {
 }
 
 load_env() {
-  [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+  [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
   set -a
   source "$ENV_FILE"
   set +a
@@ -164,7 +164,7 @@ write_patch_json() {
 }
 
 available_inbounds_json() {
-  [[ -f "$INBOUNDS_FILE" ]] || die "无法读取可选 inbound：缺 $INBOUNDS_FILE，请先跑 sb-genenv upgrade"
+  [[ -f "$INBOUNDS_FILE" ]] || die "无法读取可选 inbound：缺 ${INBOUNDS_FILE}，请先跑 sb-genenv upgrade"
 
   jq -c '
     def valid_tag:
@@ -378,7 +378,7 @@ del_upstream_inbounds() {
   if [[ -z "$new" ]]; then
     log "WARN: UPSTREAM_INBOUNDS 已为空；sb-apply 不会生成 upstream 路由规则。"
   else
-    log "OK: UPSTREAM_INBOUNDS=$new。跑 sb-apply 生效。"
+    log "OK: UPSTREAM_INBOUNDS=${new}。跑 sb-apply 生效。"
   fi
 }
 
@@ -397,7 +397,7 @@ set_upstream_key() {
         0|false|off|no) set_env "UPSTREAM_ENABLED" "0" ;;
         *) die "upstream enabled 只支持 1/0 true/false on/off yes/no，收到 '$value'" ;;
       esac
-      log "OK: UPSTREAM_ENABLED=$value。跑 sb-apply 生效。"
+      log "OK: UPSTREAM_ENABLED=${value}。跑 sb-apply 生效。"
       ;;
     name)
       set_upstream_from_outbound "$value"
@@ -419,24 +419,24 @@ set_upstream_key() {
       [[ "$value" == "socks" || "$value" == "http" ]] || die "UPSTREAM_TYPE 仅支持 socks/http，收到 '$value'"
       set_env "UPSTREAM_NAME" ""
       set_env "UPSTREAM_TYPE" "$value"
-      log "OK: UPSTREAM_TYPE=$value。跑 sb-apply 生效。"
+      log "OK: UPSTREAM_TYPE=${value}。跑 sb-apply 生效。"
       ;;
     host)
       set_env "UPSTREAM_NAME" ""
       set_env "UPSTREAM_HOST" "$value"
-      log "OK: UPSTREAM_HOST=$value。跑 sb-apply 生效。"
+      log "OK: UPSTREAM_HOST=${value}。跑 sb-apply 生效。"
       ;;
     port)
       [[ "$value" =~ ^[0-9]+$ ]] || die "UPSTREAM_PORT 必须是数字，收到 '$value'"
       (( value >= 1 && value <= 65535 )) || die "UPSTREAM_PORT 范围必须是 1-65535，收到 '$value'"
       set_env "UPSTREAM_NAME" ""
       set_env "UPSTREAM_PORT" "$value"
-      log "OK: UPSTREAM_PORT=$value。跑 sb-apply 生效。"
+      log "OK: UPSTREAM_PORT=${value}。跑 sb-apply 生效。"
       ;;
     user)
       set_env "UPSTREAM_NAME" ""
       set_env "UPSTREAM_USER" "$value"
-      log "OK: UPSTREAM_USER=$value。跑 sb-apply 生效。"
+      log "OK: UPSTREAM_USER=${value}。跑 sb-apply 生效。"
       ;;
     pass|password)
       set_env "UPSTREAM_NAME" ""
@@ -537,7 +537,7 @@ set_outbound_patch_key() {
         | .patch[$tag].domain_strategy = $strategy
       ' "$PATCH_F" > "$tmp"
       write_patch_json "$tmp"
-      log "OK: 已设置 outbound '$tag' domain_strategy=$value。跑 sb-apply 应用。"
+      log "OK: 已设置 outbound '$tag' domain_strategy=${value}。跑 sb-apply 应用。"
       ;;
     *)
       die "$tag set 不支持 key '$key'；可选：resolver/domain_strategy"
@@ -817,7 +817,7 @@ case "$cmd" in
     ' "$F" > "$tmp"
 
     write_json "$tmp"
-    log "OK: 已删 outbound $name。跑 sb-apply 应用。"
+    log "OK: 已删 outbound ${name}。跑 sb-apply 应用。"
     ;;
 
   show)
@@ -837,7 +837,7 @@ case "$cmd" in
     ;;
 
   enable)
-    [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+    [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
 
     name="${1:-}"
 
@@ -859,11 +859,11 @@ case "$cmd" in
     set_upstream_from_outbound "$name"
 
     log "OK: 已启用 outbound '$name' 作为 UPSTREAM。"
-    log "INFO: egress=upstream 的用户会走 $name；跑 sb-apply 生效。"
+    log "INFO: egress=upstream 的用户会走 ${name}；跑 sb-apply 生效。"
     ;;
 
   disable)
-    [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+    [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
 
     set_env "UPSTREAM_ENABLED" "0"
 
@@ -994,7 +994,7 @@ case "$cmd" in
         ' "$F" > "$tmp"
 
         write_json "$tmp"
-        log "OK: 已设置 outbound '$name' domain_strategy=$strategy。跑 sb-apply 应用。"
+        log "OK: 已设置 outbound '$name' domain_strategy=${strategy}。跑 sb-apply 应用。"
         ;;
 
       del|rm)
@@ -1209,7 +1209,7 @@ case "$cmd" in
         if [[ -z "$new" ]]; then
           log "WARN: UPSTREAM_INBOUNDS 已为空；sb-apply 不会生成 upstream 路由规则。"
         else
-          log "OK: UPSTREAM_INBOUNDS=$new。跑 sb-apply 生效。"
+          log "OK: UPSTREAM_INBOUNDS=${new}。跑 sb-apply 生效。"
         fi
         ;;
 

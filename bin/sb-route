@@ -154,7 +154,7 @@ validate_action_match_type() {
 
 validate_action() {
   local action="$1"
-  contains_word "$action" "$VALID_ACTIONS" || die "action 仅支持：$VALID_ACTIONS，收到 '$action'"
+  contains_word "$action" "$VALID_ACTIONS" || die "action 仅支持：${VALID_ACTIONS}，收到 '$action'"
 }
 
 validate_network() {
@@ -237,7 +237,7 @@ resolve_user_scope() {
   local found
 
   [[ -n "$key" ]] || die "user scope 不能为空"
-  [[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，无法解析 --user/account/alias，请先跑 sb-genenv"
+  [[ -f "$USERS_FILE" ]] || die "缺 ${USERS_FILE}，无法解析 --user/account/alias，请先跑 sb-genenv"
 
   found="$(
     jq -r --arg k "$key" '
@@ -283,7 +283,7 @@ case "$cmd" in
     p="${1:-}"
     [[ "$p" == "before-upstream" || "$p" == "after-upstream" ]] || die "position 只能 before-upstream | after-upstream"
     jq --arg p "$p" '.position=$p' "$F" | write_json
-    log "OK: position=$p。跑 sb-apply 生效。"
+    log "OK: position=${p}。跑 sb-apply 生效。"
     ;;
 
   add|add-action)

@@ -414,7 +414,7 @@ ensure_singbox_config_symlink() {
       return 0
     fi
 
-    log "WARN: $link 当前指向 $cur，将改为 $target"
+    log "WARN: $link 当前指向 ${cur}，将改为 $target"
     ln -sfn "$target" "$link"
     log "OK: 已更新 sing-box config 软链：$link -> $target"
     return 0

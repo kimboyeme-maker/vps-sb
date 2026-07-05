@@ -79,7 +79,7 @@ case "$cmd" in
     for d in env certs templates bin; do [[ -e "$BROOT/$id/root/$d" ]] && rm -rf "$SB_ROOT/$d" && cp -a "$BROOT/$id/root/$d" "$SB_ROOT/$d"; done
     mkdir -p "$SB_ROOT/out"
     for f in config.json outbounds.json inbounds.json; do [[ -e "$BROOT/$id/root/out/$f" ]] && cp -a "$BROOT/$id/root/out/$f" "$SB_ROOT/out/$f"; done
-    log "OK: restored $id。建议运行 sb-apply" ;;
+    log "OK: restored ${id}。建议运行 sb-apply" ;;
   prune)
     keep="${1:-20}"; [[ "$keep" =~ ^[0-9]+$ ]] || die "keep-count 必须是数字"
     mapfile -t ids < <(find "$BROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r)

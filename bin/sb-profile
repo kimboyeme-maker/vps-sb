@@ -61,6 +61,6 @@ case "$cmd" in
     if command -v sb-dns >/dev/null 2>&1; then sb-dns profile "$(jq -r .dns_profile "$F")" >/dev/null || true; fi
     set_env PROFILE_NAME "$p"
     set_env PROFILE_REGION "$(jq -r .region "$F")"
-    log "OK: profile=$p。已尝试联动 sb-dns。跑 sb-apply 生效。" ;;
+    log "OK: profile=${p}。已尝试联动 sb-dns。跑 sb-apply 生效。" ;;
   *) die "未知命令: $cmd" ;;
 esac

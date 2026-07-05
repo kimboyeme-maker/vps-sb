@@ -23,7 +23,7 @@ alias 仅本地备注用途（如 chatgpt / netflix / bob-laptop），不进 con
 U
 exit 1; }
 
-[[ -f "$F" ]] || die "缺 $F，先跑 sb-genenv"
+[[ -f "$F" ]] || die "缺 ${F}，先跑 sb-genenv"
 cmd="${1:-}"; shift || true
 case "$cmd" in
   list)
@@ -55,7 +55,7 @@ case "$cmd" in
     jq -e --arg k "$key" 'any(.[]; .name==$k or .alias==$k)' "$F" >/dev/null || die "无此用户(按 account 或 alias): $key"
     tmp="$(mktemp)"; jq --arg k "$key" 'map(select(.name!=$k and .alias!=$k))' "$F" > "$tmp"
     install -m 600 "$tmp" "$F"; rm -f "$tmp"
-    log "OK: 已删用户 $key。跑 sb-apply 生效。" ;;
+    log "OK: 已删用户 ${key}。跑 sb-apply 生效。" ;;
   set-egress)
     key="${1:-}"; eg="${2:-}"; [[ -n "$key" && -n "$eg" ]] || usage
     [[ "$eg" == direct || "$eg" == upstream ]] || die "egress 只能 direct|upstream"
@@ -63,6 +63,6 @@ case "$cmd" in
     tmp="$(mktemp)"; jq --arg k "$key" --arg e "$eg" \
       'map(if .name==$k or .alias==$k then .egress=$e else . end)' "$F" > "$tmp"
     install -m 600 "$tmp" "$F"; rm -f "$tmp"
-    log "OK: $key egress=$eg。跑 sb-apply 生效。" ;;
+    log "OK: $key egress=${eg}。跑 sb-apply 生效。" ;;
   *) usage ;;
 esac
