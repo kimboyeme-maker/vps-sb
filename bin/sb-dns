@@ -20,6 +20,7 @@ summary:
       {
         enabled,
         servers: { tag -> {type, server, server_port?, path?, domain_resolver?} },
+        domains,
         rules,
         final,
         strategy,
@@ -51,6 +52,12 @@ usage:
   sb-dns server del|rm <tag>
   sb-dns server show <tag>
 
+  sb-dns domain list
+  sb-dns domain add <domain> [...]
+  sb-dns domain rm|del <domain> [...]
+  sb-dns domain show <domain>
+  sb-dns domain clear
+
   sb-dns final <server-tag>
   sb-dns final off|clear|del|rm
   sb-dns final show
@@ -81,6 +88,7 @@ examples:
   sb-dns enable
   sb-dns server add google tls 8.8.8.8
   sb-dns server add local local
+  sb-dns domain add example.com www.example.com
 
   sb-dns route-default set server google
   sb-dns route-default set strategy prefer_ipv6
@@ -93,7 +101,8 @@ examples:
 notes:
   - route-default 写 env/dns.json 的 route_default object
   - sb-apply 会把它编译成最终 config.route.default_domain_resolver
-  - 改完跑 sb-apply 生效
+  - enable/server/final/strategy/route-default 改完跑 sb-apply 生效
+  - domain 只是域名登记，供证书/后续规则使用，单独修改不需要 sb-apply
 U
 }
 
@@ -106,6 +115,7 @@ ensure_file() {
 {
   "enabled": false,
   "servers": {},
+  "domains": [],
   "rules": []
 }
 JSON
@@ -118,8 +128,11 @@ JSON
     if type != "object" then error("dns.json 必须是 object") else . end
     | .enabled = (.enabled // false)
     | .servers = (.servers // {})
+    | .domains = (.domains // [])
     | .rules = (.rules // [])
     | if (.servers | type) != "object" then error(".servers 必须是 object") else . end
+    | if (.domains | type) != "array" then error(".domains 必须是 array") else . end
+    | .domains = (.domains | map(tostring | ascii_downcase) | unique)
     | if (.rules | type) != "array" then error(".rules 必须是 array") else . end
   ' "$F" > "$tmp" || { rm -f "$tmp"; die "$F 格式错误"; }
 
@@ -145,7 +158,7 @@ validate_strategy() {
       return 0
       ;;
     *)
-      die "strategy 仅支持：$VALID_STRATEGIES，收到 '$s'"
+      die "strategy 仅支持：${VALID_STRATEGIES}，收到 '$s'"
       ;;
   esac
 }
@@ -159,7 +172,7 @@ validate_server_type() {
       return 0
       ;;
     *)
-      die "server type 仅支持：$VALID_SERVER_TYPES，收到 '$t'"
+      die "server type 仅支持：${VALID_SERVER_TYPES}，收到 '$t'"
       ;;
   esac
 }
@@ -168,6 +181,36 @@ validate_port() {
   local port="${1:-}"
   [[ "$port" =~ ^[0-9]+$ ]] || die "port 必须是数字，收到 '$port'"
   (( port >= 1 && port <= 65535 )) || die "port 范围必须是 1-65535，收到 '$port'"
+}
+
+normalize_domain() {
+  local domain="${1:-}"
+
+  [[ -n "$domain" ]] || die "缺少 domain"
+  domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')"
+  domain="${domain#http://}"
+  domain="${domain#https://}"
+  domain="${domain%%/*}"
+  domain="${domain%%:*}"
+
+  [[ -n "$domain" ]] || die "domain 不能为空"
+  [[ "$domain" != .* && "$domain" != *..* && "$domain" != *. ]] || die "非法 domain: '$domain'"
+  [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || \
+    die "非法 domain: '$domain'；请输入类似 example.com 的域名，不要带协议、路径或端口"
+
+  printf '%s' "$domain"
+}
+
+domains_args_json() {
+  local domains=()
+  local d
+
+  [[ $# -gt 0 ]] || die "缺少 domain"
+  for d in "$@"; do
+    domains+=("$(normalize_domain "$d")")
+  done
+
+  printf '%s\n' "${domains[@]}" | jq -Rcs 'split("\n") | map(select(length > 0)) | unique'
 }
 
 server_exists() {
@@ -275,7 +318,7 @@ rm_route_default_key() {
           | if ((.route_default | type) == "object" and (.route_default | length) == 0) then del(.route_default) else . end
         end
       ' "$F" | write_json
-      log "OK: 已删除 route_default.$key。跑 sb-apply 生效。"
+      log "OK: 已删除 route_default.${key}。跑 sb-apply 生效。"
       ;;
     *)
       die "route-default rm 仅支持 key: server / strategy，收到 '$key'"
@@ -321,6 +364,7 @@ case "$cmd" in
 {
   "enabled": false,
   "servers": {},
+  "domains": [],
   "rules": []
 }
 JSON
@@ -400,6 +444,64 @@ JSON
       *)
         usage >&2
         die "未知 server 子命令 '$sub'"
+        ;;
+    esac
+    ;;
+
+  domain|domains)
+    sub="${1:-}"
+    [[ $# -gt 0 ]] && shift || true
+
+    case "$sub" in
+      list)
+        jq -r '
+          if ((.domains // []) | length) == 0 then
+            "无 domain"
+          else
+            (.domains // [])[]
+          end
+        ' "$F"
+        ;;
+
+      add)
+        domains_json="$(domains_args_json "$@")"
+        jq --argjson domains "$domains_json" '
+          .domains = (((.domains // []) + $domains) | map(tostring | ascii_downcase) | unique)
+        ' "$F" | write_json
+        log "OK: 已记录 domain: $(jq -r 'join(", ")' <<<"$domains_json")。这是域名登记，不需要 sb-apply。"
+        ;;
+
+      show)
+        domain="$(normalize_domain "${1:-}")"
+        jq --arg domain "$domain" '
+          {
+            domain: $domain,
+            exists: ((.domains // []) | index($domain) != null)
+          }
+        ' "$F"
+        ;;
+
+      rm|del|delete)
+        domains_json="$(domains_args_json "$@")"
+        jq --argjson domains "$domains_json" '
+          .domains = ((.domains // []) | map(select(. as $d | ($domains | index($d) | not))))
+        ' "$F" | write_json
+        log "OK: 已删除 domain: $(jq -r 'join(", ")' <<<"$domains_json")。这是域名登记，不需要 sb-apply。"
+        ;;
+
+      clear|off|none)
+        jq '.domains = []' "$F" | write_json
+        log "OK: 已清空 domains。这是域名登记，不需要 sb-apply。"
+        ;;
+
+      "")
+        usage >&2
+        die "缺少 domain 子命令"
+        ;;
+
+      *)
+        usage >&2
+        die "未知 domain 子命令 '$sub'"
         ;;
     esac
     ;;
