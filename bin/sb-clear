@@ -1,17 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+
+ASSUME_YES=0
+
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+warn() { log "WARN: $*"; }
 die() { log "FAIL: $*"; exit 1; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "清理 sing-box 配置需要 root。"; }
 
-read -p "警告: 即将删除 env/ certs/ out/。确认吗? (yes/no) " confirm
-[[ "$confirm" == "yes" ]] || { log "已取消"; exit 0; }
+usage(){
+  cat <<'U'
+usage:
+  sb-clear [--yes]
 
-log "清空 env/"
-rm -rf "$SB_ROOT/env/"*
-log "清空 certs/"
-rm -rf "$SB_ROOT/certs/"*
-log "清空 out/"
-rm -rf "$SB_ROOT/out/"*
+说明:
+  一键清理本工具生成的运行状态和 sing-box 配置，适合废弃/重置当前 VPS。
 
-log "OK: 已清空所有文件。重新部署请跑 sb-genenv"
+会清理:
+  - env/ certs/ out/ backups/
+  - managed /etc/sing-box/config.json 软链
+  - HY2 range nftables 表 inet sb_hy2_range
+  - sing-box 服务当前运行状态（若存在则 stop）
+
+不会清理:
+  - bin/ tools 本身
+  - /usr/local/bin 下的 pi/sb-* 软链
+  - 非本工具管理的 /etc/sing-box/config.json 普通文件
+U
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes|-y)
+      ASSUME_YES=1
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "未知参数: $1"
+      ;;
+  esac
+  shift
+done
+
+need_root
+
+if (( ASSUME_YES != 1 )); then
+  cat >&2 <<EOF
+警告: 即将清理当前部署状态:
+  $SB_ROOT/env/
+  $SB_ROOT/certs/
+  $SB_ROOT/out/
+  $SB_ROOT/backups/
+  /etc/sing-box/config.json（仅当它是指向本项目 out/config.json 的软链）
+  nft table inet sb_hy2_range
+
+工具链 bin/ 和 /usr/local/bin 软链会保留，可之后继续 pi update / pi genenv。
+EOF
+  read -r -p "确认清理吗? 输入 yes 继续: " confirm
+  [[ "$confirm" == "yes" ]] || { log "已取消"; exit 0; }
+fi
+
+if has systemctl && systemctl list-unit-files sing-box.service >/dev/null 2>&1; then
+  if systemctl is-active --quiet sing-box; then
+    log "停止 sing-box"
+    systemctl stop sing-box || warn "停止 sing-box 失败，请手动检查 systemctl status sing-box"
+  fi
+fi
+
+for dir in env certs out backups; do
+  log "清空 $SB_ROOT/$dir/"
+  mkdir -p "$SB_ROOT/$dir"
+  find "$SB_ROOT/$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+done
+
+link="/etc/sing-box/config.json"
+expected="$SB_ROOT/out/config.json"
+if [[ -L "$link" ]]; then
+  target="$(readlink -f "$link" 2>/dev/null || true)"
+  if [[ "$target" == "$expected" ]]; then
+    log "删除 managed $link -> $target"
+    rm -f "$link"
+  else
+    warn "$link 是软链但不指向 $expected，已保留: $target"
+  fi
+elif [[ -e "$link" ]]; then
+  warn "$link 存在但不是本工具软链，已保留"
+fi
+
+if has nft && nft list table inet sb_hy2_range >/dev/null 2>&1; then
+  log "删除 nft table inet sb_hy2_range"
+  nft delete table inet sb_hy2_range || warn "删除 nft table inet sb_hy2_range 失败"
+fi
+
+log "OK: 已清理运行状态和 managed sing-box 配置。重新部署请跑 pi genenv"

@@ -23,6 +23,7 @@ declare -A ROUTES=(
   [dns]=sb-dns
   [route]=sb-route
   [tune]=sb-tune
+  [update]=sb-update
 )
 
 usage() {
@@ -38,13 +39,14 @@ usage() {
   export      导出每用户订阅到 out/sub/（支持协议过滤）            (= sb-export)
   outbound    落地 outbound / upstream / direct patch 管理          (= sb-outbound)
   inbound     inbound 增删改查 / clone / HY2 端口跳跃                (= sb-inbound)
-  clear       一键清空 env/certs/out（debug 用）                   (= sb-clear)
+  clear       一键清空 runtime overlay + managed sing-box config   (= sb-clear)
   backup      快照 / 回滚整个部署（restore 前自动快照）            (= sb-backup)
   doctor      只读诊断 service/ports/firewall/cert/nft/dns/network  (= sb-doctor)
   detect      doctor 的别名，适合快速检测当前部署状态             (= sb-doctor)
   dns         服务端出站 DNS 策略（typed server / final / strategy）  (= sb-dns)
   route       自定义分流规则（域名/IP，硬覆盖层，支持 scope）        (= sb-route)
   tune        新机准备与系统调优（依赖/sing-box/sysctl/XanMod）       (= sb-tune)
+  update      从当前仓库更新工具链脚本/模板/install.sh，不改 env/certs/out (= sb-update)
 
   list        列出所有可用子命令
   help        显示本帮助（-h / --help 等价）
@@ -61,6 +63,7 @@ usage() {
   pi apply
   pi show txt vless
   pi export vless default
+  pi update
 U
 }
 
@@ -87,6 +90,8 @@ if command -v "$target" >/dev/null 2>&1; then
   exec "$target" "$@"
 elif [[ -x "$BIN_DIR/$target" ]]; then
   exec "$BIN_DIR/$target" "$@"
+elif [[ -f "$BIN_DIR/$target" ]]; then
+  exec bash "$BIN_DIR/$target" "$@"
 else
   die "找不到目标脚本 ${target}（既不在 PATH，也不在 ${BIN_DIR}）"
 fi

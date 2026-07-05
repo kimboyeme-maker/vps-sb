@@ -27,6 +27,7 @@ CORE=(
   sb-route
   sb-show
   sb-tune
+  sb-update
 )
 
 log(){ printf '[install] %s\n' "$*" >&2; }

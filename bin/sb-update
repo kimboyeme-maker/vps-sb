@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+
+REPO="kimboyeme-maker/vps_proxy"
+REF="main"
+DRY_RUN=0
+RAW=""
+
+CORE=(
+  pi
+  sb-apply
+  sb-backup
+  sb-clear
+  sb-dns
+  sb-doctor
+  sb-export
+  sb-genenv
+  sb-user
+  sb-inbound
+  sb-outbound
+  sb-route
+  sb-show
+  sb-tune
+  sb-update
+)
+
+log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die(){ log "FAIL: $*"; exit 1; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "更新会写 $SB_ROOT 和 /usr/local/bin，需要 root。"; }
+
+usage(){
+  cat <<'U'
+usage:
+  sb-update
+  sb-update --ref <branch-or-tag>
+  sb-update --repo <owner/repo>
+  sb-update --dry-run
+
+说明:
+  从 GitHub raw 拉取当前工具链脚本、模板和 install.sh，覆盖 bin/、templates/、install.sh。
+  不会改 env/、certs/、out/、backups/。
+U
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ref)
+      shift
+      [[ -n "${1:-}" ]] || die "--ref 需要值"
+      REF="$1"
+      ;;
+    --repo)
+      shift
+      [[ -n "${1:-}" ]] || die "--repo 需要值"
+      REPO="$1"
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "未知参数: $1"
+      ;;
+  esac
+  shift
+done
+
+has curl || die "缺 curl"
+has bash || die "缺 bash"
+if (( DRY_RUN != 1 )); then
+  need_root
+fi
+
+RAW="https://raw.githubusercontent.com/$REPO/$REF"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+fetch(){
+  local src="$1" dst="$2"
+  curl -fsSL --retry 3 "$RAW/$src" -o "$dst" || die "下载失败: $src"
+}
+
+log "准备更新 $SB_ROOT (repo=$REPO ref=$REF)"
+mkdir -p "$TMP/bin" "$TMP/templates"
+
+for s in "${CORE[@]}"; do
+  fetch "bin/$s" "$TMP/bin/$s"
+  bash -n "$TMP/bin/$s" || die "脚本语法检查失败: bin/$s"
+done
+
+fetch "templates/config.json.tpl" "$TMP/templates/config.json.tpl"
+fetch "install.sh" "$TMP/install.sh"
+bash -n "$TMP/install.sh" || die "脚本语法检查失败: install.sh"
+
+if (( DRY_RUN == 1 )); then
+  log "OK: dry-run 下载和语法检查通过；未写入任何文件"
+  exit 0
+fi
+
+mkdir -p "$SB_ROOT"/{bin,templates,env,certs,out,backups}
+
+for s in "${CORE[@]}"; do
+  install -m 755 "$TMP/bin/$s" "$SB_ROOT/bin/$s"
+  ln -sf "$SB_ROOT/bin/$s" "/usr/local/bin/$s"
+done
+
+install -m 644 "$TMP/templates/config.json.tpl" "$SB_ROOT/templates/config.json.tpl"
+install -m 755 "$TMP/install.sh" "$SB_ROOT/install.sh"
+
+if [[ ! -e /etc/sing-box/config.json ]]; then
+  mkdir -p /etc/sing-box
+  ln -sf "$SB_ROOT/out/config.json" /etc/sing-box/config.json
+fi
+
+for item in env/ certs/ out/ backups/; do
+  grep -qxF "$item" "$SB_ROOT/.gitignore" 2>/dev/null || echo "$item" >> "$SB_ROOT/.gitignore"
+done
+
+log "OK: 已更新工具链；env/certs/out/backups 未改动"

@@ -40,6 +40,7 @@ Unified entry point. `pi <subcommand> ...` forwards arguments to the matching `s
 | --- | --- | --- |
 | `pi list` | List available subcommands. | Read-only |
 | `pi help` | Show top-level help. | Read-only |
+| `pi update` | Update toolkit scripts, template, and installer from the GitHub repo; leaves runtime state untouched. | `bin/`, `templates/`, `install.sh`, `/usr/local/bin` symlinks |
 
 ### `pi tune`
 
@@ -281,11 +282,22 @@ Snapshot, inspect, diff, restore, and prune deploy state. Restore creates a pre-
 
 ### `pi clear`
 
-Debug-only reset of generated runtime state.
+Reset generated runtime state and managed sing-box config, useful when abandoning or rebuilding a VPS. It keeps the toolchain itself, so `pi update` and `pi genenv` remain available.
 
 | Command | Description | Affects |
 | --- | --- | --- |
-| `pi clear` | Wipe generated runtime state. | `env/`, `certs/`, `out/` |
+| `pi clear` | Ask for confirmation, stop sing-box if running, clear runtime state, remove managed sing-box config symlink, and delete HY2 range nft table. | `env/`, `certs/`, `out/`, `backups/`, managed `/etc/sing-box/config.json`, `inet sb_hy2_range` |
+| `pi clear --yes` | Same cleanup without interactive confirmation. | Same as above |
+
+### `pi update`
+
+Update installed toolkit code without touching node state.
+
+| Command | Description | Affects |
+| --- | --- | --- |
+| `pi update` | Download latest scripts/template/installer from `kimboyeme-maker/vps_proxy` `main`, syntax-check scripts, then install. | `bin/`, `templates/`, `install.sh`, `/usr/local/bin` symlinks |
+| `pi update --dry-run` | Download and syntax-check only. | Read-only except temp files |
+| `pi update --ref <branch-or-tag>` | Update from a specific branch/tag. | `bin/`, `templates/`, `/usr/local/bin` symlinks |
 
 ## Deployment Examples
 
