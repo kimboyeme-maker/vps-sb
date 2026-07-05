@@ -38,6 +38,20 @@ detect_country() {
   printf ''
 }
 
+# 探测任意目标主机所在国家二字码，用于 upstream 出口地区命名兜底；无 curl 时静默跳过
+detect_region_for_host() {
+  local host="$1"
+  [[ -n "$host" ]] || { printf ''; return 0; }
+  command -v curl >/dev/null 2>&1 || { printf ''; return 0; }
+
+  local c
+  c="$(curl -fsS4 --max-time 6 "https://ipapi.co/${host}/country/" 2>/dev/null || true)"
+  [[ "$c" =~ ^[A-Za-z]{2}$ ]] || c="$(curl -fsS4 --max-time 6 "http://ip-api.com/line/${host}?fields=countryCode" 2>/dev/null || true)"
+  [[ "$c" =~ ^[A-Za-z]{2}$ ]] || c=""
+
+  printf '%s' "${c,,}"
+}
+
 summary() {
   cat <<'S'
 summary:
@@ -188,6 +202,13 @@ HY2_RANGE_OFFSET="${HY2_RANGE_OFFSET:-}"
 HY2_RANGE_HOP_INTERVAL="${HY2_RANGE_HOP_INTERVAL:-30}"
 UPSTREAM_ENABLED="${UPSTREAM_ENABLED:-0}"
 UPSTREAM_NAME="${UPSTREAM_NAME:-}"
+UPSTREAM_HOST="${UPSTREAM_HOST:-}"
+UPSTREAM_REGION="${UPSTREAM_REGION:-}"
+UPSTREAM_ISP="${UPSTREAM_ISP:-1}"
+if [[ -z "$UPSTREAM_REGION" ]]; then
+  UPSTREAM_REGION="$(detect_region_for_host "$UPSTREAM_HOST")"
+  [[ -z "$UPSTREAM_REGION" ]] && UPSTREAM_REGION="unknown"
+fi
 MANAGED_DOMAIN=""
 
 if [[ -f "$CERT_META_FILE" ]]; then
@@ -809,7 +830,10 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
     outbound="$(route_outbound_for_user_tag "$name" "$tag")"
 
     region_part="$NODE_COUNTRY"
-    [[ "$outbound" != "direct" ]] && region_part="${NODE_COUNTRY}-${outbound}"
+    if [[ "$outbound" != "direct" ]]; then
+      region_part="${NODE_COUNTRY}-${UPSTREAM_REGION}"
+      [[ "$UPSTREAM_ISP" == "1" ]] && region_part="${region_part}-ISP"
+    fi
 
     case "$p" in
       vless)

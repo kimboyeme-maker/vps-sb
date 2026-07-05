@@ -206,6 +206,9 @@ upgrade_existing_env() {
   ensure_env_key "HY2_RANGE_MODE" "$HY2_RANGE_MODE_DEFAULT"
   ensure_env_key "HY2_RANGE_HOP_INTERVAL" "$HY2_RANGE_HOP_INTERVAL_DEFAULT"
 
+  ensure_env_key "UPSTREAM_REGION" ""
+  ensure_env_key "UPSTREAM_ISP" "1"
+
   migrate_legacy_env
 
   chmod 600 "$ENV_FILE"
@@ -342,6 +345,11 @@ UPSTREAM_HOST=
 UPSTREAM_PORT=
 UPSTREAM_USER=
 UPSTREAM_PASS=
+
+# upstream 出口地区（订阅节点命名用）；host/name 变更时由 sb-outbound 自动 geoip 探测并缓存
+UPSTREAM_REGION=
+# 订阅节点命名是否带 ISP 段，默认 1；用 sb-outbound upstream set isp 0|1 修改
+UPSTREAM_ISP=1
 INNER
 
   chmod 600 "$ENV_FILE"

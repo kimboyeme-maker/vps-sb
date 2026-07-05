@@ -133,6 +133,12 @@ Manage inbound registry and overlays. Tag truth source is `env/inbounds.json`, n
 
 Manage landing outbounds, upstream settings, direct outbound patching, and upstream inbound scope.
 
+Whenever the upstream host changes (`pi outbound upstream set host <HOST>` or
+`pi outbound upstream set name <name>`), the upstream's own egress country is
+auto-detected via geoip and cached as `UPSTREAM_REGION` in `env/node.env` —
+this is separate from `NODE_COUNTRY` (the VPS's own country) and is used only
+in subscription node naming (see `pi export`/`pi show` below).
+
 | Command | Description | Affects |
 | --- | --- | --- |
 | `pi outbound list` | List custom outbounds; last column is each named outbound's `domain_strategy`. | Read-only, creates `out/outbounds.json` if missing |
@@ -153,6 +159,7 @@ Manage landing outbounds, upstream settings, direct outbound patching, and upstr
 | `pi outbound upstream set domain_strategy ipv4_only` | Set current upstream domain strategy; visible in `pi outbound upstream show`, not `pi outbound list`. | `env/node.env` |
 | `pi outbound upstream set host <HOST>` | Configure temporary upstream host without named outbound. | `env/node.env` |
 | `pi outbound upstream set port <PORT>` | Configure temporary upstream port without named outbound. | `env/node.env` |
+| `pi outbound upstream set isp 0\|1` | Toggle the `-ISP` segment in upstream subscription node names (default `1`). Naming only, no `pi apply` needed. | `env/node.env` |
 | `pi outbound direct show` | Show patch for built-in `direct` outbound. | Read-only |
 | `pi outbound direct set resolver cloudflare prefer_ipv4` | Patch direct outbound `domain_resolver`. | `env/outbound-patch.json` |
 | `pi outbound direct set domain_strategy ipv4_only` | Patch direct outbound domain strategy. | `env/outbound-patch.json` |
@@ -245,8 +252,16 @@ Node names follow `<NODE_COUNTRY>-<proto-or-tag>[-v4|-v6]`, e.g. `jp-vless`,
 `jp-vless-v4`/`jp-vless-v6`/`jp-vless` (bare = domain) when a domain exists.
 If a protocol has more than one inbound (e.g. `hy2-in` and `hy2-alt`), the
 inbound tag replaces the protocol name to disambiguate: `jp-hy2-in`,
-`jp-hy2-alt`. When a user's traffic is routed through a named upstream
-outbound instead of `direct`, the outbound name is inserted: `jp-us-vless`.
+`jp-hy2-alt`.
+
+When a user's egress is `upstream` (see `pi user`/`pi outbound upstream`),
+the name becomes `<NODE_COUNTRY>-<UPSTREAM_REGION>[-ISP]-<proto-or-tag>`,
+e.g. `jp-us-ISP-vless` — `UPSTREAM_REGION` is the upstream proxy host's own
+geoip'd country (not the VPS's), auto-detected and cached whenever
+`sb-outbound upstream set host`/`name` changes it. The `-ISP` segment is
+controlled by `pi outbound upstream set isp 0|1` (default `1`) and omitted
+entirely when set to `0`.
+
 `NODE_COUNTRY` is set in `env/node.env`; see `pi genenv` and `pi dns country`
 below.
 

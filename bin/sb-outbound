@@ -14,6 +14,31 @@ for dep in jq awk; do
   command -v "$dep" >/dev/null || die "缺依赖 $dep"
 done
 
+# 探测任意目标主机所在国家二字码，用于 upstream host 的出口地区命名；无 curl/探测失败返回空
+detect_region_for_host() {
+  local host="$1"
+  [[ -n "$host" ]] || { printf ''; return 0; }
+  command -v curl >/dev/null 2>&1 || { printf ''; return 0; }
+
+  local c
+  c="$(curl -fsS4 --max-time 6 "https://ipapi.co/${host}/country/" 2>/dev/null || true)"
+  [[ "$c" =~ ^[A-Za-z]{2}$ ]] || c="$(curl -fsS4 --max-time 6 "http://ip-api.com/line/${host}?fields=countryCode" 2>/dev/null || true)"
+  [[ "$c" =~ ^[A-Za-z]{2}$ ]] || c=""
+
+  printf '%s' "${c,,}"
+}
+
+# 探测 upstream host 出口地区并写入 UPSTREAM_REGION，探测失败落 unknown（sb-export 只在字段完全缺失时才会现查兜底）
+refresh_upstream_region() {
+  local host="$1"
+  local region
+
+  region="$(detect_region_for_host "$host")"
+  [[ -z "$region" ]] && region="unknown"
+  set_env "UPSTREAM_REGION" "$region"
+  log "OK: UPSTREAM_REGION=${region}"
+}
+
 usage() {
   cat >&2 <<U
 用法:
@@ -49,6 +74,11 @@ upstream key:
   port <port>
   user <user>
   pass <pass>
+  isp 0|1          订阅节点命名是否带 ISP 段，默认 1；仅影响命名，不影响出站配置
+
+说明：
+  UPSTREAM_REGION（upstream 出口地区二字码）在 host/name 变更时自动 geoip 探测并缓存，
+  不需要手动设置；探测失败落 unknown。
 
 direct key:
   resolver <dns-server-tag> [strategy]
@@ -304,6 +334,7 @@ set_upstream_from_outbound() {
   set_env "UPSTREAM_PORT" "$port"
   set_env "UPSTREAM_USER" "$user"
   set_env "UPSTREAM_PASS" "$pass"
+  refresh_upstream_region "$server"
 }
 
 set_upstream_inbounds() {
@@ -425,6 +456,7 @@ set_upstream_key() {
       set_env "UPSTREAM_NAME" ""
       set_env "UPSTREAM_HOST" "$value"
       log "OK: UPSTREAM_HOST=${value}。跑 sb-apply 生效。"
+      refresh_upstream_region "$value"
       ;;
     port)
       [[ "$value" =~ ^[0-9]+$ ]] || die "UPSTREAM_PORT 必须是数字，收到 '$value'"
@@ -443,8 +475,16 @@ set_upstream_key() {
       set_env "UPSTREAM_PASS" "$value"
       log "OK: UPSTREAM_PASS=<set>。跑 sb-apply 生效。"
       ;;
+    isp)
+      case "$value" in
+        1|true|on|yes) set_env "UPSTREAM_ISP" "1" ;;
+        0|false|off|no) set_env "UPSTREAM_ISP" "0" ;;
+        *) die "upstream isp 只支持 1/0，收到 '$value'" ;;
+      esac
+      log "OK: UPSTREAM_ISP=${value}。仅影响订阅节点命名，无需 sb-apply。"
+      ;;
     *)
-      die "upstream set 不支持 key '$key'；可选：enabled/name/inbounds/domain_strategy/type/host/port/user/pass"
+      die "upstream set 不支持 key '$key'；可选：enabled/name/inbounds/domain_strategy/type/host/port/user/pass/isp"
       ;;
   esac
 }
@@ -474,8 +514,12 @@ clear_upstream_key() {
       set_env "UPSTREAM_PASS" ""
       log "OK: UPSTREAM_PASS=<empty>。跑 sb-apply 生效。"
       ;;
+    isp)
+      set_env "UPSTREAM_ISP" "1"
+      log "OK: UPSTREAM_ISP 已重置为默认值 1。"
+      ;;
     *)
-      die "upstream clear 不支持 key '$key'；可选：inbounds/domain_strategy/name/user/pass"
+      die "upstream clear 不支持 key '$key'；可选：inbounds/domain_strategy/name/user/pass/isp"
       ;;
   esac
 }
@@ -491,6 +535,8 @@ show_upstream() {
   echo "  host=${UPSTREAM_HOST:-}"
   echo "  port=${UPSTREAM_PORT:-}"
   echo "  user=${UPSTREAM_USER:-}"
+  echo "  region=${UPSTREAM_REGION:-<none>} (订阅节点命名用，host 变更时自动探测)"
+  echo "  isp=${UPSTREAM_ISP:-1} (1=命名带 ISP 段，0=省略)"
   echo
   echo "available inbounds:"
   available_inbounds_json | jq -r '.[] | "  " + .'
@@ -818,6 +864,19 @@ case "$cmd" in
 
     write_json "$tmp"
     log "OK: 已删 outbound ${name}。跑 sb-apply 应用。"
+
+    load_env
+    if [[ "${UPSTREAM_NAME:-}" == "$name" ]]; then
+      set_env "UPSTREAM_ENABLED" "0"
+      set_env "UPSTREAM_NAME" ""
+      set_env "UPSTREAM_HOST" ""
+      set_env "UPSTREAM_PORT" ""
+      set_env "UPSTREAM_USER" ""
+      set_env "UPSTREAM_PASS" ""
+      set_env "UPSTREAM_REGION" ""
+      set_env "UPSTREAM_ISP" "1"
+      log "WARN: 被删 outbound '${name}' 正是当前 upstream，已清空 UPSTREAM_* 并禁用 upstream。跑 sb-apply 生效。"
+    fi
     ;;
 
   show)
