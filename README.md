@@ -55,7 +55,7 @@ Required interactive VPS preparation and tuning: dependencies, certbot/certifica
 | `pi tune deps check` | Check required packages. | Read-only |
 | `pi tune deps install` | Install required base packages. | System packages |
 | `pi tune deps upgrade` | Run package upgrade flow. | System packages |
-| `pi tune cert` | Interactive certbot certificate wizard; links `certs/cert.pem` and `certs/key.pem`. HY2 already uses these template defaults, so no inbound patch is written unless paths diverge. | sing-box service, certbot, `/etc/letsencrypt`, certbot deploy hook, `env/cert.json`, `certs/`, optional `pi apply` |
+| `pi tune cert` | Interactive certbot certificate wizard; links `certs/cert.pem` and `certs/key.pem`, then writes HY2 `tls.server_name` to the issued domain. | sing-box service, certbot, `/etc/letsencrypt`, certbot deploy hook, `env/cert.json`, `certs/`, `env/inbounds.json`, optional `pi apply` |
 | `pi tune cert check` | Check certbot, renewal task, deploy hook, cert links, and configured TLS paths. | Read-only |
 | `pi tune cert install` | Install certbot only. | System packages |
 | `pi tune cert renew-test` | Manually run `certbot renew --dry-run`; this temporarily stops sing-box. | sing-box service, certbot staging |
@@ -222,6 +222,9 @@ Export subscriptions from compiled `out/config.json`. Run `pi apply` first.
 | `pi export hy2` | Export only Hysteria2 nodes. | `out/sub/` |
 | `pi export socks5` | Export only SOCKS5 nodes. | `out/sub/` |
 | `pi export all transit` | Export all protocols for one account/alias. | `out/sub/` |
+| `pi export hy2-in transit` | Export one inbound tag for one account/alias. | `out/sub/` |
+| `pi export node hy2-in transit` | Print JSON nodes through `pi show node`. | Read-only |
+| `pi export txt hy2-in transit` | Print plain links through `pi show txt`. | Read-only |
 
 ### `pi show`
 
@@ -232,6 +235,7 @@ Print share links or JSON node objects from compiled config.
 | `pi show txt` | Print text share links. | Read-only |
 | `pi show txt all transit` | Print all protocol links for one user. | Read-only |
 | `pi show txt vless netflix` | Print VLESS links for one user. | Read-only |
+| `pi show txt hy2-in netflix` | Print links for one inbound tag and one user. | Read-only |
 | `pi show node all transit` | Print JSON node objects for one user. | Read-only |
 
 ### `pi doctor`
@@ -246,7 +250,7 @@ Read-only diagnostics for service, ports, firewall, certificates, nftables, DNS,
 | `pi doctor service` | Check sing-box service/config. | Read-only |
 | `pi doctor ports` | Check inbounds and listening ports. | Read-only |
 | `pi doctor firewall` | Show UFW state. | Read-only |
-| `pi doctor cert` | Check certbot, renewal timer/cron, cert symlinks, and TLS paths. | Read-only |
+| `pi doctor cert` | Check certbot, renewal timer/cron, deploy hook, UFW 80/tcp, cert expiry/fingerprint, TLS paths, and client update advice. | Read-only |
 | `pi doctor nft` | Show HY2 range nft table. | Read-only |
 | `pi doctor dns` | Show DNS state. | Read-only |
 | `pi doctor network` | Show network/public IP basics. | Read-only |
