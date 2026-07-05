@@ -731,22 +731,22 @@ link_cert_files(){
 }
 
 apply_cert_to_inbound(){
+  local domain="$1"
   local fullchain="$CERT_DIR/cert.pem"
   local privkey="$CERT_DIR/key.pem"
   local default_fullchain="$SB_ROOT/certs/cert.pem"
   local default_privkey="$SB_ROOT/certs/key.pem"
   local inbound_path
   local -a inbound_cmd
+  local rc=0
 
   if [[ "$fullchain" == "$default_fullchain" && "$privkey" == "$default_privkey" ]]; then
-    ok "HY2 模板默认已使用 ${fullchain} / ${privkey}，无需写入 inbounds.json overlay。"
-    return 0
+    ok "HY2 模板默认已使用 ${fullchain} / ${privkey}，无需写入 certificate_path/key_path overlay。"
   fi
 
   if [[ ! -f "$SB_ROOT/env/inbounds.json" || ! -f "$SB_ROOT/env/node.env" ]]; then
-    warn "尚未发现 env/inbounds.json 或 env/node.env，跳过 HY2 证书路径写入。"
-    advice "稍后执行 pi genenv 后再运行：pi inbound set hy2 tls.certificate_path $fullchain"
-    advice "稍后执行 pi genenv 后再运行：pi inbound set hy2 tls.key_path $privkey"
+    warn "尚未发现 env/inbounds.json 或 env/node.env，跳过 HY2 tls.server_name 写入。"
+    advice "稍后执行 pi genenv 后再运行：pi inbound set hy2 tls.server_name $domain"
     return 1
   fi
 
@@ -758,22 +758,29 @@ apply_cert_to_inbound(){
     inbound_cmd=(bash "$SB_ROOT/bin/sb-inbound")
   else
     warn "找不到 sb-inbound，请手动执行："
-    advice "pi inbound set hy2 tls.certificate_path $fullchain"
-    advice "pi inbound set hy2 tls.key_path $privkey"
+    advice "pi inbound set hy2 tls.server_name $domain"
     return 1
   fi
 
-  if ! "${inbound_cmd[@]}" set hy2 tls.certificate_path "$fullchain"; then
+  if [[ "$fullchain" != "$default_fullchain" ]] && ! "${inbound_cmd[@]}" set hy2 tls.certificate_path "$fullchain"; then
     warn "写入 HY2 certificate_path 失败，可能当前没有 hysteria2 inbound。已保留证书软链。"
     advice "确认 inbound 后手动执行：pi inbound set hy2 tls.certificate_path $fullchain"
-    return 1
+    rc=1
   fi
 
-  if ! "${inbound_cmd[@]}" set hy2 tls.key_path "$privkey"; then
+  if [[ "$privkey" != "$default_privkey" ]] && ! "${inbound_cmd[@]}" set hy2 tls.key_path "$privkey"; then
     warn "写入 HY2 key_path 失败，可能当前没有 hysteria2 inbound。已保留证书软链。"
     advice "确认 inbound 后手动执行：pi inbound set hy2 tls.key_path $privkey"
-    return 1
+    rc=1
   fi
+
+  if ! "${inbound_cmd[@]}" set hy2 tls.server_name "$domain"; then
+    warn "写入 HY2 tls.server_name 失败，可能当前没有 hysteria2 inbound。sb-show/sb-export 的 SNI 仍会回落到 HY2_SNI 默认值（www.bing.com），与实际证书域名不一致。"
+    advice "确认 inbound 后手动执行：pi inbound set hy2 tls.server_name $domain"
+    rc=1
+  fi
+
+  return "$rc"
 }
 
 run_apply_if_requested(){
@@ -820,7 +827,7 @@ cert_wizard(){
   ensure_certbot_renew_task
   ensure_certbot_deploy_hook
   link_cert_files "$domain"
-  if apply_cert_to_inbound; then
+  if apply_cert_to_inbound "$domain"; then
     certbot_check
     run_apply_if_requested
   else
