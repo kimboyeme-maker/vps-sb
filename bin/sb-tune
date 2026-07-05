@@ -570,6 +570,7 @@ record_dns_domain(){
 
 stop_singbox_for_cert(){
   if has systemctl && systemctl is-active --quiet sing-box 2>/dev/null; then
+    ask_yn "sing-box 正在运行，确认暂时停止吗（完成后自动恢复）" Y || die "用户取消操作。"
     systemctl stop sing-box
     echo active
   else
@@ -585,27 +586,58 @@ restore_singbox_after_cert(){
   fi
 }
 
+ensure_ufw_allows_http(){
+  has ufw || return 0
+  ufw status 2>/dev/null | grep -q "Status: active" || return 0
+
+  if ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW'; then
+    status "ufw 已放行 80/tcp。"
+  else
+    warn "ufw 未放行 80/tcp，自动执行 ufw allow 80/tcp（证书签发/续期需要）。"
+    ufw allow 80/tcp >/dev/null
+    ok "已放行 80/tcp。"
+  fi
+}
+
+wait_with_progress(){
+  local pid="$1" sec=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 3
+    sec=$((sec + 3))
+    status "仍在等待 Let's Encrypt 响应...(${sec}s，如果长时间无响应，多半是 80/tcp 从公网不可达)"
+  done
+  wait "$pid"
+}
+
 certbot_issue(){
   local email="$1"
   local domain="$2"
-  local prev_state
+  local prev_state cb_pid cb_rc
 
   stage "Certbot certonly：申请证书"
-  warn "即将暂时停止 sing-box，避免证书申请期间端口冲突。申请完成后会尝试恢复。"
-  expect "域名 $domain 必须已经解析到本机公网 IP，且 80/tcp 能从公网访问。"
-  ask_yn "确认继续并暂时停止 sing-box 吗" Y || die "用户取消证书申请。"
+  expect "域名 $domain 必须已经解析到本机公网 IP，本机 80/tcp 和云厂商安全组/防火墙都要放行 80/tcp。"
+
+  ensure_ufw_allows_http
 
   prev_state="$(stop_singbox_for_cert)"
   trap 'restore_singbox_after_cert "$prev_state"' RETURN EXIT
   if [[ "$prev_state" == "active" ]]; then
     status "sing-box 已暂时停止。"
   else
-    status "sing-box 当前未运行或 systemctl 不可用。"
+    status "sing-box 当前未运行，无需停止。"
   fi
 
-  if ! certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring \
-      --email "$email" -d "$domain" --preferred-challenges http; then
-    die "certbot 申请证书失败。请确认域名解析、本机 80/tcp 防火墙和云厂商安全组。"
+  certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring \
+    --email "$email" -d "$domain" --preferred-challenges http &
+  cb_pid=$!
+  if wait_with_progress "$cb_pid"; then
+    cb_rc=0
+  else
+    cb_rc=$?
+  fi
+
+  if (( cb_rc != 0 )); then
+    die "certbot 申请证书失败。请确认域名解析、本机 80/tcp 防火墙和云厂商安全组（安全组是脚本管不到的一层，需要自行在云控制台放行）。"
   fi
 
   trap - RETURN EXIT
