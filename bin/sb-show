@@ -102,9 +102,9 @@ esac
 
 [[ $# -le 3 ]] || fail_usage "参数过多"
 
-[[ -f "$ENV_FILE"   ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
-[[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，先跑 sb-genenv"
-[[ -f "$CONFIG"     ]] || die "缺 $CONFIG，请先跑 sb-apply"
+[[ -f "$ENV_FILE"   ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
+[[ -f "$USERS_FILE" ]] || die "缺 ${USERS_FILE}，先跑 sb-genenv"
+[[ -f "$CONFIG"     ]] || die "缺 ${CONFIG}，请先跑 sb-apply"
 
 for dep in jq base64; do
   command -v "$dep" >/dev/null || die "缺依赖 $dep"

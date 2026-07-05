@@ -103,9 +103,9 @@ esac
 
 [[ $# -le 2 ]] || fail_usage "参数过多"
 
-[[ -f "$ENV_FILE"   ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
-[[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，先跑 sb-genenv"
-[[ -f "$CONFIG"     ]] || die "缺 $CONFIG，请先跑 sb-apply"
+[[ -f "$ENV_FILE"   ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
+[[ -f "$USERS_FILE" ]] || die "缺 ${USERS_FILE}，先跑 sb-genenv"
+[[ -f "$CONFIG"     ]] || die "缺 ${CONFIG}，请先跑 sb-apply"
 
 for dep in jq base64 sed grep date mktemp install; do
   command -v "$dep" >/dev/null || die "缺依赖 $dep"
@@ -707,7 +707,7 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
 
   if [[ ! -s "$uris_tmp" ]]; then
     rm -f "$uris_tmp" "$yaml_tmp"
-    die "没有生成任何节点，protocol=$proto user=$name；请确认 sb-apply 后 config.json 里存在该用户"
+    die "没有生成任何节点，protocol=$proto user=${name}；请确认 sb-apply 后 config.json 里存在该用户"
   fi
 
   if ! grep -Eq '^(vless|hysteria2|socks5)://' "$uris_tmp"; then
