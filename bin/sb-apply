@@ -6,6 +6,8 @@ ENV_FILE="$SB_ROOT/env/node.env"
 USERS_FILE="$SB_ROOT/env/users.json"
 INBOUNDS_FILE="$SB_ROOT/env/inbounds.json"
 OUTBOUND_PATCH_FILE="$SB_ROOT/env/outbound-patch.json"
+DNS_FILE="$SB_ROOT/env/dns.json"
+CERT_META_FILE="$SB_ROOT/env/cert.json"
 TPL="$SB_ROOT/templates/config.json.tpl"
 OUT="$SB_ROOT/out/config.json"
 
@@ -39,7 +41,7 @@ summary:
    12. 自动合并 env/dns.json（DNS 策略，默认禁用）
    13. 自动合并 env/routes.json（自定义分流规则，默认禁用）
    14. sing-box check 通过后才落盘
-   15. 重启 sing-box
+   15. config 变化时重启 sing-box；config 未变则跳过重启，服务未运行时仅 start
    16. UFW 端口对账
    17. HY2 range nftables dnat 对账
 
@@ -66,6 +68,7 @@ notes:
   - VLESS_PORT / HY2_PORT / SOCKS5_PORT 是模板 listen_port 必需参数；缺失或为空会直接失败，不自动补默认值
   - sing-box check 不通过时不会覆盖正式 config
   - HY2_RANGE_ENABLED=1 时需要系统有 nft 命令
+  - env/cert.json 存在或 env/dns.json.domains 非空时，UFW 会自动保留 80/tcp 供 certbot 续期
   - sb-apply snapshot：apply 全部成功后打一张快照（调 sb-backup），并只保留最近 10 张；平时 sb-apply 不打快照
 U
 }
@@ -87,8 +90,8 @@ case "${1:-}" in
     ;;
 esac
 
-[[ -f "$ENV_FILE"   ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
-[[ -f "$USERS_FILE" ]] || die "缺 $USERS_FILE，先跑 sb-genenv"
+[[ -f "$ENV_FILE"   ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
+[[ -f "$USERS_FILE" ]] || die "缺 ${USERS_FILE}，先跑 sb-genenv"
 [[ -f "$TPL"        ]] || die "缺 $TPL"
 
 for dep in envsubst jq sing-box ufw ss awk grep sort head; do
@@ -345,6 +348,8 @@ dbg "inbound base tags: vless=$VLESS_TAG hy2=$HY2_TAG socks5=$SOCKS5_TAG"
 
 TMP="$(mktemp)"
 TMP2="$(mktemp)"
+CHECK_LOG="$(mktemp)"
+NFT_BATCH="$(mktemp)"
 
 dbg "envsubst 填标量"
 VARS='${SB_ROOT} ${VLESS_TAG} ${HY2_TAG} ${SOCKS5_TAG} ${VLESS_PORT} ${HY2_PORT} ${SOCKS5_PORT} ${REALITY_PRIVATE_KEY} ${REALITY_SHORT_ID} ${REALITY_SNI} ${HY2_UP_MBPS} ${HY2_DOWN_MBPS} ${HY2_OBFS_PASS}'
@@ -430,13 +435,22 @@ fi
 dbg "读取 DNS / route overlay"
 
 DNS_JSON='{"enabled":false}'
-if [[ -f "$SB_ROOT/env/dns.json" ]]; then
+if [[ -f "$DNS_FILE" ]]; then
   DNS_JSON="$(jq -c '
     if type != "object" then error("dns.json 必须是 object") else . end
     | .enabled  = (.enabled  // false)
     | .servers  = (.servers  // {})
+    | .domains  = (.domains  // [])
     | .rules    = (.rules    // [])
-  ' "$SB_ROOT/env/dns.json")" || die "$SB_ROOT/env/dns.json 格式错误"
+    | if (.servers | type) != "object" then error(".servers 必须是 object") else . end
+    | if (.domains | type) != "array" then error(".domains 必须是 array") else . end
+    | if (.rules | type) != "array" then error(".rules 必须是 array") else . end
+    | .domains = (
+        .domains
+        | map(tostring | ascii_downcase)
+        | unique
+      )
+  ' "$DNS_FILE")" || die "$DNS_FILE 格式错误"
 fi
 
 ROUTES_JSON='{"enabled":false,"rules":[]}'
@@ -925,31 +939,52 @@ fi
 
 dbg "语法校验（过了才落盘）"
 
-if ! sing-box check -c "$TMP2" 2>&1 | tee /tmp/sb-check.log; then
+if ! sing-box check -c "$TMP2" 2>&1 | tee "$CHECK_LOG"; then
   die "sing-box check 未通过，已保留临时文件供调试:
   - 渲染后的 config: $TMP2
   - jq 输入 envsubst 后: $TMP
-  查看 sing-box 错误信息: cat /tmp/sb-check.log
+  查看 sing-box 错误信息: cat $CHECK_LOG
   修复后重跑 sb-apply"
 fi
 
-[[ -f "$OUT" ]] && {
-  cp -a "$OUT" "$OUT.bak.$(date +%s)"
-  dbg "已备份旧 config"
-}
+CONFIG_CHANGED=1
+if [[ -f "$OUT" ]] && cmp -s "$TMP2" "$OUT"; then
+  CONFIG_CHANGED=0
+fi
 
-install -m 600 "$TMP2" "$OUT"
-log "OK: 已生成 $OUT"
+if (( CONFIG_CHANGED == 1 )); then
+  [[ -f "$OUT" ]] && {
+    cp -a "$OUT" "$OUT.bak.$(date +%s)"
+    dbg "已备份旧 config"
+  }
+
+  install -m 600 "$TMP2" "$OUT"
+  log "OK: 已生成 $OUT"
+else
+  log "OK: config 未变化，跳过落盘与 sing-box restart"
+fi
 
 apply_hy2_nft() {
   local table="sb_hy2_range"
 
   if [[ "${HY2_RANGE_ENABLED:-0}" == "1" && -n "$HY2_RANGE_START" && -n "$HY2_RANGE_END" && -n "$HY2_RANGE_PORT" ]]; then
-    nft list table inet "$table" >/dev/null 2>&1 && nft delete table inet "$table" || true
+    : > "$NFT_BATCH"
+    if nft list table inet "$table" >/dev/null 2>&1; then
+      if nft list chain inet "$table" prerouting >/dev/null 2>&1; then
+        {
+          echo "flush chain inet $table prerouting"
+          echo "delete chain inet $table prerouting"
+        } >> "$NFT_BATCH"
+      fi
+    else
+      echo "add table inet $table" >> "$NFT_BATCH"
+    fi
+    {
+      echo "add chain inet $table prerouting { type nat hook prerouting priority dstnat; policy accept; }"
+      echo "add rule inet $table prerouting udp dport ${HY2_RANGE_START}-${HY2_RANGE_END} dnat to :${HY2_RANGE_PORT}"
+    } >> "$NFT_BATCH"
 
-    nft add table inet "$table"
-    nft 'add chain inet sb_hy2_range prerouting { type nat hook prerouting priority dstnat; policy accept; }'
-    nft add rule inet "$table" prerouting udp dport "${HY2_RANGE_START}-${HY2_RANGE_END}" dnat to ":${HY2_RANGE_PORT}"
+    nft -f "$NFT_BATCH"
 
     log "OK: nftables HY2 range dnat 已应用：udp ${HY2_RANGE_START}-${HY2_RANGE_END} -> ${HY2_RANGE_PORT}"
   else
@@ -964,10 +999,17 @@ apply_hy2_nft() {
   return 0
 }
 
-dbg "重启 sing-box"
-
-systemctl restart sing-box
-sleep 1
+if (( CONFIG_CHANGED == 1 )); then
+  dbg "重启 sing-box"
+  systemctl restart sing-box
+  sleep 1
+elif ! systemctl is-active --quiet sing-box; then
+  dbg "config 未变化但 sing-box 未运行，尝试启动"
+  systemctl start sing-box
+  sleep 1
+else
+  dbg "config 未变化且 sing-box 运行中，跳过重启"
+fi
 
 systemctl is-active --quiet sing-box || die "sing-box 未起来，看 journalctl -u sing-box -e"
 
@@ -1005,11 +1047,23 @@ SSH_PORT="$(
 
 SSH_PORT="${SSH_PORT:-22}"
 
-dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} HY2_RANGE=${HY2_RANGE_ALLOW:-}"
+KEEP_HTTP_FOR_CERT=0
+if [[ -f "$CERT_META_FILE" ]]; then
+  KEEP_HTTP_FOR_CERT=1
+elif jq -e '(.domains // []) | length > 0' <<<"$DNS_JSON" >/dev/null; then
+  KEEP_HTTP_FOR_CERT=1
+fi
+
+dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} HY2_RANGE=${HY2_RANGE_ALLOW:-} KEEP_HTTP_FOR_CERT=$KEEP_HTTP_FOR_CERT"
 
 declare -A WANT
 
 WANT["${SSH_PORT}/tcp"]=1
+
+if (( KEEP_HTTP_FOR_CERT == 1 )); then
+  WANT["80/tcp"]=1
+  log "INFO: 检测到证书/域名登记，保留 80/tcp 供 certbot 续期。"
+fi
 
 for p in $TCP_PORTS; do
   WANT["${p}/tcp"]=1
@@ -1095,5 +1149,5 @@ if [[ "$DO_SNAPSHOT" == "1" ]]; then
   fi
 fi
 
-rm -f "$TMP" "$TMP2" /tmp/sb-check.log
+rm -f "$TMP" "$TMP2" "$CHECK_LOG" "$NFT_BATCH"
 dbg "已清理临时文件"
