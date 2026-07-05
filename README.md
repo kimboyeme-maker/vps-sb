@@ -289,9 +289,9 @@ when no explicit SNI is set.
 `pi show txt` groups links under a `# ── <user> · <proto> · <tag> ──` section
 header, and — when a managed domain exists — emits a third domain-addressed
 link per inbound next to the `v4`/`v6` ones. Node naming follows the same
-`<NODE_COUNTRY>-<proto-or-tag>[-v4|-v6]` scheme described under `pi export`
-above (`pi show` has no per-user outbound routing, so it never adds an
-upstream/ISP name segment).
+scheme described under `pi export` above, including the
+`<NODE_COUNTRY>-<UPSTREAM_REGION>[-ISP]-<proto-or-tag>` form for users whose
+egress is `upstream`.
 
 | Command | Description | Affects |
 | --- | --- | --- |

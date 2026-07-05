@@ -36,6 +36,20 @@ detect_country() {
   printf ''
 }
 
+# 探测任意目标主机所在国家二字码，用于 upstream 出口地区命名兜底；无 curl 时静默跳过
+detect_region_for_host() {
+  local host="$1"
+  [[ -n "$host" ]] || { printf ''; return 0; }
+  command -v curl >/dev/null 2>&1 || { printf ''; return 0; }
+
+  local c
+  c="$(curl -fsS4 --max-time 6 "https://ipapi.co/${host}/country/" 2>/dev/null || true)"
+  [[ "$c" =~ ^[A-Za-z]{2}$ ]] || c="$(curl -fsS4 --max-time 6 "http://ip-api.com/line/${host}?fields=countryCode" 2>/dev/null || true)"
+  [[ "$c" =~ ^[A-Za-z]{2}$ ]] || c=""
+
+  printf '%s' "${c,,}"
+}
+
 summary() {
   cat <<'S'
 summary:
@@ -227,6 +241,13 @@ HY2_RANGE_ENABLED="${HY2_RANGE_ENABLED:-0}"
 HY2_RANGE_TAG="${HY2_RANGE_TAG:-}"
 HY2_RANGE_OFFSET="${HY2_RANGE_OFFSET:-}"
 HY2_RANGE_HOP_INTERVAL="${HY2_RANGE_HOP_INTERVAL:-30}"
+UPSTREAM_HOST="${UPSTREAM_HOST:-}"
+UPSTREAM_REGION="${UPSTREAM_REGION:-}"
+UPSTREAM_ISP="${UPSTREAM_ISP:-1}"
+if [[ -z "$UPSTREAM_REGION" ]]; then
+  UPSTREAM_REGION="$(detect_region_for_host "$UPSTREAM_HOST")"
+  [[ -z "$UPSTREAM_REGION" ]] && UPSTREAM_REGION="unknown"
+fi
 MANAGED_DOMAIN=""
 
 if [[ -f "$CERT_META_FILE" ]]; then
@@ -423,6 +444,35 @@ inbound_rows() {
   ' "$CONFIG"
 }
 
+# 只判断用户级默认出口，不把 sb-route 的域名/IP 细分规则当成整节点出口。
+route_outbound_for_user_tag() {
+  local user="$1"
+  local tag="$2"
+
+  jq -r --arg u "$user" --arg t "$tag" '
+    def str_or_array_has($v; $x):
+      if $v == null then false
+      elif ($v | type) == "array" then ($v | index($x)) != null
+      else ($v == $x)
+      end;
+
+    def domainish:
+      has("domain") or has("domain_suffix") or has("domain_keyword") or
+      has("domain_regex") or has("ip_cidr") or has("rule_set") or
+      has("ip_is_private") or has("geoip") or has("geosite");
+
+    [
+      .route.rules[]?
+      | select(.outbound? != null)
+      | select(.auth_user? != null)
+      | select(str_or_array_has(.auth_user; $u))
+      | select((.inbound? == null) or str_or_array_has(.inbound; $t))
+      | select(domainish | not)
+      | .outbound
+    ][0] // "direct"
+  ' "$CONFIG"
+}
+
 user_rows() {
   jq -r --arg filter "$filter_user" '
     .[]
@@ -565,11 +615,18 @@ case "$mode" in
         esac
 
         proto_label="$(tag_or_type_label "$p" "$tag")"
+        outbound="$(route_outbound_for_user_tag "$name" "$tag")"
+
+        region_part="$NODE_COUNTRY"
+        if [[ "$outbound" != "direct" ]]; then
+          region_part="${NODE_COUNTRY}-${UPSTREAM_REGION}"
+          [[ "$UPSTREAM_ISP" == "1" ]] && region_part="${region_part}-ISP"
+        fi
 
         echo "# ── ${disp} · ${p} · ${tag} ──"
         while IFS=$'\t' read -r host addr_label; do
           [[ -n "$host" ]] || continue
-          nodename="${NODE_COUNTRY}-${proto_label}$(addr_suffix "$addr_label")"
+          nodename="${region_part}-${proto_label}$(addr_suffix "$addr_label")"
           case "$p" in
             vless)
               vless_uri "$host" "$port" "$uuid" "$nodename" "$sni" "$short_id"
