@@ -219,6 +219,11 @@ When `env/cert.json` or `env/dns.json.domains` records a managed domain,
 `pi export` writes it to YAML `x-meta.domain`; `pi export node ...` delegates
 to `pi show node ...` and includes the same `domain` field.
 
+Every node is also emitted with a `domain`-addressed variant alongside the
+`v4`/`v6` IP variants (node name suffix `-domain`), so subscriptions carry
+`server: <domain>` entries in addition to the IP ones. With no managed domain
+present, only the IP variants are produced.
+
 | Command | Description | Affects |
 | --- | --- | --- |
 | `pi export` | Export all protocols for all users. | `out/sub/` |
@@ -239,6 +244,10 @@ When a managed domain exists, `pi show node ...` includes `domain` on the user
 object and each node. HY2 `sni` comes from the compiled inbound
 `tls.server_name`, with the managed certificate domain filled by `pi apply`
 when no explicit SNI is set.
+
+`pi show txt` groups links under a `# ── <user> · <proto> · <tag> ──` section
+header, and — when a managed domain exists — emits a third `-domain` link per
+inbound (address = domain) next to the `-v4`/`-v6` links.
 
 | Command | Description | Affects |
 | --- | --- | --- |

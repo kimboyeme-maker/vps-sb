@@ -167,6 +167,14 @@ if [[ -z "$MANAGED_DOMAIN" && -f "$DNS_FILE" ]]; then
   MANAGED_DOMAIN="$(jq -r '(.domains // [])[0] // "" | tostring | ascii_downcase' "$DNS_FILE" 2>/dev/null || true)"
 fi
 
+# 枚举节点连接地址：v4 / v6(可选) / 域名(可选)，tab 分隔 <host>\t<label>
+addr_list() {
+  printf '%s\t%s\n' "$SERVER_IP" "v4"
+  [[ -n "${SERVER_IP6:-}" ]] && printf '%s\t%s\n' "$SERVER_IP6" "v6"
+  [[ -n "$MANAGED_DOMAIN" ]] && printf '%s\t%s\n' "$MANAGED_DOMAIN" "domain"
+  return 0
+}
+
 [[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY_PUBLIC_KEY 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_SHORT_ID" ]] || die "REALITY_SHORT_ID 为空，请检查 $ENV_FILE"
@@ -501,8 +509,11 @@ hy2_uri() {
 
   [[ -z "$sni" ]] && sni="$HY2_SNI"
 
+  local insecure=1
+  [[ "$ipver" == "domain" ]] && insecure=0
+
   frag="$(urlencode "$(node_name "$disp" "$outbound" "$tag" "Hy2" "$ipver")")"
-  q="sni=$(urlencode "$sni")&insecure=1&alpn=h3"
+  q="sni=$(urlencode "$sni")&insecure=${insecure}&alpn=h3"
 
   if [[ -n "$obfs_type" && "$obfs_type" != "plain" && "$obfs_type" != "none" ]]; then
     q="${q}&obfs=$(urlencode "$obfs_type")"
@@ -607,6 +618,9 @@ emit_hy2_yaml() {
   [[ -z "$sni" ]] && sni="$HY2_SNI"
   n="$(node_name "$disp" "$outbound" "$tag" "Hy2" "$ipver")"
 
+  local skip_verify=true
+  [[ "$ipver" == "domain" ]] && skip_verify=false
+
   cat <<YML
   - name: $(yaml_q "$n")
     type: hysteria2
@@ -624,7 +638,7 @@ YML
   cat <<YML
     password: $(yaml_q "$pw")
     sni: $(yaml_q "$sni")
-    skip-cert-verify: true
+    skip-cert-verify: ${skip_verify}
     alpn:
       - h3
 YML
@@ -750,13 +764,11 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
         vless_uuid="$(row_get "$row_json" uuid)"
         flow="$(row_get "$row_json" flow)"
 
-        vless_uri "$SERVER_IP" "$port" "$vless_uuid" "$disp" "$tag" v4 "$sni" "$short_id" "$flow" "$outbound" >> "$uris_tmp"
-        emit_vless_yaml "$SERVER_IP" "$port" "$vless_uuid" "$disp" "$tag" v4 "$sni" "$short_id" "$flow" "$outbound" >> "$yaml_tmp"
-
-        if [[ -n "${SERVER_IP6:-}" ]]; then
-          vless_uri "$SERVER_IP6" "$port" "$vless_uuid" "$disp" "$tag" v6 "$sni" "$short_id" "$flow" "$outbound" >> "$uris_tmp"
-          emit_vless_yaml "$SERVER_IP6" "$port" "$vless_uuid" "$disp" "$tag" v6 "$sni" "$short_id" "$flow" "$outbound" >> "$yaml_tmp"
-        fi
+        while IFS=$'\t' read -r host label; do
+          [[ -n "$host" ]] || continue
+          vless_uri "$host" "$port" "$vless_uuid" "$disp" "$tag" "$label" "$sni" "$short_id" "$flow" "$outbound" >> "$uris_tmp"
+          emit_vless_yaml "$host" "$port" "$vless_uuid" "$disp" "$tag" "$label" "$sni" "$short_id" "$flow" "$outbound" >> "$yaml_tmp"
+        done < <(addr_list)
         ;;
 
       hy2)
@@ -768,26 +780,22 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
         down="$(row_get "$row_json" down)"
         ports="$(hy2_range_ports "$tag" "$port")"
 
-        hy2_uri "$SERVER_IP" "$port" "$hy2_pw" "$disp" "$tag" v4 "$hy2_sni" "$obfs_type" "$obfs_pass" "$ports" "$outbound" >> "$uris_tmp"
-        emit_hy2_yaml "$SERVER_IP" "$port" "$hy2_pw" "$disp" "$tag" v4 "$hy2_sni" "$obfs_type" "$obfs_pass" "$up" "$down" "$ports" "$outbound" >> "$yaml_tmp"
-
-        if [[ -n "${SERVER_IP6:-}" ]]; then
-          hy2_uri "$SERVER_IP6" "$port" "$hy2_pw" "$disp" "$tag" v6 "$hy2_sni" "$obfs_type" "$obfs_pass" "$ports" "$outbound" >> "$uris_tmp"
-          emit_hy2_yaml "$SERVER_IP6" "$port" "$hy2_pw" "$disp" "$tag" v6 "$hy2_sni" "$obfs_type" "$obfs_pass" "$up" "$down" "$ports" "$outbound" >> "$yaml_tmp"
-        fi
+        while IFS=$'\t' read -r host label; do
+          [[ -n "$host" ]] || continue
+          hy2_uri "$host" "$port" "$hy2_pw" "$disp" "$tag" "$label" "$hy2_sni" "$obfs_type" "$obfs_pass" "$ports" "$outbound" >> "$uris_tmp"
+          emit_hy2_yaml "$host" "$port" "$hy2_pw" "$disp" "$tag" "$label" "$hy2_sni" "$obfs_type" "$obfs_pass" "$up" "$down" "$ports" "$outbound" >> "$yaml_tmp"
+        done < <(addr_list)
         ;;
 
       socks5)
         socks_user="$(row_get "$row_json" socks_username)"
         socks_pw="$(row_get "$row_json" socks_password)"
 
-        socks5_uri "$SERVER_IP" "$port" "$socks_user" "$socks_pw" "$disp" "$tag" v4 "$outbound" >> "$uris_tmp"
-        emit_socks5_yaml "$SERVER_IP" "$port" "$socks_user" "$socks_pw" "$disp" "$tag" v4 "$outbound" >> "$yaml_tmp"
-
-        if [[ -n "${SERVER_IP6:-}" ]]; then
-          socks5_uri "$SERVER_IP6" "$port" "$socks_user" "$socks_pw" "$disp" "$tag" v6 "$outbound" >> "$uris_tmp"
-          emit_socks5_yaml "$SERVER_IP6" "$port" "$socks_user" "$socks_pw" "$disp" "$tag" v6 "$outbound" >> "$yaml_tmp"
-        fi
+        while IFS=$'\t' read -r host label; do
+          [[ -n "$host" ]] || continue
+          socks5_uri "$host" "$port" "$socks_user" "$socks_pw" "$disp" "$tag" "$label" "$outbound" >> "$uris_tmp"
+          emit_socks5_yaml "$host" "$port" "$socks_user" "$socks_pw" "$disp" "$tag" "$label" "$outbound" >> "$yaml_tmp"
+        done < <(addr_list)
         ;;
     esac
   done

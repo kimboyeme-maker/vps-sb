@@ -206,6 +206,14 @@ if [[ -z "$MANAGED_DOMAIN" && -f "$DNS_FILE" ]]; then
   MANAGED_DOMAIN="$(jq -r '(.domains // [])[0] // "" | tostring | ascii_downcase' "$DNS_FILE" 2>/dev/null || true)"
 fi
 
+# 枚举节点连接地址：v4 / v6(可选) / 域名(可选)，tab 分隔 <host>\t<label>
+addr_list() {
+  printf '%s\t%s\n' "$SERVER_IP" "v4"
+  [[ -n "${SERVER_IP6:-}" ]] && printf '%s\t%s\n' "$SERVER_IP6" "v6"
+  [[ -n "$MANAGED_DOMAIN" ]] && printf '%s\t%s\n' "$MANAGED_DOMAIN" "domain"
+  return 0
+}
+
 [[ -n "$SERVER_IP" ]] || die "SERVER_IP 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY_PUBLIC_KEY 为空，请检查 $ENV_FILE"
 [[ -n "$REALITY_SHORT_ID" ]] || die "REALITY_SHORT_ID 为空，请检查 $ENV_FILE"
@@ -408,8 +416,11 @@ hy2_uri() {
 
   [[ -z "$sni" ]] && sni="$HY2_SNI"
 
+  local insecure=1
+  [[ "$ipver" == "domain" ]] && insecure=0
+
   frag="$(urlencode "$(node_name "$disp" "$tag" "Hy2" "$ipver")")"
-  q="sni=$(urlencode "$sni")&insecure=1&alpn=h3"
+  q="sni=$(urlencode "$sni")&insecure=${insecure}&alpn=h3"
 
   if [[ -n "$obfs_type" && "$obfs_type" != "plain" && "$obfs_type" != "none" ]]; then
     q="${q}&obfs=$(urlencode "$obfs_type")"
@@ -484,25 +495,26 @@ case "$mode" in
         fi
 
         case "$p" in
-          vless)
-            vless_uri "$SERVER_IP" "$port" "$uuid" "$disp" "$tag" "v4" "$sni" "$short_id"
-            if [[ -n "${SERVER_IP6:-}" ]]; then
-              vless_uri "$SERVER_IP6" "$port" "$uuid" "$disp" "$tag" "v6" "$sni" "$short_id"
-            fi
-            ;;
-          hy2)
-            hy2_uri "$SERVER_IP" "$port" "$pw" "$disp" "$tag" "v4" "$sni" "$obfs_type" "$obfs_pass" "$ports"
-            if [[ -n "${SERVER_IP6:-}" ]]; then
-              hy2_uri "$SERVER_IP6" "$port" "$pw" "$disp" "$tag" "v6" "$sni" "$obfs_type" "$obfs_pass" "$ports"
-            fi
-            ;;
-          socks5)
-            socks5_uri "$SERVER_IP" "$port" "$name" "$pw" "$disp" "$tag" "v4"
-            if [[ -n "${SERVER_IP6:-}" ]]; then
-              socks5_uri "$SERVER_IP6" "$port" "$name" "$pw" "$disp" "$tag" "v6"
-            fi
-            ;;
+          vless|hy2|socks5) ;;
+          *) continue ;;
         esac
+
+        echo "# ── ${disp} · ${p} · ${tag} ──"
+        while IFS=$'\t' read -r host label; do
+          [[ -n "$host" ]] || continue
+          case "$p" in
+            vless)
+              vless_uri "$host" "$port" "$uuid" "$disp" "$tag" "$label" "$sni" "$short_id"
+              ;;
+            hy2)
+              hy2_uri "$host" "$port" "$pw" "$disp" "$tag" "$label" "$sni" "$obfs_type" "$obfs_pass" "$ports"
+              ;;
+            socks5)
+              socks5_uri "$host" "$port" "$name" "$pw" "$disp" "$tag" "$label"
+              ;;
+          esac
+        done < <(addr_list)
+        echo
       done
     done
     ;;
