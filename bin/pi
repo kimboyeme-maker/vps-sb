@@ -19,6 +19,7 @@ declare -A ROUTES=(
   [clear]=sb-clear
   [backup]=sb-backup
   [doctor]=sb-doctor
+  [detect]=sb-doctor
   [dns]=sb-dns
   [route]=sb-route
   [tune]=sb-tune
@@ -39,7 +40,8 @@ usage() {
   inbound     inbound 增删改查 / clone / HY2 端口跳跃                (= sb-inbound)
   clear       一键清空 env/certs/out（debug 用）                   (= sb-clear)
   backup      快照 / 回滚整个部署（restore 前自动快照）            (= sb-backup)
-  doctor      只读诊断 service/ports/firewall/nft/dns/network       (= sb-doctor)
+  doctor      只读诊断 service/ports/firewall/cert/nft/dns/network  (= sb-doctor)
+  detect      doctor 的别名，适合快速检测当前部署状态             (= sb-doctor)
   dns         服务端出站 DNS 策略（typed server / final / strategy）  (= sb-dns)
   route       自定义分流规则（域名/IP，硬覆盖层，支持 scope）        (= sb-route)
   tune        新机准备与系统调优（依赖/sing-box/sysctl/XanMod）       (= sb-tune)
@@ -86,5 +88,5 @@ if command -v "$target" >/dev/null 2>&1; then
 elif [[ -x "$BIN_DIR/$target" ]]; then
   exec "$BIN_DIR/$target" "$@"
 else
-  die "找不到目标脚本 $target（既不在 PATH，也不在 $BIN_DIR）"
+  die "找不到目标脚本 ${target}（既不在 PATH，也不在 ${BIN_DIR}）"
 fi

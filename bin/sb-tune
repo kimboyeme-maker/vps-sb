@@ -9,6 +9,10 @@ JOURNALD_FILE=/etc/systemd/journald.conf.d/99-sb-tune.conf
 XANMOD_KEYRING=/usr/share/keyrings/xanmod-archive-keyring.gpg
 XANMOD_LIST=/etc/apt/sources.list.d/xanmod-release.list
 SWAP_FILE=/swapfile
+CERT_META_FILE="$SB_ROOT/env/cert.json"
+CERT_DIR="$SB_ROOT/certs"
+DNS_FILE="$SB_ROOT/env/dns.json"
+CERT_RENEW_DEPLOY_HOOK=/etc/letsencrypt/renewal-hooks/deploy/sb-singbox-reload.sh
 
 DEPS=(
   curl wget gnupg2 ca-certificates lsb-release apt-transport-https
@@ -38,6 +42,7 @@ summary:
 
   默认直接运行 sb-tune 会进入标准新机引导 bootstrap：
     - 安装系统依赖
+    - 可选安装 certbot / 申请域名证书
     - 可选 full-upgrade
     - 检查/创建 swap
     - 安装 sing-box
@@ -56,6 +61,7 @@ summary:
   覆盖范围：
     - 机器 preflight / 推荐 profile
     - apt 依赖安装 / 可选 full-upgrade
+    - certbot 安装 / 域名证书引导
     - swap 检查 / 创建
     - sing-box 安装检查 / 安装
     - journald 小盘限制
@@ -64,8 +70,8 @@ summary:
     - reboot-needed 检查
 
   安全边界：
-    - check / preflight / recommend / plan / reboot-needed / deps check / swap check / singbox check 只读
-    - deps install / deps upgrade / swap create / singbox install / sysctl / journald / apply / bbrv3 / kernel 会改系统，需要 root
+    - check / preflight / recommend / plan / reboot-needed / deps check / cert check / swap check / singbox check 只读
+    - deps install / deps upgrade / cert install / cert / swap create / singbox install / sysctl / journald / apply / bbrv3 / kernel 会改系统，需要 root
 S
 }
 
@@ -83,6 +89,11 @@ usage:
   sb-tune deps check
   sb-tune deps install
   sb-tune deps upgrade
+
+  sb-tune cert
+  sb-tune cert check
+  sb-tune cert install
+  sb-tune cert renew-test
 
   sb-tune swap check
   sb-tune swap create [512M|1G|2G]
@@ -196,7 +207,7 @@ profile_values(){
         echo "RMEM=134217728 WMEM=134217728 JS=300M JF=80M JR=150M BACKLOG=65536 SYN=32768 NOTSENT=262144"
       fi
       ;;
-    *) die "未知 profile: $p（tiny|balanced|hy2）" ;;
+    *) die "未知 profile: ${p}（tiny|balanced|hy2）" ;;
   esac
 }
 
@@ -390,6 +401,404 @@ deps_upgrade(){
   ok "full-upgrade 完成。"
 }
 
+validate_email(){
+  local email="$1"
+  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "邮箱格式不合法：$email"
+}
+
+normalize_domain(){
+  local domain="${1:-}"
+
+  [[ -n "$domain" ]] || die "域名不能为空"
+  domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')"
+  domain="${domain#http://}"
+  domain="${domain#https://}"
+  domain="${domain%%/*}"
+  domain="${domain%%:*}"
+
+  [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || \
+    die "域名格式不合法：${domain}；请输入类似 example.com 的域名，不要带协议、路径或端口"
+
+  printf '%s' "$domain"
+}
+
+certbot_check(){
+  stage "Cert check：检查 certbot / 证书 / 软链"
+  explain "这一步只读，用于确认 certbot、续期任务、Let’s Encrypt 证书和工具目录软链。"
+
+  if has certbot; then
+    ok "certbot 存在：$(command -v certbot)"
+    certbot --version 2>/dev/null || true
+  else
+    warn "certbot 未安装。"
+  fi
+
+  if has systemctl && systemctl list-timers --all 2>/dev/null | grep -qi certbot; then
+    ok "systemd certbot timer 存在。"
+    systemctl list-timers --all 2>/dev/null | grep -i certbot || true
+  elif [[ -f /etc/cron.d/certbot || -f /etc/cron.d/sb-certbot ]]; then
+    ok "cron certbot 续期任务存在。"
+    [[ -f /etc/cron.d/certbot ]] && sed -n '1,20p' /etc/cron.d/certbot || true
+    [[ -f /etc/cron.d/sb-certbot ]] && sed -n '1,20p' /etc/cron.d/sb-certbot || true
+  else
+    warn "未发现 certbot.timer 或 /etc/cron.d/certbot 续期任务。"
+  fi
+
+  if [[ -x "$CERT_RENEW_DEPLOY_HOOK" ]]; then
+    ok "certbot deploy hook 存在：$CERT_RENEW_DEPLOY_HOOK"
+  else
+    warn "certbot deploy hook 不存在，证书续期后可能不会自动 reload sing-box：$CERT_RENEW_DEPLOY_HOOK"
+  fi
+
+  if [[ -f "$CERT_META_FILE" ]]; then
+    status "cert meta: $CERT_META_FILE"
+    has jq && jq '.' "$CERT_META_FILE" || cat "$CERT_META_FILE"
+  else
+    status "cert meta: <none>"
+  fi
+
+  if [[ -e "$CERT_DIR/cert.pem" ]]; then
+    if [[ -L "$CERT_DIR/cert.pem" ]]; then
+      ok "$CERT_DIR/cert.pem -> $(readlink "$CERT_DIR/cert.pem")"
+    else
+      warn "$CERT_DIR/cert.pem 存在但不是软链。"
+    fi
+    if has openssl; then
+      openssl x509 -in "$CERT_DIR/cert.pem" -noout -subject -issuer -dates 2>/dev/null || warn "无法读取 $CERT_DIR/cert.pem"
+    else
+      warn "缺 openssl，无法检查证书内容。"
+    fi
+  else
+    warn "$CERT_DIR/cert.pem 不存在。"
+  fi
+
+  if [[ -e "$CERT_DIR/key.pem" ]]; then
+    if [[ -L "$CERT_DIR/key.pem" ]]; then
+      ok "$CERT_DIR/key.pem -> $(readlink "$CERT_DIR/key.pem")"
+    else
+      warn "$CERT_DIR/key.pem 存在但不是软链。"
+    fi
+  else
+    warn "$CERT_DIR/key.pem 不存在。"
+  fi
+
+  if has certbot; then
+    certbot certificates 2>/dev/null || true
+  fi
+}
+
+certbot_install(){
+  need_root
+  stage "Certbot install：安装 certbot"
+  explain "将用 apt 安装 certbot。证书申请会由 sb-tune cert 另行引导。"
+  has apt || die "当前系统没有 apt，暂只支持 Debian/Ubuntu。"
+  run apt update
+  run apt install -y certbot
+  certbot_check
+}
+
+ensure_certbot(){
+  if has certbot; then
+    ok "certbot 已安装。"
+    return 0
+  fi
+
+  warn "certbot 未安装。"
+  if ask_yn "现在安装 certbot 吗" Y; then
+    certbot_install
+  else
+    die "缺 certbot，无法申请证书。"
+  fi
+}
+
+ensure_cert_helpers(){
+  local missing=()
+  local p
+
+  for p in jq openssl; do
+    command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+
+  (( ${#missing[@]} == 0 )) && return 0
+
+  warn "证书引导缺少必要工具：${missing[*]}"
+  has apt || die "当前系统没有 apt，无法自动安装 ${missing[*]}。请先安装后重跑 sb-tune cert。"
+
+  if ask_yn "现在安装缺失工具 ${missing[*]} 吗" Y; then
+    run apt update
+    run apt install -y "${missing[@]}"
+  else
+    die "缺少 ${missing[*]}，无法继续证书引导。"
+  fi
+}
+
+record_cert_meta(){
+  local email="$1"
+  local domain="$2"
+  local tmp
+
+  mkdir -p "$(dirname "$CERT_META_FILE")"
+  tmp="$(mktemp)"
+  jq -n \
+    --arg email "$email" \
+    --arg domain "$domain" \
+    --arg fullchain "/etc/letsencrypt/live/$domain/fullchain.pem" \
+    --arg privkey "/etc/letsencrypt/live/$domain/privkey.pem" '
+    {
+      email: $email,
+      domain: $domain,
+      fullchain: $fullchain,
+      privkey: $privkey
+    }
+  ' > "$tmp"
+  install -m 600 "$tmp" "$CERT_META_FILE"
+  rm -f "$tmp"
+  ok "已记录证书信息：$CERT_META_FILE"
+}
+
+record_dns_domain(){
+  local domain="$1"
+
+  if has sb-dns; then
+    sb-dns domain add "$domain" || warn "写入 sb-dns domain 失败，请稍后手动执行：sb-dns domain add $domain"
+  elif [[ -x "$SB_ROOT/bin/sb-dns" ]]; then
+    "$SB_ROOT/bin/sb-dns" domain add "$domain" || warn "写入 sb-dns domain 失败，请稍后手动执行：pi dns domain add $domain"
+  else
+    warn "找不到 sb-dns，跳过 env/dns.json domain 记录。"
+  fi
+}
+
+stop_singbox_for_cert(){
+  if has systemctl && systemctl is-active --quiet sing-box 2>/dev/null; then
+    systemctl stop sing-box
+    echo active
+  else
+    echo inactive
+  fi
+}
+
+restore_singbox_after_cert(){
+  local prev="$1"
+
+  if [[ "$prev" == "active" ]] && has systemctl; then
+    systemctl start sing-box || warn "sing-box 启动失败，请执行 systemctl status sing-box 查看。"
+  fi
+}
+
+certbot_issue(){
+  local email="$1"
+  local domain="$2"
+  local prev_state
+
+  stage "Certbot certonly：申请证书"
+  warn "即将暂时停止 sing-box，避免证书申请期间端口冲突。申请完成后会尝试恢复。"
+  expect "域名 $domain 必须已经解析到本机公网 IP，且 80/tcp 能从公网访问。"
+  ask_yn "确认继续并暂时停止 sing-box 吗" Y || die "用户取消证书申请。"
+
+  prev_state="$(stop_singbox_for_cert)"
+  trap 'restore_singbox_after_cert "$prev_state"' RETURN EXIT
+  if [[ "$prev_state" == "active" ]]; then
+    status "sing-box 已暂时停止。"
+  else
+    status "sing-box 当前未运行或 systemctl 不可用。"
+  fi
+
+  if ! certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring \
+      --email "$email" -d "$domain" --preferred-challenges http; then
+    die "certbot 申请证书失败。请确认域名解析、本机 80/tcp 防火墙和云厂商安全组。"
+  fi
+
+  trap - RETURN EXIT
+  restore_singbox_after_cert "$prev_state"
+  ok "certbot 已生成证书：/etc/letsencrypt/live/$domain/"
+}
+
+ensure_certbot_renew_task(){
+  need_root
+  stage "Certbot renew task：检查自动续期任务"
+
+  if has systemctl && systemctl list-timers --all 2>/dev/null | grep -qi certbot; then
+    ok "systemd certbot timer 已存在。"
+    return 0
+  fi
+
+  if [[ -f /etc/cron.d/certbot || -f /etc/cron.d/sb-certbot ]]; then
+    ok "cron certbot 续期任务已存在。"
+    return 0
+  fi
+
+  warn "未发现 certbot.timer 或 cron 续期任务，将创建 /etc/cron.d/sb-certbot。"
+  cat > /etc/cron.d/sb-certbot <<'EOF'
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+17 */12 * * * root command -v certbot >/dev/null 2>&1 && certbot -q renew --pre-hook "systemctl is-active --quiet sing-box 2>/dev/null && systemctl stop sing-box || true" --post-hook "systemctl start sing-box 2>/dev/null || true"
+EOF
+  chmod 644 /etc/cron.d/sb-certbot
+  ok "已创建 /etc/cron.d/sb-certbot"
+}
+
+ensure_certbot_deploy_hook(){
+  need_root
+  stage "Certbot deploy hook：安装 sing-box reload hook"
+
+  mkdir -p "$(dirname "$CERT_RENEW_DEPLOY_HOOK")"
+  cat > "$CERT_RENEW_DEPLOY_HOOK" <<'EOF'
+#!/bin/sh
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl reload sing-box 2>/dev/null || systemctl restart sing-box 2>/dev/null || true
+fi
+EOF
+  chmod 755 "$CERT_RENEW_DEPLOY_HOOK"
+  ok "已安装 $CERT_RENEW_DEPLOY_HOOK"
+}
+
+test_certbot_renew(){
+  local prev_state
+
+  stage "Certbot dry-run：测试自动续期流程"
+  warn "certbot renew --dry-run 会连接 Let’s Encrypt staging，并可能短暂占用挑战端口；将临时停止 sing-box 后再测试。"
+  prev_state="$(stop_singbox_for_cert)"
+  trap 'restore_singbox_after_cert "$prev_state"' RETURN EXIT
+  if certbot renew --dry-run; then
+    trap - RETURN EXIT
+    restore_singbox_after_cert "$prev_state"
+    ok "certbot renew --dry-run 通过。"
+  else
+    die "certbot renew --dry-run 失败，请先修复自动续期问题。"
+  fi
+}
+
+link_cert_files(){
+  local domain="$1"
+  local fullchain="/etc/letsencrypt/live/$domain/fullchain.pem"
+  local privkey="/etc/letsencrypt/live/$domain/privkey.pem"
+  local ts
+
+  [[ -f "$fullchain" ]] || die "缺少 $fullchain"
+  [[ -f "$privkey" ]] || die "缺少 $privkey"
+
+  mkdir -p "$CERT_DIR"
+  ts="$(date +%s)"
+
+  if [[ -e "$CERT_DIR/cert.pem" && ! -L "$CERT_DIR/cert.pem" ]]; then
+    mv "$CERT_DIR/cert.pem" "$CERT_DIR/cert.pem.bak.$ts"
+    warn "已备份旧 cert.pem -> cert.pem.bak.$ts"
+  fi
+
+  if [[ -e "$CERT_DIR/key.pem" && ! -L "$CERT_DIR/key.pem" ]]; then
+    mv "$CERT_DIR/key.pem" "$CERT_DIR/key.pem.bak.$ts"
+    warn "已备份旧 key.pem -> key.pem.bak.$ts"
+  fi
+
+  ln -sfn "$fullchain" "$CERT_DIR/cert.pem"
+  ln -sfn "$privkey" "$CERT_DIR/key.pem"
+  ok "已创建证书软链：$CERT_DIR/cert.pem -> $fullchain"
+  ok "已创建证书软链：$CERT_DIR/key.pem -> $privkey"
+  warn "如果 sing-box 不是 root 运行，需要额外授权它读取 Let’s Encrypt 私钥路径。"
+}
+
+apply_cert_to_inbound(){
+  local fullchain="$CERT_DIR/cert.pem"
+  local privkey="$CERT_DIR/key.pem"
+  local default_fullchain="$SB_ROOT/certs/cert.pem"
+  local default_privkey="$SB_ROOT/certs/key.pem"
+  local inbound_path
+  local -a inbound_cmd
+
+  if [[ "$fullchain" == "$default_fullchain" && "$privkey" == "$default_privkey" ]]; then
+    ok "HY2 模板默认已使用 ${fullchain} / ${privkey}，无需写入 inbounds.json overlay。"
+    return 0
+  fi
+
+  if [[ ! -f "$SB_ROOT/env/inbounds.json" || ! -f "$SB_ROOT/env/node.env" ]]; then
+    warn "尚未发现 env/inbounds.json 或 env/node.env，跳过 HY2 证书路径写入。"
+    advice "稍后执行 pi genenv 后再运行：pi inbound set hy2 tls.certificate_path $fullchain"
+    advice "稍后执行 pi genenv 后再运行：pi inbound set hy2 tls.key_path $privkey"
+    return 1
+  fi
+
+  if inbound_path="$(command -v sb-inbound 2>/dev/null)" && [[ -x "$inbound_path" ]]; then
+    inbound_cmd=("$inbound_path")
+  elif [[ -x "$SB_ROOT/bin/sb-inbound" ]]; then
+    inbound_cmd=("$SB_ROOT/bin/sb-inbound")
+  elif [[ -r "$SB_ROOT/bin/sb-inbound" ]]; then
+    inbound_cmd=(bash "$SB_ROOT/bin/sb-inbound")
+  else
+    warn "找不到 sb-inbound，请手动执行："
+    advice "pi inbound set hy2 tls.certificate_path $fullchain"
+    advice "pi inbound set hy2 tls.key_path $privkey"
+    return 1
+  fi
+
+  if ! "${inbound_cmd[@]}" set hy2 tls.certificate_path "$fullchain"; then
+    warn "写入 HY2 certificate_path 失败，可能当前没有 hysteria2 inbound。已保留证书软链。"
+    advice "确认 inbound 后手动执行：pi inbound set hy2 tls.certificate_path $fullchain"
+    return 1
+  fi
+
+  if ! "${inbound_cmd[@]}" set hy2 tls.key_path "$privkey"; then
+    warn "写入 HY2 key_path 失败，可能当前没有 hysteria2 inbound。已保留证书软链。"
+    advice "确认 inbound 后手动执行：pi inbound set hy2 tls.key_path $privkey"
+    return 1
+  fi
+}
+
+run_apply_if_requested(){
+  if ask_yn "现在执行 sb-apply 让证书配置生效吗" Y; then
+    if has sb-apply; then
+      sb-apply
+    elif [[ -x "$SB_ROOT/bin/sb-apply" ]]; then
+      "$SB_ROOT/bin/sb-apply"
+    else
+      die "找不到 sb-apply，请稍后手动执行 pi apply"
+    fi
+  else
+    advice "稍后执行 pi apply 让证书路径进入最终 sing-box config。"
+  fi
+}
+
+cert_wizard(){
+  need_root
+  local email domain default_email default_domain
+
+  stage "Cert wizard：域名证书申请引导"
+  explain "这会引导 certbot 申请 Let’s Encrypt 证书，并把工具目录 certs/cert.pem/key.pem 链接到新证书。"
+  warn "申请期间会暂时停止 sing-box。请确认域名已解析到本机，80/tcp 已放行。"
+
+  ensure_cert_helpers
+  ensure_certbot
+
+  default_email=""
+  default_domain=""
+  if [[ -f "$CERT_META_FILE" ]] && has jq; then
+    default_email="$(jq -r '.email // ""' "$CERT_META_FILE" 2>/dev/null || true)"
+    default_domain="$(jq -r '.domain // ""' "$CERT_META_FILE" 2>/dev/null || true)"
+  fi
+
+  email="$(ask_value "请输入邮箱（用于接收证书过期通知）" "${default_email:-admin@example.com}")"
+  validate_email "$email"
+
+  domain="$(ask_value "请输入域名" "${default_domain:-example.com}")"
+  domain="$(normalize_domain "$domain")"
+
+  record_cert_meta "$email" "$domain"
+  record_dns_domain "$domain"
+  certbot_issue "$email" "$domain"
+  ensure_certbot_renew_task
+  ensure_certbot_deploy_hook
+  link_cert_files "$domain"
+  if apply_cert_to_inbound; then
+    certbot_check
+    run_apply_if_requested
+  else
+    certbot_check
+    advice "证书已生成并链接；等 pi genenv / HY2 inbound 就绪后再写入 inbound 并执行 pi apply。"
+  fi
+
+  ok "证书引导完成。"
+}
+
 swap_check(){
   stage "Swap check：检查 swap"
   explain "这一步只读。1G VPS 建议至少 1G swap，避免 apt 升级或装内核时 OOM。"
@@ -468,7 +877,7 @@ swap_create(){
 swap_off(){
   need_root
   stage "Swap off：关闭脚本创建的 swap"
-  explain "只处理 $SWAP_FILE，并从 /etc/fstab 移除对应行。"
+  explain "只处理 ${SWAP_FILE}，并从 /etc/fstab 移除对应行。"
   if swapon --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
     run swapoff "$SWAP_FILE"
   fi
@@ -476,7 +885,7 @@ swap_off(){
     sed -i.bak "\#^${SWAP_FILE}[[:space:]]#d" /etc/fstab
   fi
   [[ -e "$SWAP_FILE" ]] && rm -f "$SWAP_FILE"
-  ok "已关闭并删除 $SWAP_FILE。"
+  ok "已关闭并删除 ${SWAP_FILE}。"
 }
 
 singbox_check(){
@@ -525,7 +934,7 @@ write_journald(){
   local p="${1:-balanced}" RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
   load_profile_values "$p"
   stage "journald：限制日志占用"
-  explain "小盘 VPS 必做。将写 $JOURNALD_FILE，限制 systemd journal 的磁盘和运行时占用。"
+  explain "小盘 VPS 必做。将写 ${JOURNALD_FILE}，限制 systemd journal 的磁盘和运行时占用。"
   status "profile=$p SystemMaxUse=$JS SystemMaxFileSize=$JF RuntimeMaxUse=$JR"
   expect "完成后 systemd-journald 会重启，日志占用上限受控。"
   mkdir -p "$(dirname "$JOURNALD_FILE")"
@@ -544,7 +953,7 @@ write_sysctl(){
   local p="${1:-balanced}" RMEM WMEM JS JF JR BACKLOG SYN NOTSENT
   load_profile_values "$p"
   stage "sysctl：写入网络调优"
-  explain "将写 $SYSCTL_FILE。它排序在 $SYSCTL_BASE 之后，因此重叠键会以 sb-tune 为准。"
+  explain "将写 ${SYSCTL_FILE}。它排序在 $SYSCTL_BASE 之后，因此重叠键会以 sb-tune 为准。"
   status "profile=$p RMEM=$RMEM WMEM=$WMEM BACKLOG=$BACKLOG SYN=$SYN NOTSENT=$NOTSENT"
   advice "1G 小鸡建议 tiny；高于 1.5G 且 HY2/UDP 流量多再考虑 hy2。"
   expect "完成后 sysctl net.ipv4.tcp_congestion_control 应为 bbr，net.core.default_qdisc 应为 fq。"
@@ -593,7 +1002,7 @@ apply_tune(){
   explain "这一步只做系统调优，不安装 XanMod，不安装 sing-box。"
   write_sysctl "$p"
   write_journald "$p"
-  ok "tune apply 完成 profile=$p。"
+  ok "tune apply 完成 profile=${p}。"
 }
 
 cleanup_xanmod_source(){
@@ -602,7 +1011,7 @@ cleanup_xanmod_source(){
     [[ -f "$f" ]] || continue
     if grep -q 'deb\.xanmod\.org[[:space:]]\+releases' "$f" 2>/dev/null; then
       warn "发现旧 XanMod releases 源：$f"
-      advice "旧 releases 路径容易 404；本脚本会写入按 VERSION_CODENAME 的源到 $XANMOD_LIST。"
+      advice "旧 releases 路径容易 404；本脚本会写入按 VERSION_CODENAME 的源到 ${XANMOD_LIST}。"
     fi
   done
 }
@@ -781,6 +1190,16 @@ bootstrap(){
     warn "跳过依赖安装。后续某些步骤可能因为缺命令失败。"
   fi
 
+  if ask_yn "安装 certbot 并进入域名证书申请引导吗" N; then
+    if ( cert_wizard ); then
+      ok "证书引导完成，继续 bootstrap。"
+    else
+      warn "证书引导失败或被取消，已跳过并继续 bootstrap。稍后可执行：sb-tune cert"
+    fi
+  else
+    status "跳过 certbot / 域名证书引导。需要时可执行：sb-tune cert"
+  fi
+
   if ask_yn "执行 apt -y full-upgrade 吗（可能耗时/可能需要重启）" N; then
     deps_upgrade
   else
@@ -861,17 +1280,18 @@ menu(){
   1) 标准新机引导 bootstrap（逐步询问，推荐）
   2) 只读体检 preflight
   3) 只读检查 check
-  4) 查看推荐 recommend
-  5) 安装必要依赖 deps install
-  6) 系统完整升级 deps upgrade
-  7) swap 检查/创建
-  8) sing-box 检查/安装
-  9) journald 限制
- 10) sysctl 网络调优
- 11) apply = sysctl + journald
- 12) XanMod/BBRv3 安装
- 13) reboot-needed 检查
- 14) plan 预览
+ 4) 查看推荐 recommend
+ 5) 安装必要依赖 deps install
+  6) certbot / 域名证书引导
+  7) 系统完整升级 deps upgrade
+  8) swap 检查/创建
+  9) sing-box 检查/安装
+ 10) journald 限制
+ 11) sysctl 网络调优
+ 12) apply = sysctl + journald
+ 13) XanMod/BBRv3 安装
+ 14) reboot-needed 检查
+ 15) plan 预览
   0) 退出
 =====================================================
 MENU
@@ -882,40 +1302,41 @@ MENU
       3) show_check; pause ;;
       4) show_recommend; pause ;;
       5) deps_install; pause ;;
-      6) deps_upgrade; pause ;;
-      7)
+      6) cert_wizard; pause ;;
+      7) deps_upgrade; pause ;;
+      8)
         swap_check
         if ask_yn "创建/补充 1G swap 吗" N; then swap_create 1G; fi
         pause
         ;;
-      8)
+      9)
         singbox_check
         if ! has sing-box || ask_yn "重新执行 sing-box install 吗" N; then singbox_install; fi
         pause
         ;;
-      9)
+      10)
         p="$(choose_profile_interactive)"
         write_journald "$p"
         pause
         ;;
-      10)
+      11)
         p="$(choose_profile_interactive)"
         write_sysctl "$p"
         pause
         ;;
-      11)
+      12)
         p="$(choose_profile_interactive)"
         apply_tune "$p"
         pause
         ;;
-      12)
+      13)
         echo "ABI: auto / v2 / v3"
         abi="$(ask_value "选择 ABI" "auto")"
         install_xanmod "$abi"
         pause
         ;;
-      13) reboot_needed; pause ;;
-      14)
+      14) reboot_needed; pause ;;
+      15)
         p="$(choose_profile_interactive)"
         show_plan "$p"
         pause
@@ -947,6 +1368,17 @@ case "$cmd" in
       install) deps_install ;;
       upgrade|full-upgrade|full_upgrade) deps_upgrade ;;
       *) usage >&2; die "未知 deps 子命令: $sub" ;;
+    esac
+    ;;
+
+  cert)
+    sub="${1:-wizard}"
+    case "$sub" in
+      wizard|apply|issue|"") cert_wizard ;;
+      check|status) certbot_check ;;
+      install) certbot_install ;;
+      renew-test|dry-run|dryrun) test_certbot_renew ;;
+      *) usage >&2; die "未知 cert 子命令: $sub" ;;
     esac
     ;;
 

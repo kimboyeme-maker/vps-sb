@@ -3,6 +3,8 @@ set -uo pipefail
 export SB_ROOT="${SB_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 ENV_FILE="$SB_ROOT/env/node.env"
 CONFIG="$SB_ROOT/out/config.json"
+CERT_META_FILE="$SB_ROOT/env/cert.json"
+CERT_DIR="$SB_ROOT/certs"
 log(){ printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 ok(){ printf 'OK   %s\n' "$*"; }
 warn(){ printf 'WARN %s\n' "$*"; }
@@ -10,7 +12,7 @@ fail(){ printf 'FAIL %s\n' "$*"; }
 has(){ command -v "$1" >/dev/null 2>&1; }
 summary(){ cat <<'S'
 summary:
-  sb-doctor 只诊断，不修改。用于检查 service / ports / firewall / nft / dns / network / upstream / export。
+  sb-doctor 只诊断，不修改。用于检查 service / ports / firewall / cert / nft / dns / network / upstream / export。
 S
 }
 usage(){ cat <<'U'
@@ -22,6 +24,7 @@ usage:
   sb-doctor service
   sb-doctor ports
   sb-doctor firewall
+  sb-doctor cert
   sb-doctor nft
   sb-doctor dns
   sb-doctor network
@@ -33,6 +36,71 @@ section(){ echo; echo "== $1 =="; }
 service_check(){ section service; if has systemctl; then systemctl is-active --quiet sing-box && ok "sing-box active" || warn "sing-box not active"; systemctl status sing-box --no-pager 2>/dev/null | head -20 || true; else warn "no systemctl"; fi; [[ -L /etc/sing-box/config.json ]] && ok "/etc/sing-box/config.json is symlink" || warn "/etc/sing-box/config.json not symlink"; [[ -f "$CONFIG" ]] && ok "$CONFIG exists" || fail "$CONFIG missing"; if has sing-box && [[ -f "$CONFIG" ]]; then sing-box check -c "$CONFIG" >/tmp/sb-doctor-check.log 2>&1 && ok "sing-box check passed" || { fail "sing-box check failed"; tail -40 /tmp/sb-doctor-check.log; }; fi; }
 ports_check(){ section ports; if [[ -f "$CONFIG" ]] && has jq; then jq -r '.inbounds[]? | "\(.tag)\t\(.type)\t\(.listen // "-"):\(.listen_port // "-")"' "$CONFIG"; fi; if has ss; then ss -tunlp | grep -E 'sing-box|:40443|:40500|:40080' || warn "ss 未看到常见端口或 sing-box"; else warn "no ss"; fi; }
 firewall_check(){ section firewall; has ufw && ufw status verbose || warn "no ufw"; }
+cert_check(){
+  section cert
+  local domain fullchain privkey
+
+  if has certbot; then
+    ok "certbot: $(command -v certbot)"
+    certbot --version 2>/dev/null || true
+  else
+    warn "certbot missing"
+  fi
+
+  if has systemctl && systemctl list-timers --all 2>/dev/null | grep -qi certbot; then
+    ok "certbot systemd timer exists"
+    systemctl list-timers --all 2>/dev/null | grep -i certbot || true
+  elif [[ -f /etc/cron.d/certbot || -f /etc/cron.d/sb-certbot ]]; then
+    ok "certbot cron exists"
+    [[ -f /etc/cron.d/certbot ]] && sed -n '1,20p' /etc/cron.d/certbot || true
+    [[ -f /etc/cron.d/sb-certbot ]] && sed -n '1,20p' /etc/cron.d/sb-certbot || true
+  else
+    warn "no certbot renewal timer/cron found"
+  fi
+
+  if [[ -f "$CERT_META_FILE" ]] && has jq; then
+    jq '.' "$CERT_META_FILE"
+    domain="$(jq -r '.domain // ""' "$CERT_META_FILE" 2>/dev/null || true)"
+  elif [[ -f "$CERT_META_FILE" ]]; then
+    cat "$CERT_META_FILE"
+    domain=""
+  else
+    warn "cert meta missing: $CERT_META_FILE"
+    domain=""
+  fi
+
+  fullchain="$CERT_DIR/cert.pem"
+  privkey="$CERT_DIR/key.pem"
+
+  if [[ -e "$fullchain" ]]; then
+    [[ -L "$fullchain" ]] && ok "$fullchain -> $(readlink "$fullchain")" || warn "$fullchain exists but is not symlink"
+    openssl x509 -in "$fullchain" -noout -subject -issuer -dates 2>/dev/null || warn "cannot parse $fullchain"
+  else
+    warn "$fullchain missing"
+  fi
+
+  if [[ -e "$privkey" ]]; then
+    [[ -L "$privkey" ]] && ok "$privkey -> $(readlink "$privkey")" || warn "$privkey exists but is not symlink"
+  else
+    warn "$privkey missing"
+  fi
+
+  if [[ -n "$domain" && -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]]; then
+    ok "letsencrypt live cert exists for $domain"
+    openssl x509 -in "/etc/letsencrypt/live/$domain/fullchain.pem" -noout -subject -issuer -dates 2>/dev/null || true
+  elif [[ -n "$domain" ]]; then
+    warn "letsencrypt live cert missing for $domain"
+  fi
+
+  if [[ -f "$CONFIG" ]] && has jq; then
+    echo "configured TLS certificate paths:"
+    jq -r '
+      .inbounds[]?
+      | select((.tls.certificate_path? // "") != "" or (.tls.key_path? // "") != "")
+      | "\(.tag // "-")\tcert=\(.tls.certificate_path // "-")\tkey=\(.tls.key_path // "-")"
+    ' "$CONFIG" || true
+  fi
+}
 nft_check(){ section nft; if has nft; then nft list table inet sb_hy2_range 2>/dev/null || warn "no nft table inet sb_hy2_range"; else warn "no nft"; fi; }
 dns_check(){ section dns; if has sb-dns; then sb-dns status || true; fi; [[ -f "$CONFIG" ]] && has jq && jq '.dns // "<no dns block>", .route.default_domain_resolver? // "<no route.default_domain_resolver>"' "$CONFIG" || true; if has resolvectl; then resolvectl dns 2>/dev/null || true; fi; cat /etc/resolv.conf 2>/dev/null | sed -n '1,8p' || true; }
 network_check(){ section network; has ip && { ip -br addr || true; ip route || true; ip -6 route || true; } || warn "no ip"; if has curl; then echo "public IPv4:"; curl -4 -fsS --max-time 5 https://ip.sb || true; echo; echo "public IPv6:"; curl -6 -fsS --max-time 5 https://ip.sb || true; echo; else warn "no curl"; fi; if has dig; then dig +short google.com A | head || true; dig +short google.com AAAA | head || true; fi; }
@@ -42,11 +110,12 @@ cmd="${1:-quick}"; shift || true
 case "$cmd" in
   summary) summary ;;
   help|-h|--help) summary; echo; usage ;;
-  quick) service_check; ports_check; firewall_check ;;
-  all) service_check; ports_check; firewall_check; nft_check; dns_check; network_check; upstream_check; export_check ;;
+  quick) service_check; ports_check; firewall_check; cert_check ;;
+  all) service_check; ports_check; firewall_check; cert_check; nft_check; dns_check; network_check; upstream_check; export_check ;;
   service) service_check ;;
   ports) ports_check ;;
   firewall) firewall_check ;;
+  cert|https|tls) cert_check ;;
   nft) nft_check ;;
   dns) dns_check ;;
   network) network_check ;;
