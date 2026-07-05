@@ -47,7 +47,7 @@ usage:
   sb-inbound list
   sb-inbound show <tag>
 
-  sb-inbound set   <tag> <key> <value>
+  sb-inbound set   <tag|type> <key> <value>
   sb-inbound rm    <tag> <key>
   sb-inbound del   <tag> <key>
   sb-inbound reset <tag> <key>
@@ -72,9 +72,12 @@ examples:
 
   sb-inbound set hy2-in up_mbps 80
   sb-inbound set hy2-in down_mbps 300
+  sb-inbound set hy2 obfs.type salamander
   sb-inbound set hy2-in obfs.type salamander
   sb-inbound set hy2-in obfs.password abc123
   sb-inbound set hy2-in tls.alpn '["h3"]'
+  sb-inbound set hy2 tls.certificate_path /opt/sb/certs/cert.pem
+  sb-inbound set hy2 tls.key_path /opt/sb/certs/key.pem
 
   sb-inbound rm hy2-in obfs
   sb-inbound reset hy2-in obfs
@@ -110,6 +113,8 @@ notes:
   - listen_port 低于 INBOUND_PORT_SUGGEST_MIN 会 WARN
   - rm/del 表示最终 config 删除字段
   - reset 表示取消该字段的 overlay 修改；最终是否回到默认由 sb-apply 编译结果决定
+  - set <tag|type> 中 type 支持 vless / hy2 / hysteria2 / socks / socks5
+  - listen_port 是单实例字段；type selector 命中多个 inbound 时会拒绝写入，避免端口冲突
   - set <tag> tag <new-tag> 会重命名 inbound tag，并同步 inbounds.json/node.env/routes.json 引用
   - clone 适合做 vless/hy2 多端口备用 inbound
   - hy2 range 最终 nftables/ufw 由 sb-apply 对账
@@ -126,7 +131,7 @@ for dep in jq awk grep head; do
 done
 
 ensure_env() {
-  [[ -f "$ENV_FILE" ]] || die "缺 $ENV_FILE，先跑 sb-genenv"
+  [[ -f "$ENV_FILE" ]] || die "缺 ${ENV_FILE}，先跑 sb-genenv"
 }
 
 ensure_env_default() {
@@ -619,6 +624,89 @@ inbound_type() {
   fi
 }
 
+normalize_type_selector() {
+  local selector="$1"
+
+  case "$selector" in
+    vless)
+      echo "vless"
+      ;;
+    hy2|hysteria2)
+      echo "hysteria2"
+      ;;
+    socks|socks5)
+      echo "socks"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+selector_tags_json() {
+  local selector="$1"
+  local type
+  local base
+  local clones
+  local deleted
+  local tags
+
+  validate_tag_syntax "$selector"
+
+  if tag_exists "$selector"; then
+    jq -cn --arg tag "$selector" '[$tag]'
+    return 0
+  fi
+
+  type="$(normalize_type_selector "$selector")" || {
+    die "不存在的 inbound selector: '$selector'；可用 tag：$(known_tags_text)；可用 type：vless, hy2, hysteria2, socks, socks5"
+  }
+
+  base="$(
+    current_config | jq -c '
+      [.inbounds[]? | {tag, type}]
+    '
+  )"
+  clones="$(jq -c '.clones // {}' "$PATCH_FILE")"
+  deleted="$(deleted_tags_json)"
+
+  tags="$(
+    jq -cn \
+      --arg type "$type" \
+      --argjson base "$base" \
+      --argjson clones "$clones" \
+      --argjson deleted "$deleted" '
+      def base_type($tag):
+        ([ $base[]? | select(.tag == $tag) | .type ][0]) // "";
+
+      (
+        $base
+        + [
+            $clones
+            | to_entries[]
+            | {tag: .key, type: base_type(.value.from)}
+            | select(.type != "")
+          ]
+      )
+      | map(select(.type == $type))
+      | map(.tag)
+      | reduce .[] as $x ([]; if index($x) then . else . + [$x] end)
+      | map(select(. as $x | ($deleted | index($x) | not)))
+    '
+  )"
+
+  if [[ "$(jq -r 'length' <<<"$tags")" == "0" ]]; then
+    die "selector '$selector' 没有匹配到 active inbound；可用 tag：$(known_tags_text)"
+  fi
+
+  printf '%s\n' "$tags"
+}
+
+selector_is_exact_tag() {
+  local selector="$1"
+  tag_exists "$selector"
+}
+
 default_hy2_tag() {
   local tag
 
@@ -693,10 +781,10 @@ validate_port() {
   [[ "$port" =~ ^[0-9]+$ ]] || die "$label 必须是数字，收到 '$port'"
   (( port >= 1 && port <= 65535 )) || die "$label 范围必须是 1-65535，收到 '$port'"
 
-  (( port >= INBOUND_PORT_MIN )) || die "$label=$port 低于 INBOUND_PORT_MIN=$INBOUND_PORT_MIN，不允许使用"
+  (( port >= INBOUND_PORT_MIN )) || die "$label=$port 低于 INBOUND_PORT_MIN=${INBOUND_PORT_MIN}，不允许使用"
 
   if (( port < INBOUND_PORT_SUGGEST_MIN )); then
-    log "WARN: $label=$port 低于建议值 INBOUND_PORT_SUGGEST_MIN=$INBOUND_PORT_SUGGEST_MIN，建议使用 ${INBOUND_PORT_SUGGEST_MIN}+ 的高位端口"
+    log "WARN: $label=$port 低于建议值 INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN}，建议使用 ${INBOUND_PORT_SUGGEST_MIN}+ 的高位端口"
   fi
 }
 
@@ -883,46 +971,54 @@ case "$cmd" in
     ;;
 
   set)
-    tag="${1:-}"
+    selector="${1:-}"
     key="${2:-}"
 
-    [[ -n "$tag" && -n "$key" && $# -ge 3 ]] || fail_usage "用法: sb-inbound set <tag> <key> <value>"
+    [[ -n "$selector" && -n "$key" && $# -ge 3 ]] || fail_usage "用法: sb-inbound set <tag|type> <key> <value>"
 
     shift 2
     value="$*"
 
-    require_tag "$tag"
-    require_not_deleted "$tag"
-
     if [[ "$key" == "tag" ]]; then
-      rename_inbound_tag "$tag" "$value"
-      log "OK: 已重命名 inbound '$tag' -> '$value'，并同步 inbounds.json/node.env/routes.json 引用。跑 sb-apply 生效。"
+      if ! selector_is_exact_tag "$selector"; then
+        die "重命名 tag 必须使用精确 inbound tag，不能使用 type selector: '$selector'"
+      fi
+      require_not_deleted "$selector"
+      rename_inbound_tag "$selector" "$value"
+      log "OK: 已重命名 inbound '$selector' -> '$value'，并同步 inbounds.json/node.env/routes.json 引用。跑 sb-apply 生效。"
       exit 0
     fi
 
+    tags_json="$(selector_tags_json "$selector")"
     validate_key "$key"
     validate_set_value_by_key "$key" "$value"
+
+    if [[ "$key" == "listen_port" ]] && (( $(jq 'length' <<<"$tags_json") > 1 )); then
+      die "listen_port 不能用多命中的 type selector 批量设置，会造成端口冲突。请使用精确 tag，例如：sb-inbound set hy2-in listen_port 40500"
+    fi
 
     pjson="$(path_json "$key")"
     vjson="$(value_json "$value")"
 
     tmp="$(mktemp)"
     jq \
-      --arg tag "$tag" \
       --arg key "$key" \
+      --argjson tags "$tags_json" \
       --argjson path "$pjson" \
       --argjson val "$vjson" '
-      .patch[$tag] = ((.patch[$tag] // {}) | setpath($path; $val))
-      | .delete_fields[$tag] = ((.delete_fields[$tag] // []) | map(select(. != $key)))
-      | if ((.delete_fields[$tag] // []) | length) == 0 then
-          del(.delete_fields[$tag])
-        else
-          .
-        end
+      reduce $tags[] as $tag (.;
+        .patch[$tag] = ((.patch[$tag] // {}) | setpath($path; $val))
+        | .delete_fields[$tag] = ((.delete_fields[$tag] // []) | map(select(. != $key)))
+        | if ((.delete_fields[$tag] // []) | length) == 0 then
+            del(.delete_fields[$tag])
+          else
+            .
+          end
+      )
     ' "$PATCH_FILE" > "$tmp"
 
     write_patch_tmp "$tmp"
-    log "OK: 已设置 inbound '$tag' ${key}=${value}。跑 sb-apply 生效。"
+    log "OK: 已设置 inbound selector '$selector' -> $(jq -r 'join(", ")' <<<"$tags_json") ${key}=${value}。跑 sb-apply 生效。"
     ;;
 
   rm|del)
