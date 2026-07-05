@@ -37,23 +37,24 @@ summary:
 
   正确顺序：
     sb-apply
-    sb-export [protocol] [name_or_alias]
+    sb-export [tag|protocol|name_or_alias] [tag|protocol|name_or_alias]
+    sb-export node|txt|info [tag|protocol|name_or_alias] [...]
 S
 }
 
 usage() {
   cat <<'U'
 usage:
-  sb-export [protocol] [name_or_alias]
+  sb-export [tag|protocol|name_or_alias] [tag|protocol|name_or_alias]
+  sb-export node|txt|info [tag|protocol|name_or_alias] [...]
 
-protocol:
-  all                         导出全部当前可用协议，默认
-  vless                       只导出 VLESS Reality
-  hy2                         只导出 Hysteria2
-  socks5                      只导出 Socks5
+后两个位置参数各自独立识别（顺序不限，重复同类会报错）：
+  protocol                     all / vless / hy2 / socks5
+  inbound tag                  必须是 out/config.json 里存在的精确 tag
+  name_or_alias                users.json 里的 name 或 alias
 
-name_or_alias:
-  可选。按 users.json 里的 name 或 alias 过滤用户。
+node/txt/info:
+  直接转发给 sb-show，用于 stdout 输出，不写 out/sub 文件。
 
 output:
   <SB_ROOT>/out/sub/<alias_or_account>_<protocol>.sub
@@ -73,6 +74,8 @@ examples:
 
   sb-export all AI
   sb-export vless AI
+  sb-export hy2-41500 AI
+  sb-export node hy2-41500 AI
   sb-export socks5 default
 
 help:
@@ -83,6 +86,8 @@ help:
 notes:
   - .sub 是整文件 base64 标准订阅（protocol:// 明文列表整体 base64 编码）
   - 想看明文 URI 用 sb-show txt
+  - node/txt/info 模式等价于 sb-show node/txt/info
+  - tag 必须精确匹配 out/config.json 里的 inbound tag，clone 出来的 tag 也支持
   - HY2 range 在 .sub URI 中输出 mport=<range>，在 Clash/Mihomo YAML 中输出 ports/hop-interval
 U
 }
@@ -100,6 +105,18 @@ case "${1:-}" in
     exit 0
     ;;
 esac
+
+if [[ "${1:-}" == "txt" || "${1:-}" == "node" || "${1:-}" == "info" ]]; then
+  if show_cmd="$(command -v sb-show 2>/dev/null)" && [[ -x "$show_cmd" ]]; then
+    exec "$show_cmd" "$@"
+  elif [[ -x "$SB_ROOT/bin/sb-show" ]]; then
+    exec "$SB_ROOT/bin/sb-show" "$@"
+  elif [[ -r "$SB_ROOT/bin/sb-show" ]]; then
+    exec "${BASH:-bash}" "$SB_ROOT/bin/sb-show" "$@"
+  else
+    die "找不到 sb-show，无法执行 sb-export $1"
+  fi
+fi
 
 [[ $# -le 2 ]] || fail_usage "参数过多"
 
@@ -119,8 +136,11 @@ set -a
 source "$ENV_FILE"
 set +a
 
-proto="${1:-all}"
-filter_user="${2:-}"
+arg1="${1:-}"
+arg2="${2:-}"
+proto="all"
+filter_user=""
+filter_tag=""
 
 NODE_NAME="${NODE_NAME:-NODE}"
 SERVER_IP="${SERVER_IP:-}"
@@ -150,6 +170,57 @@ available_protocols_json() {
     ]
   ' "$CONFIG"
 }
+
+KNOWN_TAGS_JSON="$(jq -c '[.inbounds[]?.tag] | map(select(. != null and . != ""))' "$CONFIG")"
+
+is_known_tag() {
+  jq -e --arg t "$1" 'index($t) != null' <<<"$KNOWN_TAGS_JSON" >/dev/null
+}
+
+classify_selector() {
+  case "$1" in
+    all|vless|hy2|socks5) echo proto ;;
+    *) is_known_tag "$1" && echo tag || echo user ;;
+  esac
+}
+
+proto_for_tag() {
+  jq -r --arg t "$1" '
+    (.inbounds[]? | select(.tag == $t) |
+      (if .type == "vless" then "vless"
+       elif .type == "hysteria2" then "hy2"
+       elif .type == "socks" then "socks5"
+       else "" end)) // ""
+  ' "$CONFIG"
+}
+
+declare -A SEEN=()
+
+for token in "$arg1" "$arg2"; do
+  [[ -n "$token" ]] || continue
+  case "$(classify_selector "$token")" in
+    proto)
+      [[ -z "${SEEN[proto]:-}" ]] || fail_usage "重复指定 protocol：'$token'"
+      proto="$token"; SEEN[proto]=1
+      ;;
+    tag)
+      [[ -z "${SEEN[tag]:-}" ]] || fail_usage "重复指定 inbound tag：'$token'"
+      filter_tag="$token"; SEEN[tag]=1
+      ;;
+    user)
+      [[ -z "${SEEN[user]:-}" ]] || fail_usage "无法识别的参数组合：'$token'；已有 name/alias '${filter_user}'。如果要指定 tag，请确认 tag 拼写；可用 tag：$(jq -r 'join(", ")' <<<"$KNOWN_TAGS_JSON")"
+      filter_user="$token"; SEEN[user]=1
+      ;;
+  esac
+done
+
+if [[ -n "$filter_tag" && "$proto" != "all" ]]; then
+  tag_proto="$(proto_for_tag "$filter_tag")"
+  [[ "$tag_proto" == "$proto" ]] || fail_usage "inbound tag '$filter_tag' 的协议是 '$tag_proto'，与指定的 protocol '$proto' 不一致"
+fi
+
+export_label="$proto"
+[[ -n "$filter_tag" ]] && export_label="$filter_tag"
 
 AVAIL_PROTO_JSON="$(available_protocols_json)"
 AVAIL_PROTO_TEXT="$(jq -r '(["all"] + .) | join(", ")' <<<"$AVAIL_PROTO_JSON")"
@@ -207,6 +278,7 @@ file_base_for_user() {
   local name="$1"
   local alias="$2"
   local key
+  local label
 
   if [[ -n "$alias" ]]; then
     key="$alias"
@@ -217,10 +289,12 @@ file_base_for_user() {
   fi
 
   key="$(safe_file_part "$key")"
+  label="$(safe_file_part "$export_label")"
+  [[ -n "$label" ]] || label="all"
   if [[ -n "$key" ]]; then
-    printf '%s_%s' "$key" "$proto"
+    printf '%s_%s' "$key" "$label"
   else
-    printf '%s' "$proto"
+    printf '%s' "$label"
   fi
 }
 
@@ -292,7 +366,7 @@ has_custom_route_rules() {
 inbound_user_rows() {
   local username="$1"
 
-  jq -r --arg proto "$proto" --arg username "$username" '
+  jq -r --arg proto "$proto" --arg tag "$filter_tag" --arg username "$username" '
     def protocol:
       if .type == "vless" then "vless"
       elif .type == "hysteria2" then "hy2"
@@ -310,6 +384,7 @@ inbound_user_rows() {
     | ($in | protocol) as $p
     | select($p != "")
     | select($proto == "all" or $proto == $p)
+    | select($tag == "" or (($in.tag // "") == $tag))
     | if $p == "vless" then
         ($in.users[]? | select((.name // "") == $username)) as $u
         | {
@@ -635,6 +710,7 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
     echo "  generated-by: sb-deploy"
     echo "  format: base64-sub-and-mihomo-yaml"
     echo "  protocol-filter: $(yaml_q "$proto")"
+    echo "  inbound-tag-filter: $(yaml_q "${filter_tag:-}")"
     echo "  node: $(yaml_q "$NODE_NAME")"
     echo "  user: $(yaml_q "$name")"
     echo "  alias: $(yaml_q "${alias:-}")"
@@ -707,7 +783,7 @@ while IFS=$'\t' read -r name uuid_from_users pw_from_users egress alias; do
 
   if [[ ! -s "$uris_tmp" ]]; then
     rm -f "$uris_tmp" "$yaml_tmp"
-    die "没有生成任何节点，protocol=$proto user=${name}；请确认 sb-apply 后 config.json 里存在该用户"
+    die "没有生成任何节点，protocol=${proto} tag=${filter_tag:-<any>} user=${name}；请确认 sb-apply 后 config.json 里存在该用户"
   fi
 
   if ! grep -Eq '^(vless|hysteria2|socks5)://' "$uris_tmp"; then
@@ -738,4 +814,4 @@ done < <(
   ' "$USERS_FILE"
 )
 
-log "INFO: 订阅导出完成 | users=${N} | protocol=${proto} | 目录 $SUB_DIR/ | $([[ -n "${SERVER_IP6:-}" ]] && echo 'v4+v6' || echo 'v4')"
+log "INFO: 订阅导出完成 | users=${N} | protocol=${proto} tag=${filter_tag:-<any>} | 目录 $SUB_DIR/ | $([[ -n "${SERVER_IP6:-}" ]] && echo 'v4+v6' || echo 'v4')"

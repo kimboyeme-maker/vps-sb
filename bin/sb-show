@@ -32,21 +32,19 @@ S
 usage() {
   cat <<'U'
 usage:
-  sb-show [mode] [protocol] [name_or_alias]
+  sb-show [mode] [tag|protocol|name_or_alias] [tag|protocol|name_or_alias]
 
 mode:
   txt                         明文分享链接输出，默认；只输出 vless:// / hysteria2:// / socks5:// 行
   node                        JSON 节点数据输出
   info                        人类可读信息输出：server / protocols / inbounds / hy2 range
 
-protocol:
-  all                         输出全部当前可用协议，默认
-  vless                       只输出 VLESS Reality
-  hy2                         只输出 Hysteria2
-  socks5                      只输出 Socks5
+后两个位置参数各自独立识别（顺序不限，重复同类会报错）：
+  protocol                     all / vless / hy2 / socks5
+  inbound tag                  必须是 out/config.json 里存在的精确 tag（如 hy2-in、hy2-41500）
+  name_or_alias                users.json 里的 name 或 alias
 
-name_or_alias:
-  可选。按 users.json 里的 name 或 alias 过滤用户。
+  识别优先级：protocol 关键字 > 精确 tag 命中 > 当作 name/alias
 
 examples:
   sb-show
@@ -69,6 +67,10 @@ examples:
   sb-show node socks5 default
   sb-show info
 
+  sb-show txt hy2-41500              只看某个具体 hy2 clone inbound
+  sb-show txt hy2-41500 default       tag + 用户 一起过滤
+  sb-show node vless-in
+
 help:
   sb-show help
   sb-show -h
@@ -80,6 +82,8 @@ notes:
   - sb-show txt default 会自动识别 default 为用户过滤，不再误判为协议
   - protocol 传错会提示当前可选值
   - 当前可选协议来自 out/config.json 里的 inbounds
+  - tag 必须精确匹配 out/config.json 里的 inbound tag，clone 出来的 tag 也支持
+  - tag 与 protocol 同时给出但类型不一致会直接报错
   - txt 模式只输出明文 URI 行，不输出标题、注释、分隔符
   - HY2 range 会在 info/node 输出里显示 ports；txt URI 会带 mport=<range>
   - URI authority 仍保留 HY2 主监听端口作兼容字段；端口跳跃范围由 mport 表达
@@ -123,6 +127,7 @@ arg2="${2:-}"
 arg3="${3:-}"
 proto="all"
 filter_user=""
+filter_tag=""
 
 case "$mode" in
   txt|node|info)
@@ -132,21 +137,51 @@ case "$mode" in
     ;;
 esac
 
-case "$arg2" in
-  "")
-    proto="all"
-    filter_user=""
-    ;;
-  all|vless|hy2|socks5)
-    proto="$arg2"
-    filter_user="$arg3"
-    ;;
-  *)
-    proto="all"
-    filter_user="$arg2"
-    [[ -z "$arg3" ]] || fail_usage "非法参数组合：'$arg2' '$arg3'。如果要指定用户，请用: sb-show $mode <protocol> <name_or_alias> 或 sb-show $mode <name_or_alias>"
-    ;;
-esac
+KNOWN_TAGS_JSON="$(jq -c '[.inbounds[]?.tag] | map(select(. != null and . != ""))' "$CONFIG")"
+
+is_known_tag() {
+  jq -e --arg t "$1" 'index($t) != null' <<<"$KNOWN_TAGS_JSON" >/dev/null
+}
+
+classify_selector() {
+  case "$1" in
+    all|vless|hy2|socks5) echo proto ;;
+    *) is_known_tag "$1" && echo tag || echo user ;;
+  esac
+}
+
+declare -A SEEN=()
+
+for token in "$arg2" "$arg3"; do
+  [[ -n "$token" ]] || continue
+  case "$(classify_selector "$token")" in
+    proto)
+      [[ -z "${SEEN[proto]:-}" ]] || fail_usage "重复指定 protocol：'$token'"
+      proto="$token"; SEEN[proto]=1
+      ;;
+    tag)
+      [[ -z "${SEEN[tag]:-}" ]] || fail_usage "重复指定 inbound tag：'$token'"
+      filter_tag="$token"; SEEN[tag]=1
+      ;;
+    user)
+      [[ -z "${SEEN[user]:-}" ]] || fail_usage "无法识别的参数组合：'$token'；已有 name/alias '${filter_user}'。如果要指定 tag，请确认 tag 拼写；可用 tag：$(jq -r 'join(", ")' <<<"$KNOWN_TAGS_JSON")"
+      filter_user="$token"; SEEN[user]=1
+      ;;
+  esac
+done
+
+if [[ -n "$filter_tag" && "$proto" != "all" ]]; then
+  tag_proto="$(
+    jq -r --arg t "$filter_tag" '
+      (.inbounds[]? | select(.tag == $t) |
+        (if .type == "vless" then "vless"
+         elif .type == "hysteria2" then "hy2"
+         elif .type == "socks" then "socks5"
+         else "" end)) // ""
+    ' "$CONFIG"
+  )"
+  [[ "$tag_proto" == "$proto" ]] || fail_usage "inbound tag '$filter_tag' 的协议是 '$tag_proto'，与指定的 protocol '$proto' 不一致"
+fi
 
 NODE_NAME="${NODE_NAME:-NODE}"
 SERVER_IP="${SERVER_IP:-}"
@@ -204,7 +239,7 @@ if [[ "$USER_COUNT" == "0" ]]; then
       | join(", ")
     ' "$USERS_FILE"
   )"
-  die "没有匹配用户: '$filter_user'；可选值：${USERS_TEXT:-<none>}"
+  die "没有匹配用户: '$filter_user'；可选用户：${USERS_TEXT:-<none>}；可选 tag：$(jq -r 'join(", ")' <<<"$KNOWN_TAGS_JSON")"
 fi
 
 uri_host() {
@@ -258,7 +293,7 @@ hy2_range_ports() {
 
 # 每行输出一个 base64(JSON object)。不要用 @tsv：Bash read 会折叠连续 IFS 空白，空字段会导致列错位。
 inbound_rows() {
-  jq -r --arg proto "$proto" '
+  jq -r --arg proto "$proto" --arg tag "$filter_tag" '
     def protocol:
       if .type == "vless" then "vless"
       elif .type == "hysteria2" then "hy2"
@@ -276,6 +311,7 @@ inbound_rows() {
     | protocol as $p
     | select($p != "")
     | select($proto == "all" or $proto == $p)
+    | select($tag == "" or (.tag // "") == $tag)
     | {
         protocol: $p,
         tag: (.tag // ""),
@@ -440,15 +476,21 @@ case "$mode" in
         case "$p" in
           vless)
             vless_uri "$SERVER_IP" "$port" "$uuid" "$disp" "$tag" "v4" "$sni" "$short_id"
-            [[ -n "${SERVER_IP6:-}" ]] && vless_uri "$SERVER_IP6" "$port" "$uuid" "$disp" "$tag" "v6" "$sni" "$short_id"
+            if [[ -n "${SERVER_IP6:-}" ]]; then
+              vless_uri "$SERVER_IP6" "$port" "$uuid" "$disp" "$tag" "v6" "$sni" "$short_id"
+            fi
             ;;
           hy2)
             hy2_uri "$SERVER_IP" "$port" "$pw" "$disp" "$tag" "v4" "$sni" "$obfs_type" "$obfs_pass" "$ports"
-            [[ -n "${SERVER_IP6:-}" ]] && hy2_uri "$SERVER_IP6" "$port" "$pw" "$disp" "$tag" "v6" "$sni" "$obfs_type" "$obfs_pass" "$ports"
+            if [[ -n "${SERVER_IP6:-}" ]]; then
+              hy2_uri "$SERVER_IP6" "$port" "$pw" "$disp" "$tag" "v6" "$sni" "$obfs_type" "$obfs_pass" "$ports"
+            fi
             ;;
           socks5)
             socks5_uri "$SERVER_IP" "$port" "$name" "$pw" "$disp" "$tag" "v4"
-            [[ -n "${SERVER_IP6:-}" ]] && socks5_uri "$SERVER_IP6" "$port" "$name" "$pw" "$disp" "$tag" "v6"
+            if [[ -n "${SERVER_IP6:-}" ]]; then
+              socks5_uri "$SERVER_IP6" "$port" "$name" "$pw" "$disp" "$tag" "v6"
+            fi
             ;;
         esac
       done
