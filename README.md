@@ -114,6 +114,7 @@ Manage inbound registry and overlays. Tag truth source is `env/inbounds.json`, n
 | `pi inbound list` | Show base tags, clones, patches, deleted tags, port policy, HY2 range. | Read-only, normalizes `env/inbounds.json` |
 | `pi inbound show <tag>` | Show source/clone/patch/delete state for one inbound. | Read-only |
 | `pi inbound set vless-in listen_port 40443` | Set inbound field by exact tag. | `env/inbounds.json` |
+| `pi inbound set vless-in multiplex.enabled true` | Enable inbound multiplex (smux/yamux) for VLESS. Client subscription config must also enable multiplex, or connections will fail. | `env/inbounds.json` |
 | `pi inbound set vless-in tag edge-vless` | Rename inbound tag and sync references. | `env/inbounds.json`, `env/node.env`, `env/routes.json` |
 | `pi inbound set hy2-in up_mbps 80` | Set HY2 upstream bandwidth. | `env/inbounds.json` |
 | `pi inbound set hy2-in obfs.password <pass>` | Patch nested inbound field. | `env/inbounds.json` |
@@ -369,6 +370,7 @@ pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound hy2 range <number> enables HY2 port hopping.
+# Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 
 pi user add direct daily
 pi user add direct jp-video
@@ -392,6 +394,7 @@ pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound hy2 range <number> enables HY2 port hopping.
+# Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 pi user add direct hk
 
 # pi dns enable
@@ -416,6 +419,7 @@ pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound hy2 range <number> enables HY2 port hopping.
+# Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 
 pi user add direct netflix
 pi user add direct openai
@@ -439,6 +443,7 @@ pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound hy2 range <number> enables HY2 port hopping.
+# Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 
 pi user add direct jp
 pi user add upstream us-ai
@@ -480,6 +485,7 @@ pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound hy2 range <number> enables HY2 port hopping.
+# Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 
 pi user add direct hk
 pi user add upstream us-ai
@@ -522,6 +528,7 @@ pi inbound set vless-in  listen_port 40443
 pi inbound set hy2-in    listen_port 40500
 pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound hy2 range <number> enables HY2 port hopping.
+# Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 
 pi user add direct netflix
 pi user add direct openai
