@@ -151,6 +151,7 @@ ask_value(){
 }
 
 mem_mb(){ awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
+mem_avail_mb(){ awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
 swap_mb(){ awk '/SwapTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0; }
 disk_root_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$2); print $2}' || echo 0; }
 disk_avail_gb(){ df -BG / 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}' || echo 0; }
@@ -188,6 +189,83 @@ recommend_profile(){
   else
     echo hy2
   fi
+}
+
+format_mb(){
+  local mb="${1:-0}"
+  if (( mb > 0 && mb % 1024 == 0 )); then
+    echo "$(( mb / 1024 ))G"
+  elif (( mb > 0 )); then
+    echo "${mb}M"
+  else
+    echo ""
+  fi
+}
+
+swap_recommend_mb(){
+  local m a
+  m="$(mem_mb)"
+  a="$(disk_avail_gb)"
+
+  if (( m <= 0 )); then
+    echo 0
+  elif (( m < 1500 )); then
+    if (( a > 0 && a < 3 )); then
+      echo 512
+    else
+      echo 1024
+    fi
+  elif (( m < 3000 )); then
+    echo 512
+  else
+    echo 0
+  fi
+}
+
+swap_recommend_size(){
+  format_mb "$(swap_recommend_mb)"
+}
+
+swap_recommend_advice(){
+  local m s a rec_mb size
+  m="$(mem_mb)"
+  s="$(swap_mb)"
+  a="$(disk_avail_gb)"
+  rec_mb="$(swap_recommend_mb)"
+  size="$(format_mb "$rec_mb")"
+
+  if (( s > 0 )); then
+    ok "已有 swap=$(format_mb "$s")。"
+    if (( rec_mb > 0 && s < rec_mb )); then
+      warn "当前 swap 小于建议值 ${size}。"
+      advice "如果这是本工具创建的 ${SWAP_FILE}，可在 bootstrap 中选择调整到 ${size}。"
+    fi
+    return 0
+  fi
+
+  if (( m <= 0 )); then
+    warn "当前没有 swap，且无法读取内存大小。"
+    advice "无法自动判断是否小机；需要更稳可手动执行：sb-tune swap create 512M"
+    return 0
+  fi
+
+  warn "当前没有 swap。内存=${m}MB，根分区可用=${a}G。"
+  if (( rec_mb > 0 )); then
+    if (( m > 0 && m < 1500 )); then
+      advice "判断为小内存 VPS；建议创建 ${size} swap：sb-tune swap create ${size}"
+    else
+      advice "判断为中等内存 VPS；建议创建 ${size} swap，提高 apt upgrade/装内核时的容错。"
+    fi
+  else
+    advice "当前内存不算小机，默认不强制创建 swap；想更稳可手动执行：sb-tune swap create 512M"
+  fi
+}
+
+swap_needs_action(){
+  local s rec_mb
+  s="$(swap_mb)"
+  rec_mb="$(swap_recommend_mb)"
+  (( rec_mb > 0 && s < rec_mb ))
 }
 
 profile_values(){
@@ -292,9 +370,8 @@ EOF2
     advice "内存较大，可以考虑 hy2；但 1C 小鸡不建议盲目把 HY2 带宽拉太高。"
   fi
 
-  if (( s == 0 && m > 0 && m < 1500 )); then
-    warn "当前没有 swap；1G 机器安装内核/升级包时更容易 OOM。"
-    advice "建议创建 1G swap。"
+  if (( s == 0 )); then
+    swap_recommend_advice
   fi
 
   if (( a > 0 && a < 3 )); then
@@ -348,8 +425,8 @@ show_recommend(){
       advice "可以用 hy2：journald=300M/80M/150M，socket buffer=128M；HY2 流量多时再选。"
       ;;
   esac
-  if (( s == 0 && m > 0 && m < 1500 )); then
-    advice "建议先创建 1G swap，再 full-upgrade 或装内核。"
+  if (( s == 0 )); then
+    swap_recommend_advice
   fi
   if [[ "$(uname -r)" != *xanmod* ]]; then
     advice "需要 BBRv3 就安装 XanMod；安装后 reboot，再 check。"
@@ -840,13 +917,84 @@ cert_wizard(){
 
 swap_check(){
   stage "Swap check：检查 swap"
-  explain "这一步只读。1G VPS 建议至少 1G swap，避免 apt 升级或装内核时 OOM。"
-  echo "swap_mb = $(swap_mb)"
-  if (( $(swap_mb) > 0 )); then
-    ok "已有 swap。"
+  explain "这一步只读。会根据内存和磁盘余量判断是否建议创建 swap。"
+  local m ma s rec_mb suggest
+  m="$(mem_mb)"
+  ma="$(mem_avail_mb)"
+  s="$(swap_mb)"
+  rec_mb="$(swap_recommend_mb)"
+  if (( rec_mb > 0 && s < rec_mb )); then
+    suggest="$(format_mb "$rec_mb")"
   else
-    warn "当前没有 swap。"
-    advice "1G 小机建议执行：sb-tune swap create 1G"
+    suggest="否"
+  fi
+  echo "mem_mb        = $m"
+  echo "mem_avail_mb  = $ma"
+  echo "swap_mb       = $s"
+  echo "disk_avail_gb = $(disk_avail_gb)"
+  echo "swap_suggest  = $suggest"
+  swap_recommend_advice
+}
+
+swap_prompt(){
+  local m ma s rec_mb suggest exists ans mb target
+  m="$(mem_mb)"
+  ma="$(mem_avail_mb)"
+  s="$(swap_mb)"
+  rec_mb="$(swap_recommend_mb)"
+
+  if (( rec_mb > 0 && s < rec_mb )); then
+    suggest="$(format_mb "$rec_mb")"
+  else
+    suggest="否"
+  fi
+
+  if (( s > 0 )); then
+    exists="是($(format_mb "$s"))"
+  else
+    exists="否"
+  fi
+
+  read -r -p "当前内存：$(format_mb "$m")，可用内存：$(format_mb "$ma")，是否存在swap：${exists}，建议swap：${suggest}，是否创建[Y/N/自定义]: " ans || ans=""
+  ans="${ans//[[:space:]]/}"
+
+  if [[ -z "$ans" ]]; then
+    if [[ "$suggest" != "否" ]]; then
+      ans="Y"
+    else
+      ans="N"
+    fi
+  fi
+
+  case "$ans" in
+    Y|y|yes|YES|Yes)
+      if [[ "$suggest" != "否" ]]; then
+        target="$suggest"
+      else
+        target="512M"
+      fi
+      ;;
+    N|n|no|NO|No)
+      status "跳过 swap 创建/调整。"
+      return 0
+      ;;
+    *)
+      mb="$(size_to_mb "$ans")"
+      validate_swap_size_mb "$mb"
+      target="$(format_mb "$mb")"
+      ;;
+  esac
+
+  mb="$(size_to_mb "$target")"
+  if (( s > 0 && s == mb )); then
+    ok "当前 swap 已是 ${target}，无需调整。"
+    return 0
+  fi
+
+  if (( s > 0 )); then
+    swap_recreate "$target"
+  else
+    swap_create "$target"
   fi
 }
 
@@ -876,12 +1024,26 @@ size_to_mb(){
   esac
 }
 
+validate_swap_size_mb(){
+  local mb="$1" m
+  m="$(mem_mb)"
+  [[ "$mb" =~ ^[0-9]+$ ]] || die "非法 swap size"
+  (( mb >= 256 )) || die "swap size 不能小于 256M"
+  if (( m > 0 && mb > m )); then
+    die "swap size 不能大于本机内存 ${m}M，收到 $(format_mb "$mb")"
+  fi
+  (( mb <= 4096 )) || die "swap size 建议不超过 4G，收到 $(format_mb "$mb")"
+}
+
+managed_swap_active(){
+  swapon --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"
+}
+
 swap_create(){
   need_root
   local size="${1:-1G}" mb avail
   mb="$(size_to_mb "$size")"
-  [[ "$mb" =~ ^[0-9]+$ ]] || die "非法 swap size: $size"
-  (( mb >= 256 && mb <= 4096 )) || die "swap size 建议范围 256M-4G，收到 ${size}"
+  validate_swap_size_mb "$mb"
 
   stage "Swap create：创建 swap"
   explain "目标是在 $SWAP_FILE 创建 ${size} swap，并写入 /etc/fstab。已有 swap 时会跳过。"
@@ -911,6 +1073,24 @@ swap_create(){
   run swapon "$SWAP_FILE"
   awk -v f="$SWAP_FILE" '$1 == f {found=1} END{exit found?0:1}' /etc/fstab 2>/dev/null || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
   ok "swap 已创建并启用：$(swap_mb)MB"
+}
+
+swap_recreate(){
+  need_root
+  local size="${1:-1G}" mb
+  mb="$(size_to_mb "$size")"
+  validate_swap_size_mb "$mb"
+
+  if (( $(swap_mb) > 0 )) && ! managed_swap_active; then
+    warn "当前已有 swap，但不是本工具管理的 ${SWAP_FILE}，不会自动替换。"
+    advice "如需调整，请先手动处理现有 swap，再执行：sb-tune swap create $(format_mb "$mb")"
+    return 1
+  fi
+
+  if managed_swap_active || [[ -e "$SWAP_FILE" ]]; then
+    swap_off
+  fi
+  swap_create "$(format_mb "$mb")"
 }
 
 swap_off(){
@@ -1245,16 +1425,11 @@ bootstrap(){
     status "跳过 full-upgrade。"
   fi
 
-  if (( $(swap_mb) == 0 && $(mem_mb) > 0 && $(mem_mb) < 1500 )); then
-    warn "检测到小内存且没有 swap。"
-    if ask_yn "创建 1G swap 吗" Y; then
-      swap_create 1G
-    fi
+  swap_check
+  if swap_needs_action; then
+    swap_prompt
   else
-    swap_check
-    if (( $(swap_mb) == 0 )) && ask_yn "仍然创建 1G swap 吗" N; then
-      swap_create 1G
-    fi
+    status "swap 已满足当前建议或当前无需 swap，跳过 swap 创建/调整。"
   fi
 
   if ! has sing-box; then
@@ -1345,7 +1520,7 @@ MENU
       7) deps_upgrade; pause ;;
       8)
         swap_check
-        if ask_yn "创建/补充 1G swap 吗" N; then swap_create 1G; fi
+        swap_prompt
         pause
         ;;
       9)

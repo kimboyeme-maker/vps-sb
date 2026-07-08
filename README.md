@@ -60,9 +60,13 @@ Required interactive VPS preparation and tuning: dependencies, certbot/certifica
 | `pi tune cert check` | Check certbot, renewal task, deploy hook, cert links, and configured TLS paths. | Read-only |
 | `pi tune cert install` | Install certbot only. | System packages |
 | `pi tune cert renew-test` | Manually run `certbot renew --dry-run`; this temporarily stops sing-box. | sing-box service, certbot staging |
-| `pi tune swap check` | Check swap state. | Read-only |
-| `pi tune swap create 1G` | Create swap file. | System swap |
+| `pi tune swap check` | Check RAM, available RAM, swap size, disk space, and recommended swap size. | Read-only |
+| `pi tune swap create 512M\|1G\|2G` | Create swap file. | System swap |
 | `pi tune swap off` | Disable managed swap. | System swap |
+
+During `pi tune bootstrap`, the swap step prompts with current RAM, available RAM,
+existing swap size, and a recommendation. Answer `Y`, `N`, or a custom size such
+as `768M`; custom values must be at least `256M` and no larger than machine RAM.
 | `pi tune singbox check` | Check sing-box availability. | Read-only |
 | `pi tune singbox install` | Install sing-box. | System service/package |
 | `pi tune singbox version` | Print sing-box version. | Read-only |
