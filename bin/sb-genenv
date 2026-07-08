@@ -308,6 +308,9 @@ INBOUND_PORT_SUGGEST_MIN=${INBOUND_PORT_SUGGEST_MIN_DEFAULT}
 # ufw 额外放行（config 端口集之外又要保留的，空格分隔，例: "80/tcp 443/tcp"）
 EXTRA_ALLOW=""
 
+# ufw 对账白名单（这些端口即使不在 config 端口集里也不会被 apply 回收删除；不会主动 allow，只跳过 DEL。空格分隔，例: "8080/tcp 9000/udp"）
+PORT_WHITELIST=""
+
 # ---- REALITY ----
 REALITY_PRIVATE_KEY=${PRIV}
 REALITY_PUBLIC_KEY=${PUB}

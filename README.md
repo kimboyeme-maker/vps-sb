@@ -134,6 +134,8 @@ Manage inbound registry and overlays. Tag truth source is `env/inbounds.json`, n
 | `pi inbound hy2 range show` | Show HY2 range calculation. | Read-only |
 | `pi inbound hy2 range off` | Disable HY2 range. | `env/node.env` |
 
+`INBOUND_PORT_MIN` (hard floor, default `20000`) and `INBOUND_PORT_SUGGEST_MIN` (soft floor that only warns, default `40000`) have no dedicated CLI command — edit `env/node.env` directly (`INBOUND_PORT_MIN=...` / `INBOUND_PORT_SUGGEST_MIN=...`), then `pi apply` to re-validate. `pi inbound list` shows the current values under `port policy:`.
+
 ### `pi outbound`
 
 Manage landing outbounds, upstream settings, direct outbound patching, and upstream inbound scope.
@@ -169,6 +171,11 @@ in subscription node naming (see `pi export`/`pi show` below).
 | `pi outbound direct set resolver cloudflare prefer_ipv4` | Patch direct outbound `domain_resolver`. | `env/outbound-patch.json` |
 | `pi outbound direct set domain_strategy ipv4_only` | Patch direct outbound domain strategy. | `env/outbound-patch.json` |
 | `pi outbound direct rm resolver` | Remove direct outbound resolver patch. | `env/outbound-patch.json` |
+| `pi outbound port-whitelist list` | Show current UFW reconciliation whitelist. | Read-only |
+| `pi outbound port-whitelist add 8080/tcp 9000/udp` | Add ports that `pi apply` should never `ufw delete allow`, even if unused by any inbound. Not auto-allowed — only skipped from reclaim. | `env/node.env` (`PORT_WHITELIST`) |
+| `pi outbound port-whitelist del 8080/tcp` | Remove ports from the whitelist. | `env/node.env` |
+| `pi outbound port-whitelist set 8080/tcp 9000/udp` | Replace the whitelist. | `env/node.env` |
+| `pi outbound port-whitelist clear` | Empty the whitelist. | `env/node.env` |
 
 ### `pi dns`
 
@@ -237,6 +244,11 @@ The only compiler. It renders config, injects users/inbounds/outbounds/DNS/route
 | `pi apply snapshot` | Apply and create a successful-apply backup snapshot. | `out/config.json`, sing-box service, backups |
 
 If `env/cert.json` exists or `env/dns.json.domains` is non-empty, `pi apply` keeps `80/tcp` in UFW so certbot HTTP renewal is not reclaimed by firewall cleanup.
+
+`pi apply` reconciles UFW against the current inbound port set: anything allowed but no longer in that set gets `ufw delete allow`'d back. Two `env/node.env` vars adjust this:
+
+- `EXTRA_ALLOW` — space-separated `port/tcp|udp` entries actively kept allowed (added if missing, never reclaimed), e.g. `EXTRA_ALLOW="80/tcp 443/tcp"`.
+- `PORT_WHITELIST` — space-separated `port/tcp|udp` entries that reconciliation skips entirely (not auto-added, just never deleted), for ports another service on the box manages, e.g. `PORT_WHITELIST="8080/tcp 9000/udp"`. Manage via `pi outbound port-whitelist` (see `pi outbound` table) instead of hand-editing `env/node.env`.
 
 ### `pi export`
 

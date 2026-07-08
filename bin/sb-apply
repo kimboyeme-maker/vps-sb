@@ -1069,7 +1069,7 @@ elif jq -e '(.domains // []) | length > 0' <<<"$DNS_JSON" >/dev/null; then
   KEEP_HTTP_FOR_CERT=1
 fi
 
-dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} HY2_RANGE=${HY2_RANGE_ALLOW:-} KEEP_HTTP_FOR_CERT=$KEEP_HTTP_FOR_CERT"
+dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} PORT_WHITELIST=${PORT_WHITELIST:-} HY2_RANGE=${HY2_RANGE_ALLOW:-} KEEP_HTTP_FOR_CERT=$KEEP_HTTP_FOR_CERT"
 
 declare -A WANT
 
@@ -1100,6 +1100,15 @@ for e in ${EXTRA_ALLOW:-}; do
   fi
 done
 
+declare -A PORT_WHITELIST_SET
+for e in ${PORT_WHITELIST:-}; do
+  if [[ "$e" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]]; then
+    PORT_WHITELIST_SET["$e"]=1
+  else
+    log "WARN: 跳过非法 PORT_WHITELIST 条目 '$e'"
+  fi
+done
+
 if ! ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "${SSH_PORT}/tcp" >/dev/null
   ufw --force enable >/dev/null
@@ -1122,6 +1131,11 @@ done
 
 while read -r c; do
   [[ -z "$c" ]] && continue
+
+  [[ -n "${PORT_WHITELIST_SET[$c]:-}" ]] && {
+    dbg "SKIP ufw delete allow $c (在 PORT_WHITELIST 白名单内)"
+    continue
+  }
 
   [[ -z "${WANT[$c]:-}" ]] && {
     log "DEL ufw delete allow $c (回收)"

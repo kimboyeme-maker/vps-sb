@@ -59,6 +59,12 @@ usage() {
   sb-outbound direct set <key> <value>
   sb-outbound direct rm  <key>
 
+  sb-outbound port-whitelist list
+  sb-outbound port-whitelist add <port[:port]/tcp|udp ...>
+  sb-outbound port-whitelist del <port[:port]/tcp|udp ...>
+  sb-outbound port-whitelist set <port[:port]/tcp|udp ...>
+  sb-outbound port-whitelist clear
+
 类型-参数:
   socks <host> <port> [user] [pass]
   http  <host> <port> [user] [pass]
@@ -105,7 +111,16 @@ strategy:
   sb-outbound direct set domain_strategy ipv4_only
   sb-outbound direct rm resolver
 
+  sb-outbound port-whitelist add 8080/tcp 9000/udp
+  sb-outbound port-whitelist list
+  sb-outbound port-whitelist del 8080/tcp
+
   sb-apply
+
+port-whitelist 说明:
+  写 env/node.env 的 PORT_WHITELIST；pi apply 做 UFW 端口对账时，
+  这些端口即使不在当前 inbound 端口集里，也不会被回收删除。
+  不会主动 allow，只是跳过删除，适合给别的服务占用的端口用。
 
 兼容旧命令仍可解析，但不再推荐：
   enable / disable / inbound / domain / resolver
@@ -116,7 +131,10 @@ U
 }
 
 shell_quote() {
-  printf '%q' "$1"
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
 }
 
 set_env() {
@@ -1275,6 +1293,75 @@ case "$cmd" in
       clear)
         set_env "UPSTREAM_INBOUNDS" ""
         log "OK: UPSTREAM_INBOUNDS=<empty>。跑 sb-apply 生效。"
+        ;;
+
+      *)
+        usage
+        ;;
+    esac
+    ;;
+
+  port-whitelist)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      list)
+        load_env
+        echo "current:"
+        if [[ -z "${PORT_WHITELIST:-}" ]]; then
+          echo "  <empty>"
+        else
+          for p in $PORT_WHITELIST; do echo "  $p"; done
+        fi
+        ;;
+
+      add)
+        [[ $# -gt 0 ]] || die "缺少端口参数，例如: sb-outbound port-whitelist add 8080/tcp"
+        load_env
+
+        declare -A seen
+        new=()
+        for p in ${PORT_WHITELIST:-} "$@"; do
+          [[ "$p" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]] || die "非法端口条目: '$p'，格式必须是 <port>[:<port>]/tcp|udp"
+          [[ -n "${seen[$p]:-}" ]] && continue
+          seen[$p]=1
+          new+=("$p")
+        done
+
+        set_env "PORT_WHITELIST" "${new[*]}"
+        log "OK: PORT_WHITELIST=${new[*]:-<empty>}。跑 sb-apply 生效。"
+        ;;
+
+      del|rm)
+        [[ $# -gt 0 ]] || die "缺少端口参数，例如: sb-outbound port-whitelist del 8080/tcp"
+        load_env
+
+        new=()
+        for p in ${PORT_WHITELIST:-}; do
+          keep=1
+          for d in "$@"; do
+            [[ "$p" == "$d" ]] && keep=0
+          done
+          (( keep )) && new+=("$p")
+        done
+
+        set_env "PORT_WHITELIST" "${new[*]}"
+        log "OK: PORT_WHITELIST=${new[*]:-<empty>}。跑 sb-apply 生效。"
+        ;;
+
+      set)
+        for p in "$@"; do
+          [[ "$p" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]] || die "非法端口条目: '$p'，格式必须是 <port>[:<port>]/tcp|udp"
+        done
+
+        set_env "PORT_WHITELIST" "$*"
+        log "OK: PORT_WHITELIST=${*:-<empty>}。跑 sb-apply 生效。"
+        ;;
+
+      clear)
+        set_env "PORT_WHITELIST" ""
+        log "OK: PORT_WHITELIST=<empty>。跑 sb-apply 生效。"
         ;;
 
       *)
