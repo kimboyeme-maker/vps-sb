@@ -85,7 +85,7 @@ cert_check(){
       ok "ufw keeps 80/tcp for HTTP-01 renewal"
     else
       warn "ufw may not allow 80/tcp; HTTP-01 issue/renew can fail"
-      echo "建议: pi apply 会在 env/cert.json 存在或 dns domains 非空时保留 80/tcp；也可手动 ufw allow 80/tcp。"
+      echo "建议: pi apply 会在 env/cert.json 存在或 dns domains 非空时放行 80/tcp；也可手动 ufw allow 80/tcp。"
     fi
   fi
 

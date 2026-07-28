@@ -34,7 +34,7 @@ usage() {
 命令:
   genenv      生成 node.env / users.json / 证书 / REALITY 密钥    (= sb-genenv)
   user        用户增删改查、改 egress                              (= sb-user)
-  apply       渲染模板→校验→落盘→重启→ufw 对账                    (= sb-apply)
+  apply       渲染模板→校验→落盘→重启→放行所需 UFW 端口           (= sb-apply)
   show        打印分享链接 / JSON 节点（支持协议过滤）             (= sb-show)
   export      导出每用户订阅到 out/sub/（支持协议过滤）            (= sb-export)
   outbound    落地 outbound / upstream / direct patch 管理          (= sb-outbound)

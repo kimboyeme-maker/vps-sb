@@ -42,7 +42,7 @@ summary:
    13. 自动合并 env/routes.json（自定义分流规则，默认禁用）
    14. sing-box check 通过后才落盘
    15. config 变化时重启 sing-box；config 未变则跳过重启，服务未运行时仅 start
-   16. UFW 端口对账
+   16. UFW 必要端口放行（不删除已有规则）
    17. HY2 range nftables dnat 对账
 
   DNS / route overlay（均默认禁用，enabled=false 时对 config 零改动）：
@@ -68,7 +68,8 @@ notes:
   - VLESS_PORT / HY2_PORT / SOCKS5_PORT 是模板 listen_port 必需参数；缺失或为空会直接失败，不自动补默认值
   - sing-box check 不通过时不会覆盖正式 config
   - HY2_RANGE_ENABLED=1 时需要系统有 nft 命令
-  - env/cert.json 存在或 env/dns.json.domains 非空时，UFW 会自动保留 80/tcp 供 certbot 续期
+  - env/cert.json 存在或 env/dns.json.domains 非空时，UFW 会自动放行 80/tcp 供 certbot 续期
+  - UFW 只增不删；废弃端口请由管理员手动回收
   - sb-apply snapshot：apply 全部成功后打一张快照（调 sb-backup），并只保留最近 10 张；平时 sb-apply 不打快照
 U
 }
@@ -1069,7 +1070,7 @@ elif jq -e '(.domains // []) | length > 0' <<<"$DNS_JSON" >/dev/null; then
   KEEP_HTTP_FOR_CERT=1
 fi
 
-dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} PORT_WHITELIST=${PORT_WHITELIST:-} HY2_RANGE=${HY2_RANGE_ALLOW:-} KEEP_HTTP_FOR_CERT=$KEEP_HTTP_FOR_CERT"
+dbg "TCP=$TCP_PORTS UDP=$UDP_PORTS SSH=$SSH_PORT EXTRA=${EXTRA_ALLOW:-} HY2_RANGE=${HY2_RANGE_ALLOW:-} KEEP_HTTP_FOR_CERT=$KEEP_HTTP_FOR_CERT"
 
 declare -A WANT
 
@@ -1100,15 +1101,6 @@ for e in ${EXTRA_ALLOW:-}; do
   fi
 done
 
-declare -A PORT_WHITELIST_SET
-for e in ${PORT_WHITELIST:-}; do
-  if [[ "$e" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]]; then
-    PORT_WHITELIST_SET["$e"]=1
-  else
-    log "WARN: 跳过非法 PORT_WHITELIST 条目 '$e'"
-  fi
-done
-
 if ! ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "${SSH_PORT}/tcp" >/dev/null
   ufw --force enable >/dev/null
@@ -1128,20 +1120,6 @@ for w in "${!WANT[@]}"; do
     ufw allow "$w" >/dev/null
   }
 done
-
-while read -r c; do
-  [[ -z "$c" ]] && continue
-
-  [[ -n "${PORT_WHITELIST_SET[$c]:-}" ]] && {
-    dbg "SKIP ufw delete allow $c (在 PORT_WHITELIST 白名单内)"
-    continue
-  }
-
-  [[ -z "${WANT[$c]:-}" ]] && {
-    log "DEL ufw delete allow $c (回收)"
-    ufw delete allow "$c" >/dev/null || true
-  }
-done <<<"$CUR"
 
 ufw reload >/dev/null 2>&1 || true
 

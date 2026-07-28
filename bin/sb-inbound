@@ -1214,7 +1214,7 @@ case "$cmd" in
             set_env "HY2_RANGE_MODE" "dnat"
 
             log "OK: 已设置 HY2 range tag=$tag offset=$offset mode=dnat。"
-            log "INFO: 跑 sb-apply 后由 sb-apply 负责 nftables/ufw 对账。"
+            log "INFO: 跑 sb-apply 后由 sb-apply 配置 nftables，并放行所需 UFW 端口。"
             ;;
         esac
         ;;
