@@ -1258,6 +1258,37 @@ check_abi(){
   ok "推荐 ABI=$abi"
 }
 
+resolve_xanmod_package(){
+  local abi="$1" primary fallback pattern found
+  case "$abi" in
+    v2)
+      primary="linux-xanmod-x64v2"
+      fallback="linux-xanmod-lts-x64v2"
+      pattern="^linux-xanmod.*x64v2"
+      ;;
+    v3)
+      primary="linux-xanmod-x64v3"
+      fallback="linux-xanmod-lts-x64v3"
+      pattern="^linux-xanmod.*x64v3"
+      ;;
+    *) die "ABI 只支持 auto/v2/v3" ;;
+  esac
+
+  # XanMod apt 源有时只提供 LTS 元包，安装前必须按当前源探测。
+  found="$(apt-cache search "$pattern" | awk '{print $1}')"
+  if grep -qx "$primary" <<<"$found"; then
+    printf '%s\n' "$primary"
+    return
+  fi
+  if grep -qx "$fallback" <<<"$found"; then
+    warn "未找到 $primary，改用当前源可用包：$fallback"
+    printf '%s\n' "$fallback"
+    return
+  fi
+
+  die "未找到可安装的 XanMod $abi 包。apt-cache search '$pattern' 输出：${found:-<empty>}"
+}
+
 install_xanmod(){
   need_root
   local abi="${1:-auto}" codename pkg tmp out
@@ -1302,8 +1333,7 @@ install_xanmod(){
   fi
 
   case "$abi" in
-    v2) pkg=linux-xanmod-x64v2 ;;
-    v3) pkg=linux-xanmod-x64v3 ;;
+    v2|v3) pkg="$(resolve_xanmod_package "$abi")" ;;
     *) die "ABI 只支持 auto/v2/v3" ;;
   esac
 
