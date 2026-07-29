@@ -383,6 +383,17 @@ pi inbound set socks5-in listen_port 40080
 pi user add direct daily
 pi user add direct jp-video
 
+# Direct-only node: no upstream relay. Resolve locally and prefer IPv6
+# for domain destinations, with automatic IPv4 fallback.
+pi outbound upstream set enabled 0
+pi dns enable
+pi dns server add local local
+pi dns final local
+pi dns strategy prefer_ipv6
+pi dns route-default set server local
+pi dns route-default set strategy prefer_ipv6
+pi outbound direct set resolver local prefer_ipv6
+
 pi apply snapshot
 pi doctor quick
 pi export
@@ -391,7 +402,8 @@ pi show txt
 
 ### Hong Kong Direct
 
-HK direct is for HK IP / Asia entry. Keep server-side DNS off by default unless you explicitly need it.
+HK direct is for HK IP / Asia entry. This example uses the VPS system resolver
+and prefers IPv6 without configuring an upstream relay.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kimboyeme-maker/vps_proxy/main/install.sh | bash -s --
@@ -405,11 +417,16 @@ pi inbound set socks5-in listen_port 40080
 # Optional: pi inbound set vless-in multiplex.enabled true — also enable multiplex/smux in the client subscription config, or the client can't connect.
 pi user add direct hk
 
-# pi dns enable
-# pi dns server add cloudflare https 1.1.1.1 443 /dns-query
-# pi dns final cloudflare
-# pi dns strategy ipv4_only
-# pi dns route-default set server cloudflare
+# Direct-only node: no upstream relay. Resolve locally and prefer IPv6
+# for domain destinations, with automatic IPv4 fallback.
+pi outbound upstream set enabled 0
+pi dns enable
+pi dns server add local local
+pi dns final local
+pi dns strategy prefer_ipv6
+pi dns route-default set server local
+pi dns route-default set strategy prefer_ipv6
+pi outbound direct set resolver local prefer_ipv6
 
 pi apply snapshot
 pi doctor quick
