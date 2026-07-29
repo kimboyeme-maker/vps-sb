@@ -149,13 +149,11 @@ in subscription node naming (see `pi export`/`pi show` below).
 
 | Command | Description | Affects |
 | --- | --- | --- |
-| `pi outbound list` | List custom outbounds; last column is each named outbound's `domain_strategy`. | Read-only, creates `out/outbounds.json` if missing |
+| `pi outbound list` | List custom outbounds. | Read-only, creates `out/outbounds.json` if missing |
 | `pi outbound show <name>` | Show one outbound. | Read-only |
 | `pi outbound add us socks <US_IP> 40080 <USER> <PASS>` | Add SOCKS5 outbound. | `out/outbounds.json` |
 | `pi outbound add web http <HOST> <PORT> [USER] [PASS]` | Add HTTP outbound. | `out/outbounds.json` |
 | `pi outbound add ss1 ss <HOST> <PORT> <METHOD> <PASSWORD>` | Add Shadowsocks outbound. | `out/outbounds.json` |
-| `pi outbound set us domain_strategy ipv4_only` | Set a named outbound's domain strategy; visible in `pi outbound list`. | `out/outbounds.json` |
-| `pi outbound reset us domain_strategy` | Clear a named outbound's domain strategy. | `out/outbounds.json` |
 | `pi outbound del <name>` | Delete outbound. | `out/outbounds.json` |
 | `pi outbound upstream show` | Show current upstream settings and available inbound tags. | Read-only |
 | `pi outbound upstream set name us` | Enable configured outbound as upstream and copy host/port/auth into env. | `env/node.env` |
@@ -164,14 +162,13 @@ in subscription node naming (see `pi export`/`pi show` below).
 | `pi outbound upstream allow inbounds hy2-alt` | Append inbound to upstream scope. | `env/node.env` |
 | `pi outbound upstream del-inbounds hy2-alt` | Remove inbound from upstream scope. | `env/node.env` |
 | `pi outbound upstream clear inbounds` | Clear upstream inbound scope. | `env/node.env` |
-| `pi outbound upstream set domain_strategy ipv4_only` | Set current upstream domain strategy; visible in `pi outbound upstream show`, not `pi outbound list`. | `env/node.env` |
 | `pi outbound upstream set host <HOST>` | Configure temporary upstream host without named outbound. | `env/node.env` |
 | `pi outbound upstream set port <PORT>` | Configure temporary upstream port without named outbound. | `env/node.env` |
 | `pi outbound upstream set isp 0\|1` | Toggle the `-ISP` segment in upstream subscription node names (default `1`). Naming only, no `pi apply` needed. | `env/node.env` |
 | `pi outbound direct show` | Show patch for built-in `direct` outbound. | Read-only |
 | `pi outbound direct set resolver cloudflare prefer_ipv4` | Patch direct outbound `domain_resolver`. | `env/outbound-patch.json` |
-| `pi outbound direct set domain_strategy ipv4_only` | Patch direct outbound domain strategy. | `env/outbound-patch.json` |
 | `pi outbound direct rm resolver` | Remove direct outbound resolver patch. | `env/outbound-patch.json` |
+| `pi outbound resolver set us cloudflare prefer_ipv4` | Set modern `domain_resolver` on any outbound tag. | `env/outbound-patch.json` |
 
 ### `pi dns`
 

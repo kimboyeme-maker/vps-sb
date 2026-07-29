@@ -82,10 +82,9 @@ upstream key:
 
 direct key:
   resolver <dns-server-tag> [strategy]
-  domain_strategy <strategy>
 
-named outbound key:
-  domain_strategy <strategy>
+任意 outbound（含 direct / named / upstream）:
+  sb-outbound resolver set <outbound-tag> <dns-server-tag> [strategy]
 
 strategy:
   prefer_ipv4
@@ -95,15 +94,13 @@ strategy:
 
 例:
   sb-outbound add isp1 socks proxy.example.com 1080 user pass
-  sb-outbound set isp1 domain_strategy ipv4_only
   sb-outbound upstream set name isp1
   sb-outbound upstream set inbounds vless-in,hy2-in
-  sb-outbound upstream set domain_strategy ipv4_only
   sb-outbound upstream set enabled 0
 
   sb-outbound direct set resolver google prefer_ipv6
-  sb-outbound direct set domain_strategy ipv4_only
   sb-outbound direct rm resolver
+  sb-outbound resolver set isp1 google prefer_ipv6
 
   sb-apply
 

@@ -514,6 +514,30 @@ jq \
         )
     );
 
+  def migrate_legacy_domain_strategy($default_server):
+    .outbounds |= map(
+      if has("domain_strategy") then
+        .domain_strategy as $legacy_strategy
+        | if ($legacy_strategy == null or $legacy_strategy == "" or $legacy_strategy == "none" or $legacy_strategy == "as_is") then
+            del(.domain_strategy)
+          else
+            ((.domain_resolver.server // "") as $explicit_server
+              | if $explicit_server != "" then $explicit_server else ($default_server // "") end) as $resolver_server
+            | if $resolver_server == "" then
+                error("outbound " + (.tag // "<unknown>") + " 使用已移除的 domain_strategy，但没有可迁移的 DNS server；先执行 pi dns server add local local、pi dns route-default set server local，或 pi outbound resolver set " + (.tag // "<tag>") + " local " + ($legacy_strategy | tostring))
+              else
+                .domain_resolver = deepmerge(
+                  {server: $resolver_server, strategy: $legacy_strategy};
+                  (.domain_resolver // {})
+                )
+                | del(.domain_strategy)
+              end
+          end
+      else
+        .
+      end
+    );
+
   def tag_list:
     [.inbounds[]?.tag | select(. != null and . != "")];
 
@@ -807,6 +831,9 @@ jq \
         error("outbound-patch 引用了不存在的 outbound: " + $op.key + "；可选值：" + ([.outbounds[]?.tag] | join(", ")))
       end
     )
+
+  # sing-box 1.14 移除了 outbound.domain_strategy；兼容旧 intent 并编译为 domain_resolver。
+  | migrate_legacy_domain_strategy($dns.route_default.server // "")
 
   | if ((.outbounds | map(.tag) | length) != (.outbounds | map(.tag) | unique | length)) then
       error("最终 outbounds 存在重复 tag")
