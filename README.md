@@ -67,6 +67,7 @@ Required interactive VPS preparation and tuning: dependencies, certbot/certifica
 During `pi tune bootstrap`, the swap step prompts with current RAM, available RAM,
 existing swap size, and a recommendation. Answer `Y`, `N`, or a custom size such
 as `768M`; custom values must be at least `256M` and no larger than machine RAM.
+Automatic recommendations use 256 MB increments and never exceed machine RAM.
 | `pi tune singbox check` | Check sing-box availability. | Read-only |
 | `pi tune singbox install` | Install sing-box. | System service/package |
 | `pi tune singbox version` | Print sing-box version. | Read-only |

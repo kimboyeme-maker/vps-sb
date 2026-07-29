@@ -203,23 +203,30 @@ format_mb(){
 }
 
 swap_recommend_mb(){
-  local m a
+  local m a target
   m="$(mem_mb)"
   a="$(disk_avail_gb)"
 
   if (( m <= 0 )); then
-    echo 0
+    target=0
   elif (( m < 1500 )); then
     if (( a > 0 && a < 3 )); then
-      echo 512
+      target=512
     else
-      echo 1024
+      target=1024
     fi
   elif (( m < 3000 )); then
-    echo 512
+    target=512
   else
-    echo 0
+    target=0
   fi
+
+  # 推荐值必须能通过创建校验；按 256M 粒度向下取整且不超过物理内存。
+  if (( target > m )); then
+    target=$(( m / 256 * 256 ))
+  fi
+  (( target >= 256 )) || target=0
+  echo "$target"
 }
 
 swap_recommend_size(){
